@@ -1,0 +1,17 @@
+// PROOF (negative): hold total >= 0 but init is -1 must fail Level-2.
+
+schema Tick {
+  value: Int
+}
+
+process Counter {
+  state total: Int = -1
+
+  on tick: Tick {
+    total := total + tick.value
+  }
+}
+
+spec Bad {
+  hold total >= 0
+}

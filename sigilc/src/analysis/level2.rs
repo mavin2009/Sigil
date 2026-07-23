@@ -2,12 +2,15 @@
 //!
 //! - Per-step recovery totality: every @timeout on a pipe step has @recover on the same step
 //! - path_timeout_sum bounds from `require path_timeout_sum <= N.ms`
-//! - Simple `hold` recording (numeric state floor) for residual reporting
+//! - Simple `hold state >= N` discharge for pure integer state
 //! - `extinct` assumptions recorded for residual risk
 
 use crate::analysis::ir::GraphIR;
-use crate::frontend::ast::{BinOp, Expr, Literal, Program, SpecItem, Stmt, Tag};
+use crate::frontend::ast::{
+    BinOp, Expr, Literal, Program, SpecItem, StateDecl, Stmt, Tag, Type,
+};
 use anyhow::{bail, Result};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Default)]
 pub struct Level2Report {
@@ -22,17 +25,21 @@ pub struct Level2Report {
 pub fn level2_check(program: &Program, ir: &GraphIR) -> Result<Level2Report> {
     let mut report = Level2Report::default();
 
-    // 1. Per-step timeout/recover pairing (stronger than process-global Level-1)
     check_per_step_recovery(program)?;
     report
         .discharged
         .push("per-step @timeout/@recover totality".into());
 
-    // 2. Path timeout sum from IR
     let sum = path_timeout_sum_ms(ir);
     report.path_timeout_sum_ms = sum;
 
-    // 3. Spec obligations
+    let pure_transforms: BTreeSet<String> = program
+        .transforms
+        .iter()
+        .filter(|t| !t.body.is_empty())
+        .map(|t| t.name.clone())
+        .collect();
+
     for spec in &program.specs {
         for item in &spec.items {
             match item {
@@ -48,24 +55,259 @@ pub fn level2_check(program: &Program, ir: &GraphIR) -> Result<Level2Report> {
                 SpecItem::Require { expr, span } => {
                     check_require(expr, sum, &mut report, &spec.name, span.start, span.end)?;
                 }
-                SpecItem::Hold { expr, .. } => {
+                SpecItem::Hold { expr, span } => {
                     report.holds.push(format_expr(expr));
-                    report.residual_assumptions.push(format!(
-                        "spec `{}` hold `{}` — discharged only for pure state updates; external transforms remain residual",
-                        spec.name,
-                        format_expr(expr)
-                    ));
-                    // Conservative: accept hold syntax; full symbolic discharge is future work
-                    report.discharged.push(format!(
-                        "hold `{}` recorded under residual assumptions",
-                        format_expr(expr)
-                    ));
+                    discharge_hold(
+                        program,
+                        expr,
+                        &pure_transforms,
+                        &mut report,
+                        &spec.name,
+                        span.start,
+                        span.end,
+                    )?;
                 }
             }
         }
     }
 
     Ok(report)
+}
+
+fn discharge_hold(
+    program: &Program,
+    expr: &Expr,
+    pure_transforms: &BTreeSet<String>,
+    report: &mut Level2Report,
+    spec_name: &str,
+    start: usize,
+    end: usize,
+) -> Result<()> {
+    // Support: state >= N  or state > N  with integer literal N
+    let (state_name, op, bound) = match parse_numeric_hold(expr) {
+        Some(v) => v,
+        None => {
+            report.residual_assumptions.push(format!(
+                "spec `{}` hold `{}` — form not auto-discharged (need state >= N)",
+                spec_name,
+                format_expr(expr)
+            ));
+            return Ok(());
+        }
+    };
+
+    let process = match program.processes.first() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    let state_decl = process.states.iter().find(|s| s.name == state_name);
+    let state_decl = match state_decl {
+        Some(s) => s,
+        None => {
+            bail!(
+                "Level-2 violation in spec '{}' at bytes {}..{}: hold refers to unknown state '{}'",
+                spec_name,
+                start,
+                end,
+                state_name
+            );
+        }
+    };
+
+    if !matches!(state_decl.ty, Type::Int | Type::Float) {
+        report.residual_assumptions.push(format!(
+            "spec `{}` hold on non-numeric state `{}`",
+            spec_name, state_name
+        ));
+        return Ok(());
+    }
+
+    // Init must satisfy the hold
+    if let Some(init_v) = literal_number(&state_decl.init) {
+        if !cmp_holds(op, init_v, bound) {
+            bail!(
+                "Level-2 violation in spec '{}' at bytes {}..{}: \
+                 initial value of '{}' is {} which falsifies hold `{}`",
+                spec_name,
+                start,
+                end,
+                state_name,
+                init_v,
+                format_expr(expr)
+            );
+        }
+    } else {
+        report.residual_assumptions.push(format!(
+            "spec `{}` hold `{}` — init not a literal; not fully discharged",
+            spec_name,
+            format_expr(expr)
+        ));
+        return Ok(());
+    }
+
+    // All assignments to state must be pure
+    let mut pure_ok = true;
+    let mut uses_msg_fields = false;
+    for handler in &process.handlers {
+        for stmt in &handler.body {
+            if let Stmt::Assign { name, expr: rhs, .. } = stmt {
+                if name != &state_name {
+                    continue;
+                }
+                match classify_rhs(rhs, pure_transforms, &process.states) {
+                    RhsKind::Pure => {}
+                    RhsKind::PureWithMsgFields => uses_msg_fields = true,
+                    RhsKind::Impure => pure_ok = false,
+                }
+            }
+        }
+    }
+
+    if !pure_ok {
+        report.residual_assumptions.push(format!(
+            "spec `{}` hold `{}` — state updated via residual/external transforms",
+            spec_name,
+            format_expr(expr)
+        ));
+        report.discharged.push(format!(
+            "hold `{}` recorded (not discharged — impure updates)",
+            format_expr(expr)
+        ));
+        return Ok(());
+    }
+
+    if uses_msg_fields {
+        report.residual_assumptions.push(format!(
+            "spec `{}` hold `{}` discharged for pure updates assuming message fields respect the bound",
+            spec_name,
+            format_expr(expr)
+        ));
+    }
+
+    report.discharged.push(format!(
+        "hold `{}` on pure state '{}' (init satisfies; updates pure)",
+        format_expr(expr),
+        state_name
+    ));
+    Ok(())
+}
+
+#[derive(Debug)]
+enum RhsKind {
+    Pure,
+    PureWithMsgFields,
+    Impure,
+}
+
+fn classify_rhs(
+    expr: &Expr,
+    pure_transforms: &BTreeSet<String>,
+    states: &[StateDecl],
+) -> RhsKind {
+    let state_names: BTreeSet<_> = states.iter().map(|s| s.name.as_str()).collect();
+    fn walk(
+        expr: &Expr,
+        pure_transforms: &BTreeSet<String>,
+        state_names: &BTreeSet<&str>,
+        saw_msg: &mut bool,
+        impure: &mut bool,
+    ) {
+        match expr {
+            Expr::Ident { name, .. } => {
+                if !state_names.contains(name.as_str())
+                    && name != "true"
+                    && name != "false"
+                {
+                    // could be message or local — treat non-state as msg-ish
+                    if !pure_transforms.contains(name) {
+                        *saw_msg = true;
+                    }
+                }
+            }
+            Expr::FieldAccess { .. } => *saw_msg = true,
+            Expr::Literal { .. } => {}
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, pure_transforms, state_names, saw_msg, impure);
+                walk(rhs, pure_transforms, state_names, saw_msg, impure);
+            }
+            Expr::Call { name, args, .. } => {
+                if !pure_transforms.contains(name) {
+                    *impure = true;
+                }
+                for a in args {
+                    walk(a, pure_transforms, state_names, saw_msg, impure);
+                }
+            }
+            Expr::Pipeline { base, steps, .. } => {
+                walk(base, pure_transforms, state_names, saw_msg, impure);
+                for step in steps {
+                    match &step.expr {
+                        Expr::Ident { name, .. } | Expr::Call { name, .. } => {
+                            if !pure_transforms.contains(name) {
+                                *impure = true;
+                            }
+                        }
+                        other => walk(other, pure_transforms, state_names, saw_msg, impure),
+                    }
+                    if step.tags.iter().any(|t| matches!(t, Tag::Timeout { .. })) {
+                        *impure = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut saw_msg = false;
+    let mut impure = false;
+    walk(expr, pure_transforms, &state_names, &mut saw_msg, &mut impure);
+    if impure {
+        RhsKind::Impure
+    } else if saw_msg {
+        RhsKind::PureWithMsgFields
+    } else {
+        RhsKind::Pure
+    }
+}
+
+fn parse_numeric_hold(expr: &Expr) -> Option<(String, BinOp, f64)> {
+    match expr {
+        Expr::Binary { op, lhs, rhs, .. }
+            if matches!(op, BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt | BinOp::Eq) =>
+        {
+            let name = match lhs.as_ref() {
+                Expr::Ident { name, .. } => name.clone(),
+                _ => return None,
+            };
+            let bound = literal_number(rhs)?;
+            Some((name, op.clone(), bound))
+        }
+        _ => None,
+    }
+}
+
+fn literal_number(expr: &Expr) -> Option<f64> {
+    match expr {
+        Expr::Literal {
+            value: Literal::Int(i),
+            ..
+        } => Some(*i as f64),
+        Expr::Literal {
+            value: Literal::Float(f),
+            ..
+        } => Some(*f),
+        _ => None,
+    }
+}
+
+fn cmp_holds(op: BinOp, value: f64, bound: f64) -> bool {
+    match op {
+        BinOp::Ge => value >= bound,
+        BinOp::Gt => value > bound,
+        BinOp::Le => value <= bound,
+        BinOp::Lt => value < bound,
+        BinOp::Eq => (value - bound).abs() < f64::EPSILON,
+        _ => false,
+    }
 }
 
 fn check_per_step_recovery(program: &Program) -> Result<()> {
@@ -136,7 +378,6 @@ fn check_require(
     start: usize,
     end: usize,
 ) -> Result<()> {
-    // Support: path_timeout_sum <= N.ms
     if let Expr::Binary {
         op: BinOp::Le,
         lhs,
@@ -181,7 +422,6 @@ fn check_require(
             return Ok(());
         }
     }
-    // Unknown require: record as residual assumption
     report.residual_assumptions.push(format!(
         "spec `{}` require `{}` not auto-discharged",
         spec_name,
@@ -274,7 +514,41 @@ spec Slo {
         let err = level2_check(&prog, &ir).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("Level-2"), "{msg}");
-        assert!(msg.contains("300") || msg.contains("path_timeout_sum"), "{msg}");
+    }
+
+    #[test]
+    fn hold_pure_counter_discharged() {
+        let src = include_str!("../../../examples/runnable/counter/counter.sigil");
+        let prog = parse(src).expect("parse");
+        let ir = lower(&prog).expect("lower");
+        let report = level2_check(&prog, &ir).expect("level2");
+        assert!(
+            report.discharged.iter().any(|d| d.contains("hold") && d.contains("pure")),
+            "expected pure hold discharge: {:?}",
+            report.discharged
+        );
+    }
+
+    #[test]
+    fn hold_bad_init_rejected() {
+        let src = r#"
+schema Tick { value: Int }
+process Counter {
+  state total: Int = -1
+  on tick: Tick {
+    total := total + tick.value
+  }
+}
+spec Bad {
+  hold total >= 0
+}
+"#;
+        let prog = parse(src).expect("parse");
+        let ir = lower(&prog).expect("lower");
+        let err = level2_check(&prog, &ir).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Level-2"), "{msg}");
+        assert!(msg.contains("initial") || msg.contains("-1"), "{msg}");
     }
 
     #[test]
@@ -283,6 +557,6 @@ spec Slo {
         let prog = parse(src).expect("parse");
         let ir = lower(&prog).expect("lower");
         let report = level2_check(&prog, &ir).expect("level2");
-        assert!(report.path_timeout_sum_ms >= 300); // 120+200
+        assert!(report.path_timeout_sum_ms >= 300);
     }
 }

@@ -1,18 +1,19 @@
 # runnable/counter
 
-Minimal program used to show generated Rust updating local state.
+Minimal pure counter with Level-2 `hold total >= 0`.
 
-## Compile and inspect
+## Compile
 
 ```bash
-cargo run -p sigilc -- examples/runnable/counter/counter.sigil generated/runnable_counter
+cargo run -p sigilc -- examples/runnable/counter/counter.sigil generated/runnable_counter --emit-main
 ```
 
-Generated `src/lib.rs` includes a smoke test and process state fields.
-With `--emit-main` (CLI flag), a binary `main` prints `total` after one tick.
+## Level-2
 
-## What this shows
+- `hold total >= 0` is **discharged** for pure updates (init 0, pure `add` body).
+- Message field `tick.value` is assumed not to break the floor when combined with pure arithmetic (recorded if needed).
 
-- Pure `add` is compiled (not residual)
-- Process-local `total` only
-- No timeout surface → residual risk has no timed external stages
+## Residual
+
+- Compiled: `add: Int → Int`
+- No timed external stages

@@ -141,6 +141,17 @@ mod integration {
     }
 
     #[test]
+    fn proof_rejects_hold_bad_init() {
+        let source = include_str!("../../examples/proofs/hold_bad_init.sigil");
+        let program = parse(source).expect("parse");
+        let graph = lower(&program).expect("lower");
+        level1_check(&graph).expect("level1");
+        let err = level2_check(&program, &graph).expect_err("level2 must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("Level-2"), "{msg}");
+    }
+
+    #[test]
     fn proof_rejects_timeout_sum_exceeded() {
         let source = include_str!("../../examples/proofs/timeout_sum_exceeded.sigil");
         let program = parse(source).expect("parse");

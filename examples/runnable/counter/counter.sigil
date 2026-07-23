@@ -1,4 +1,4 @@
-// Runnable counter: pure transform + local state, intended for printed demo output.
+// Runnable counter: pure transform + local state + Level-2 hold.
 
 schema Tick {
   value: Int
@@ -16,4 +16,8 @@ process Counter {
     let bumped = next ~> add
     total := bumped
   }
+}
+
+spec CounterSafe {
+  hold total >= 0
 }
