@@ -14,12 +14,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--level 0|1|2]\n\
+            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--level 0|1|2|3]\n\
              \n\
              Assurance levels:\n\
              \x20 0 | sketch     exploratory; no safety checks, everything residual\n\
              \x20 1 | safe       default; extinct-by-design + signature checks\n\
-             \x20 2 | contracts  spec obligations (require / hold / extinct)"
+             \x20 2 | contracts  spec obligations (require / hold / extinct)\n\
+             \x20 3 | proofs     inductive hold proofs with runtime-guarded assumptions"
         );
         std::process::exit(1);
     }
@@ -34,13 +35,13 @@ fn main() -> Result<()> {
             emit_main_flag = true;
         } else if let Some(v) = arg.strip_prefix("--level=") {
             level = AssuranceLevel::from_arg(v)
-                .with_context(|| format!("invalid assurance level '{v}' (expected 0, 1, or 2)"))?;
+                .with_context(|| format!("invalid assurance level '{v}' (expected 0-3)"))?;
         } else if arg == "--level" {
             let v = args_iter
                 .next()
                 .context("--level requires a value (0, 1, or 2)")?;
             level = AssuranceLevel::from_arg(v)
-                .with_context(|| format!("invalid assurance level '{v}' (expected 0, 1, or 2)"))?;
+                .with_context(|| format!("invalid assurance level '{v}' (expected 0-3)"))?;
         } else if input.is_none() {
             input = Some(PathBuf::from(arg));
         } else if !arg.starts_with("--") {
@@ -323,6 +324,44 @@ mod integration {
         // Untimed @recover emits a match on the stage result with a recovery note.
         assert!(rust.contains("note_recovery(\"validate\")"), "untimed recover path missing");
         assert!(rust.contains("note_recovery(\"post\")"));
+    }
+
+    /// Level 3: holds are proven inductively; assumptions are runtime guards
+    /// in the generated code; undischargeable holds fail the build.
+    #[test]
+    fn level3_proofs_are_real_and_guarded() {
+        use sigilc::{level3_prove, run_checks, AssuranceLevel};
+
+        let src = include_str!("../../examples/level3/proven_ledger.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::Proofs)
+            .expect("proven ledger must pass Level 3");
+        let l3 = outcome.level3.expect("level3 ran");
+        assert_eq!(l3.proven.len(), 2, "both holds proven");
+        assert_eq!(l3.guarded_assumptions.len(), 2, "both requires guarded");
+
+        // The assumptions are ENFORCED: guards appear in the emitted handler.
+        let rust = emit(&program, &irs);
+        assert!(rust.contains("payment.amount >= 0f64"), "amount guard missing");
+        assert!(rust.contains("(payment.units as f64) >= 0f64"), "units guard missing");
+        assert!(rust.contains("SigilError::Schema"), "guard must reject typed");
+
+        // Dropping an assumption breaks the inductive step with a named fix.
+        let unguarded = src.replace("  require payment.amount >= 0.0\n", "");
+        let program = parse(&unguarded).expect("parse");
+        let err = level3_prove(&program).expect_err("must fail without the guard");
+        let msg = format!("{err}");
+        assert!(msg.contains("INDUCTIVE STEP fails") && msg.contains("unguarded"));
+
+        // The non-inductive proof program fails at --level 3.
+        let bad = include_str!("../../examples/proofs/hold_not_inductive.sigil");
+        let program = parse(bad).expect("parse");
+        let irs = lower(&program).expect("lower");
+        assert!(run_checks(&program, &irs, AssuranceLevel::Proofs).is_err());
+        // ...but still builds at Level 2, where holds are residual.
+        run_checks(&program, &irs, AssuranceLevel::Contracts)
+            .expect("residual at level 2");
     }
 
     /// Soundness hardening before Level 3: every hole found in the L1/L2

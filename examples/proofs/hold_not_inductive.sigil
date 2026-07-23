@@ -1,0 +1,12 @@
+// MUST FAIL --level 3: subtraction lets total escape the hold.
+schema Payment { id: String, amount: Float }
+process Refunds {
+  state total: Float = 0.0
+  on payment: Payment {
+    total := total - payment.amount
+  }
+}
+spec Broken {
+  require payment.amount >= 0.0
+  hold total >= 0.0
+}

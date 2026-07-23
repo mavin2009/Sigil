@@ -48,8 +48,9 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
         out.push('\n');
     }
 
+    let guards = build_input_guards(program);
     for process in &program.processes {
-        out.push_str(&emit_process(process));
+        out.push_str(&emit_process(process, &guards));
         out.push('\n');
         out.push_str(&emit_actor(process));
         out.push('\n');
@@ -185,7 +186,55 @@ fn process_send_targets(process: &Process) -> Vec<String> {
     targets
 }
 
-fn emit_process(process: &Process) -> String {
+/// Precompute runtime guard lines per (process, handler msg): every Level-3
+/// input assumption `require msg.field <cmp> lit` is enforced at handler
+/// entry, so proofs never rest on an unchecked assumption. Violations are
+/// typed Schema errors, counted as drops by the actor loop.
+fn build_input_guards(
+    program: &Program,
+) -> std::collections::BTreeMap<(String, String), Vec<String>> {
+    use crate::analysis::level3::input_preconditions;
+    let mut map: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for pc in input_preconditions(program) {
+        // Field type decides the literal / cast shape.
+        let field_ty = program
+            .processes
+            .iter()
+            .find(|p| p.name == pc.process)
+            .and_then(|p| p.handlers.iter().find(|h| h.msg_name == pc.msg_name))
+            .and_then(|h| match &h.msg_ty {
+                Type::Named(n) => program.schemas.iter().find(|sc| sc.name == *n),
+                _ => None,
+            })
+            .and_then(|sc| sc.fields.iter().find(|(f, _)| *f == pc.field))
+            .map(|(_, ty)| ty.clone());
+        let lhs = match field_ty {
+            Some(Type::Int) => format!("({}.{} as f64)", pc.msg_name, pc.field),
+            _ => format!("{}.{}", pc.msg_name, pc.field),
+        };
+        let op = match pc.pred.op {
+            BinOp::Ge => ">=",
+            BinOp::Gt => ">",
+            BinOp::Le => "<=",
+            BinOp::Lt => "<",
+            _ => continue,
+        };
+        let line = format!(
+            "        // Level-3 guarded assumption (spec {}): reject out-of-contract input\n        if !({lhs} {op} {}f64) {{\n            return Err(sigil_rt::SigilError::Schema);\n        }}\n",
+            pc.spec, pc.pred.bound
+        );
+        map.entry((pc.process.clone(), pc.msg_name.clone()))
+            .or_default()
+            .push(line);
+    }
+    map
+}
+
+fn emit_process(
+    process: &Process,
+    guards: &std::collections::BTreeMap<(String, String), Vec<String>>,
+) -> String {
     let states: Vec<String> = process.states.iter().map(|s| s.name.clone()).collect();
     let mut s = String::new();
 
@@ -229,7 +278,11 @@ fn emit_process(process: &Process) -> String {
     }
 
     for handler in &process.handlers {
-        s.push_str(&emit_handler(handler, &states));
+        let g = guards
+            .get(&(process.name.clone(), handler.msg_name.clone()))
+            .cloned()
+            .unwrap_or_default();
+        s.push_str(&emit_handler(handler, &states, &g));
         s.push('\n');
     }
     s.push_str("}\n");
@@ -349,7 +402,7 @@ fn variant_name(msg_name: &str) -> String {
     }
 }
 
-fn emit_handler(handler: &OnHandler, states: &[String]) -> String {
+fn emit_handler(handler: &OnHandler, states: &[String], guards: &[String]) -> String {
     let msg_ty = rust_type(&handler.msg_ty);
     let method = format!("on_{}", handler.msg_name);
     let mut s = String::new();
@@ -357,6 +410,9 @@ fn emit_handler(handler: &OnHandler, states: &[String]) -> String {
         "    pub async fn {method}(&mut self, {}: {msg_ty}) -> Result<()> {{\n",
         handler.msg_name
     ));
+    for g in guards {
+        s.push_str(g);
+    }
 
     for stmt in &handler.body {
         s.push_str(&emit_stmt(stmt, "        ", states, &handler.msg_name));
@@ -500,7 +556,13 @@ fn emit_pipeline(
     multiline: bool,
     indent: &str,
 ) -> String {
+    // Pipelines borrow their input conceptually; in Rust terms the base is
+    // cloned when it is a named binding so the handler can keep using it
+    // (e.g. guarded state updates after the pipeline).
     let mut current = emit_expr(base, states, msg);
+    if matches!(base, Expr::Ident { .. } | Expr::FieldAccess { .. }) {
+        current = format!("{current}.clone()");
+    }
     for step in steps {
         let transform = match &step.expr {
             Expr::Ident { name, .. } => name.clone(),

@@ -30,9 +30,46 @@ Residual risk outside the model (external transforms, OS, scheduler) is always r
 | `--level 0` / `sketch` | exploratory | parse + lower only; every skipped guarantee is listed in the residual report |
 | `--level 1` / `safe` (default) | extinct-by-design | Level-1 checks, transform signatures, failure paths, topology |
 | `--level 2` / `contracts` | spec obligations | `require` / `hold` / `extinct` on a Level-1-legal graph |
+| `--level 3` / `proofs` | inductive proofs | every `hold` proven (base + inductive step over all reachable updates); undischargeable holds fail the build |
 
 A Level-0 build never claims unverified properties: the residual report leads
 with everything that was NOT established.
+
+## Level 3: Proven Invariants with Enforced Assumptions
+
+`hold` clauses are proven by a built-in inductive prover over an interval
+domain — no external SMT dependency:
+
+```
+spec Proven {
+  require payment.amount >= 0.0   // input assumption
+  require payment.units >= 0
+  hold posted >= 0                // PROVEN: base case + every reachable update
+  hold total_amount >= 0.0
+}
+```
+
+The crucial honesty property: **proof assumptions are never taken on faith.**
+Every `require msg.field <cmp> literal` compiles into a guard at handler
+entry; out-of-contract messages are rejected as typed errors and counted in
+the actor's dropped total. The proof is therefore unconditional over what the
+process actually executes.
+
+Failures are actionable, not oracular:
+
+```
+Level-3 violation in spec 'Broken': INDUCTIVE STEP fails — in process
+'Refunds', update `total := total - payment.amount` yields [-inf, inf] which
+can escape `total >= 0`
+  unbounded because: input `payment.amount` is unguarded ...
+  fix: constrain the inputs with `require <msg>.<field> >= 0` in the spec,
+  or restructure the update
+```
+
+Values that flow through external transforms are never assumed bounded —
+they are unbounded by construction, and the prover says so. See
+`examples/level3/proven_ledger.sigil` (passes) and
+`examples/proofs/hold_not_inductive.sigil` (must fail).
 
 ## Fault Injection (proving the failure paths)
 
@@ -393,4 +430,4 @@ Negative programs live under `examples/proofs/`.
 
 ## Status
 
-v0.3.1 — Soundness-hardened ahead of Level 3: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.
+v0.4 — Level 3 shipped: built-in inductive prover for hold invariants (interval domain, no SMT dependency), runtime-guarded proof assumptions, actionable proof failures. Soundness-hardened: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.

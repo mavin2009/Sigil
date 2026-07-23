@@ -23,6 +23,9 @@ pub enum AssuranceLevel {
     Safe = 1,
     /// Level 2 — contracts. Spec obligations checked on a Level-1-legal graph.
     Contracts = 2,
+    /// Level 3 — proofs. hold invariants proven inductively; assumptions are
+    /// runtime-guarded input preconditions. Undischargeable holds fail.
+    Proofs = 3,
 }
 
 impl AssuranceLevel {
@@ -31,6 +34,7 @@ impl AssuranceLevel {
             "0" | "sketch" => Some(Self::Sketch),
             "1" | "safe" => Some(Self::Safe),
             "2" | "contracts" => Some(Self::Contracts),
+            "3" | "proofs" => Some(Self::Proofs),
             _ => None,
         }
     }
@@ -40,6 +44,7 @@ impl AssuranceLevel {
             Self::Sketch => "Level 0 (sketch)",
             Self::Safe => "Level 1 (safe)",
             Self::Contracts => "Level 2 (contracts)",
+            Self::Proofs => "Level 3 (proofs)",
         }
     }
 }
@@ -56,6 +61,8 @@ pub struct CheckOutcome {
     pub level: AssuranceLevel,
     /// Present only when Level-2 checks actually ran.
     pub level2: Option<Level2Report>,
+    /// Present only when Level-3 proofs actually ran.
+    pub level3: Option<crate::analysis::level3::Level3Report>,
     /// Guarantees that were NOT established at this level.
     pub skipped: Vec<String>,
     /// Human-readable notes (e.g. specs parsed but unchecked).
@@ -69,6 +76,7 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
     let mut skipped = Vec::new();
     let mut notes = Vec::new();
     let mut level2 = None;
+    let mut level3 = None;
 
     if level >= AssuranceLevel::Safe {
         for ir in irs {
@@ -102,9 +110,28 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
         ));
     }
 
+    if level >= AssuranceLevel::Proofs {
+        let l3 = crate::analysis::level3::level3_prove(program)?;
+        for p in &l3.proven {
+            notes.push(format!("PROVEN: {p}"));
+        }
+        level3 = Some(l3);
+    } else {
+        let has_holds = program.specs.iter().any(|sp| {
+            sp.items.iter().any(|i| matches!(i, crate::frontend::ast::SpecItem::Hold { .. }))
+        });
+        if has_holds {
+            skipped.push(
+                "inductive hold proofs (Level 3 not run — holds are heuristic/residual at Level 2)"
+                    .into(),
+            );
+        }
+    }
+
     Ok(CheckOutcome {
         level,
         level2,
+        level3,
         skipped,
         notes,
     })
@@ -127,8 +154,29 @@ pub fn level_banner(outcome: &CheckOutcome) -> String {
         }
         out.push('\n');
     }
+    if let Some(l3) = &outcome.level3 {
+        if !l3.proven.is_empty() {
+            out.push_str("**Proven invariants (Level 3, inductive):**\n\n");
+            for p in &l3.proven {
+                out.push_str(&format!("- {p}\n"));
+            }
+            out.push('\n');
+        }
+        if !l3.guarded_assumptions.is_empty() {
+            out.push_str("**Proof assumptions — every one runtime-enforced:**\n\n");
+            for a in &l3.guarded_assumptions {
+                out.push_str(&format!("- {a}\n"));
+            }
+            out.push('\n');
+        }
+        for r in &l3.residual {
+            out.push_str(&format!("> ⚠ {r}\n\n"));
+        }
+    }
     for n in &outcome.notes {
-        out.push_str(&format!("> ⚠ {n}\n\n"));
+        if !n.starts_with("PROVEN:") {
+            out.push_str(&format!("> ⚠ {n}\n\n"));
+        }
     }
     out
 }
@@ -203,7 +251,13 @@ spec S {
         let outcome2 =
             run_checks(&program, &irs, AssuranceLevel::Contracts).expect("l2 ok");
         assert!(outcome2.level2.is_some());
-        assert!(outcome2.skipped.is_empty());
+        // At Level 2, the only remaining skip is the Level-3 proof of the hold.
+        assert!(outcome2.skipped.iter().all(|s| s.contains("Level 3")));
+
+        let outcome3 =
+            run_checks(&program, &irs, AssuranceLevel::Proofs).expect("hold total >= 0 is provable");
+        assert!(outcome3.skipped.is_empty());
+        assert!(outcome3.level3.is_some());
     }
 
     #[test]
