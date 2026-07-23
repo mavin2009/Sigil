@@ -364,6 +364,79 @@ pub(crate) fn handler_delta(
     lets: &BTreeMap<String, Interval>,
     why: &mut Vec<String>,
 ) -> Option<Interval> {
+    handler_delta_under(state, handler, owner, holds, preconds, lets, None, why)
+}
+
+/// Per-handler delta of a state, optionally assuming a guard condition
+/// holds. Assuming the guard is what lets a conditional `send ... when G`
+/// be bounded by a counter that is also incremented only when `G`.
+/// Structural equality on expressions, used to correlate a `when` guard with
+/// an `if` that tests the same condition.
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Ident { name: x, .. }, Expr::Ident { name: y, .. }) => x == y,
+        (
+            Expr::FieldAccess { base: b1, field: f1, .. },
+            Expr::FieldAccess { base: b2, field: f2, .. },
+        ) => b1 == b2 && f1 == f2,
+        (Expr::Literal { value: v1, .. }, Expr::Literal { value: v2, .. }) => {
+            format!("{v1:?}") == format!("{v2:?}")
+        }
+        (
+            Expr::Binary { op: o1, lhs: l1, rhs: r1, .. },
+            Expr::Binary { op: o2, lhs: l2, rhs: r2, .. },
+        ) => format!("{o1:?}") == format!("{o2:?}") && same_expr(l1, l2) && same_expr(r1, r2),
+        _ => false,
+    }
+}
+
+/// Under an assumed condition, an `if` testing that same condition can only
+/// take its then-branch. Interval arithmetic alone cannot see this (a closed
+/// domain cannot represent a strict bound), but the correlation is exactly
+/// what `send ... when G` relies on, so it is resolved syntactically.
+fn simplify_under_guard(expr: &Expr, guard: &Expr) -> Expr {
+    match expr {
+        Expr::If { cond, then_branch, else_branch, span } => {
+            if same_expr(cond, guard) {
+                simplify_under_guard(then_branch, guard)
+            } else {
+                Expr::If {
+                    cond: cond.clone(),
+                    then_branch: Box::new(simplify_under_guard(then_branch, guard)),
+                    else_branch: Box::new(simplify_under_guard(else_branch, guard)),
+                    span: *span,
+                }
+            }
+        }
+        Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+            op: op.clone(),
+            lhs: Box::new(simplify_under_guard(lhs, guard)),
+            rhs: Box::new(simplify_under_guard(rhs, guard)),
+            span: *span,
+        },
+        other => other.clone(),
+    }
+}
+
+pub(crate) fn handler_delta_under(
+    state: &str,
+    handler: &crate::frontend::ast::OnHandler,
+    owner: &Process,
+    holds: &BTreeMap<String, (Pred, String)>,
+    preconds: &[InputPrecondition],
+    lets: &BTreeMap<String, Interval>,
+    guard: Option<&Expr>,
+    why: &mut Vec<String>,
+) -> Option<Interval> {
+    let narrowed;
+    let lets = match guard {
+        Some(g) => {
+            let (t, _e) = narrow(g, lets, owner, &handler.msg_name, holds, preconds);
+            narrowed = t;
+            &narrowed
+        }
+        None => lets,
+    };
     let mut delta: Option<Interval> = None;
     for stmt in &handler.body {
         let Stmt::Assign { name, expr, .. } = stmt else { continue };
@@ -374,6 +447,14 @@ pub(crate) fn handler_delta(
             why.push(format!("state `{state}` assigned more than once in a handler"));
             return None;
         }
+        let simplified;
+        let expr = match guard {
+            Some(g) => {
+                simplified = simplify_under_guard(expr, g);
+                &simplified
+            }
+            None => expr,
+        };
         match expr {
             Expr::Binary { op, lhs, rhs, .. }
                 if matches!(lhs.as_ref(), Expr::Ident { name: n, .. } if n == state) =>
@@ -588,7 +669,7 @@ pub(crate) fn eval_interval(
 /// In the then-branch the variable is known to satisfy the comparison; in
 /// the else-branch it satisfies the negation. Any other condition shape
 /// leaves both environments unchanged (sound, just less precise).
-fn narrow(
+pub(crate) fn narrow(
     cond: &Expr,
     lets: &BTreeMap<String, Interval>,
     owner: &Process,
@@ -641,6 +722,10 @@ fn narrow(
     then_env.insert(key.clone(), current.meet(t_region));
     else_env.insert(key, current.meet(e_region));
     (then_env, else_env)
+}
+
+pub(crate) fn describe_expr_pub(e: &Expr) -> String {
+    describe_expr(e)
 }
 
 fn describe_expr(e: &Expr) -> String {

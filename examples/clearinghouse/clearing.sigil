@@ -21,17 +21,19 @@
 //
 // PROVEN AT --level 4:
 //   RiskEngine.assessed  <= Intake.accepted
-//   Settlement.settled   <= RiskEngine.assessed
+//   Settlement.settled   <= RiskEngine.cleared
 //   AuditTrail.recorded  <= Intake.accepted
 //
-//   NOTE: `Settlement.settled <= RiskEngine.cleared` LOOKS right and is
-//   FALSE — RiskEngine forwards every message but only counts `cleared`
-//   conditionally, so a rejected trade still reaches Settlement. The
-//   compiler rejected that spec when this example was first written:
+//   The settlement bound is the interesting one. An earlier draft forwarded
+//   EVERY message but counted `cleared` only conditionally, so a rejected
+//   trade still reached Settlement and the compiler rejected the spec:
 //     GAP fails — the `trade` handler of `RiskEngine` forwards up to 1
 //     message(s) toward `Settlement`, each able to add 1 to `settled`, but
 //     only guarantees +0 to `cleared`.
-//   Bounding against `assessed` (which rises unconditionally) is correct.
+//   The fix is `send ... when checked.lots > 0` — forwarding under the same
+//   condition that governs the counter. The prover evaluates the counter's
+//   delta UNDER that guard, so the correlation is proven rather than
+//   assumed.
 //
 // PROVEN AT --level 3:
 //   RiskEngine.cleared <= RiskEngine.assessed    (relational: conditional
@@ -119,7 +121,10 @@ process RiskEngine {
     // 1, which is what makes `cleared <= assessed` provable.
     cleared := cleared + if checked.lots > 0 { 1 } else { 0 }
 
-    send checked to Settlement @deadline(5.ms)
+    // Forward ONLY what cleared risk. The guard here is the same condition
+    // that governs the counter above, which is exactly what lets the
+    // compiler prove `Settlement.settled <= RiskEngine.cleared`.
+    send checked to Settlement @deadline(5.ms) when checked.lots > 0
   }
 
   on amendment: Amendment {
@@ -179,7 +184,7 @@ spec ClearingSafety {
   hold cleared <= assessed
 
   hold RiskEngine.assessed <= Intake.accepted
-  hold Settlement.settled <= RiskEngine.assessed
+  hold Settlement.settled <= RiskEngine.cleared
   hold AuditTrail.recorded <= Intake.accepted
 
   extinct [null]

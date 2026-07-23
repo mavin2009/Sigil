@@ -103,6 +103,11 @@ pub enum Stmt {
         expr: Expr,
         route: Route,
         backpressure: Backpressure,
+        /// `when <cond>` — the message is only forwarded if this holds.
+        /// Provers evaluate the sending handler's counters under this
+        /// condition, so a conditionally-forwarded message can be bounded
+        /// by a conditionally-incremented counter.
+        guard: Option<Expr>,
         span: Span,
     },
     Expr { expr: Expr, span: Span },
@@ -396,6 +401,7 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
             let target = inner.next().unwrap().as_str().to_string();
             let mut route = Route::RoundRobin;
             let mut backpressure = Backpressure::Block;
+            let mut guard: Option<Expr> = None;
             for extra in inner {
                 match extra.as_rule() {
                     Rule::route_clause => {
@@ -428,10 +434,13 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
                             other => bail!("unexpected backpressure clause: {:?}", other),
                         };
                     }
+                    Rule::when_clause => {
+                        guard = Some(parse_expr(extra.into_inner().next().unwrap())?);
+                    }
                     other => bail!("unexpected send clause: {:?}", other),
                 }
             }
-            Ok(Stmt::Send { target, expr, route, backpressure, span })
+            Ok(Stmt::Send { target, expr, route, backpressure, guard, span })
         }
         Rule::expr_stmt => {
             let inner = pair.into_inner().next().unwrap();

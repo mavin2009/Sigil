@@ -25,7 +25,7 @@
 //! actor model plus mandatory failure paths: the system-level proof needs
 //! no fairness or liveness assumptions at all.
 
-use crate::analysis::level3::{eval_interval, handler_delta, input_preconditions, Interval};
+use crate::analysis::level3::{eval_interval, handler_delta, handler_delta_under, input_preconditions, Interval};
 use crate::analysis::topology::derive_topology;
 use crate::frontend::ast::{BinOp, Expr, Program, Route, SpecItem, Stmt};
 use anyhow::{bail, Result};
@@ -121,6 +121,39 @@ fn sends_to(handler: &crate::frontend::ast::OnHandler, target: &str) -> Option<u
         n += 1;
     }
     Some(n)
+}
+
+/// Sends to `target` grouped by their `when` guard.
+///
+/// Unconditional sends are keyed by `None`. A conditional send is charged
+/// against the counter delta computed *under its guard*, which is what makes
+/// "forward only when accepted, count only when accepted" provable.
+fn sends_by_guard<'a>(
+    handler: &'a crate::frontend::ast::OnHandler,
+    target: &str,
+) -> Option<Vec<(Option<&'a Expr>, u64)>> {
+    let mut groups: Vec<(Option<&Expr>, u64)> = Vec::new();
+    for stmt in &handler.body {
+        let Stmt::Send { target: t, route, guard, .. } = stmt else { continue };
+        if t != target {
+            continue;
+        }
+        if matches!(route, Route::Broadcast) {
+            return None;
+        }
+        let key = guard.as_ref();
+        // Group syntactically-identical guards together.
+        let idx = groups.iter().position(|(g, _)| match (g, key) {
+            (None, None) => true,
+            (Some(a), Some(b)) => format!("{a:?}") == format!("{b:?}"),
+            _ => false,
+        });
+        match idx {
+            Some(i) => groups[i].1 += 1,
+            None => groups.push((key, 1)),
+        }
+    }
+    Some(groups)
 }
 
 /// Multiplicity of messages arriving at `dest` per message handled by each
@@ -353,32 +386,48 @@ fn prove_system_hold(
             );
         }
 
-        // How many messages reach B per execution of THIS handler.
-        // Distinct target processes only — a multi-handler target yields one
-        // edge per destination handler, but sends are counted per process.
+        // Messages reaching B per execution of THIS handler, grouped by the
+        // `when` guard that governs them. Distinct target PROCESSES only — a
+        // multi-handler target yields one edge per destination handler.
         let a_succs: BTreeSet<&str> = topo
             .edges
             .iter()
             .filter(|e| e.from == a.name)
             .map(|e| e.to.as_str())
             .collect();
-        let mut m_h: Option<u64> = Some(0);
+        // guard -> multiplicity toward B under that guard
+        let mut per_guard: Vec<(Option<&Expr>, u64)> = Vec::new();
+        let mut unbounded = false;
         for succ in &a_succs {
             let downstream = mult_map.get(*succ).cloned().unwrap_or(Some(0));
             if matches!(downstream, Some(0)) {
                 continue;
             }
-            match sends_to(ha, succ) {
-                None => m_h = None,
-                Some(0) => {}
-                Some(c) => {
-                    m_h = match (m_h, downstream) {
-                        (Some(acc), Some(d)) => Some(acc + c * d),
-                        _ => None,
-                    }
+            let Some(groups) = sends_by_guard(ha, succ) else {
+                unbounded = true;
+                break;
+            };
+            let Some(d) = downstream else {
+                unbounded = true;
+                break;
+            };
+            for (g, c) in groups {
+                let idx = per_guard.iter().position(|(pg, _)| match (pg, g) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => format!("{x:?}") == format!("{y:?}"),
+                    _ => false,
+                });
+                match idx {
+                    Some(i) => per_guard[i].1 += c * d,
+                    None => per_guard.push((g, c * d)),
                 }
             }
         }
+        let m_h: Option<u64> = if unbounded {
+            None
+        } else {
+            Some(per_guard.iter().map(|(_, c)| *c).sum())
+        };
         let Some(m_h) = m_h else {
             bail!(
                 "Level-4 violation in spec '{spec}': FLOW fails — the `{}` handler of `{}` \
@@ -434,17 +483,43 @@ fn prove_system_hold(
             );
         }
 
-        // GAP: this handler's contribution downstream must be covered.
-        let need = (m_h as f64) * db_max;
-        let ok = if h.strict { need < da.lo } else { need <= da.lo };
-        if !ok {
-            bail!(
-                "Level-4 violation in spec '{spec}': GAP fails — the `{}` handler of `{}` \
-                 forwards up to {m_h} message(s) toward `{}`, each able to add {db_max} to \
-                 `{}`, but only guarantees +{} to `{}`. Guard the increments (literal \
-                 counters, or `require` an upper bound).",
-                ha.msg_name, h.hi_proc, h.lo_proc, h.lo_state, da.lo, h.hi_state
-            );
+        // GAP, per guard group: messages forwarded under a condition are
+        // charged against the counter's increase UNDER THAT SAME CONDITION.
+        for (guard, mult) in &per_guard {
+            if *mult == 0 {
+                continue;
+            }
+            let mut lets: BTreeMap<String, Interval> = BTreeMap::new();
+            for stmt in &ha.body {
+                if let Stmt::Let { name, expr, .. } = stmt {
+                    let mut scratch = Vec::new();
+                    let v = eval_interval(
+                        expr, a, &ha.msg_name, &empty, preconds, &lets, &mut scratch,
+                    );
+                    lets.insert(name.clone(), v);
+                }
+            }
+            let mut why = Vec::new();
+            let da_g = handler_delta_under(
+                &h.hi_state, ha, a, &empty, preconds, &lets, *guard, &mut why,
+            )
+            .unwrap_or(da);
+            let need = (*mult as f64) * db_max;
+            let ok = if h.strict { need < da_g.lo } else { need <= da_g.lo };
+            if !ok {
+                let cond = match guard {
+                    Some(g) => format!(" when `{}`", crate::analysis::level3::describe_expr_pub(g)),
+                    None => String::new(),
+                };
+                bail!(
+                    "Level-4 violation in spec '{spec}': GAP fails — the `{}` handler of \
+                     `{}` forwards up to {mult} message(s) toward `{}`{cond}, each able to \
+                     add {db_max} to `{}`, but only guarantees +{} to `{}` in that case. \
+                     Either forward conditionally (`send ... when <cond>`) or make the \
+                     counter unconditional.",
+                    ha.msg_name, h.hi_proc, h.lo_proc, h.lo_state, da_g.lo, h.hi_state
+                );
+            }
         }
     }
     if !any_sends {

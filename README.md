@@ -138,6 +138,11 @@ paths, `@timeout` without recovery, `@retry` without a terminal failure path,
 fallible recovery paths, `Float` shard keys, and sends to a type the target
 cannot receive.
 
+Generated crates additionally forbid `unsafe`, enable overflow checks in
+every profile, and reject non-finite floats at handler entry — because a
+wrapped counter or an `+inf` accumulator would break a proof that the
+compiler had already discharged.
+
 By proof, when you ask for it: inductive state invariants, relational
 invariants, cross-process conservation, and latency budgets that include
 queue hand-off.
@@ -163,7 +168,7 @@ docs/             language reference, assurance levels, runtime, rationale
 cargo test
 ```
 
-77 tests: parser, per-level checks, both provers, topology and routing,
+80 tests: parser, per-level checks, both provers, topology and routing,
 codegen shape, and end-to-end compilation of every example. Every rule has a
 program in `examples/proofs/` asserted to fail *for the right reason*.
 

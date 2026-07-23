@@ -30,7 +30,7 @@ SIGIL_DEMO_CAPACITY=4 SIGIL_CHAOS_FAIL_PCT=15 SIGIL_CHAOS_LATENCY_MS=90 cargo ru
 | Property | Level |
 | -------- | ----- |
 | `RiskEngine.assessed <= Intake.accepted` | 4 |
-| `Settlement.settled <= RiskEngine.assessed` | 4 |
+| `Settlement.settled <= RiskEngine.cleared` | 4 |
 | `AuditTrail.recorded <= Intake.accepted` | 4 |
 | `cleared <= assessed` (conditional acceptance never exceeds assessment) | 3 (relational) |
 | `exposure >= 0.0`, `settled_value >= 0.0` | 3 (inductive, via clamping) |
@@ -39,10 +39,9 @@ SIGIL_DEMO_CAPACITY=4 SIGIL_CHAOS_FAIL_PCT=15 SIGIL_CHAOS_LATENCY_MS=90 cargo ru
 
 ## Two bugs the compiler caught while this file was being written
 
-**1. An invariant that looks right and is false.** The obvious spec is
-`Settlement.settled <= RiskEngine.cleared`. RiskEngine forwards *every*
-message but increments `cleared` only conditionally — so a rejected trade
-still reaches Settlement:
+**1. Forwarding and counting must agree.** The first draft forwarded *every*
+message to Settlement but incremented `cleared` only conditionally, so a
+rejected trade still reached Settlement:
 
 ```
 GAP fails — the `trade` handler of `RiskEngine` forwards up to 1 message(s)
@@ -50,8 +49,15 @@ toward `Settlement`, each able to add 1 to `settled`, but only guarantees
 +0 to `cleared`.
 ```
 
-Bounding against `assessed` (which rises unconditionally) is correct. No
-amount of code review reliably catches this; the counting argument does.
+The fix is a conditional send:
+
+```
+send checked to Settlement @deadline(5.ms) when checked.lots > 0
+```
+
+The prover evaluates the counter's delta **under that same guard**, so the
+correlation is proven rather than assumed. Remove the `when` and the build
+fails again — the guard is load-bearing, and a test asserts it.
 
 **2. A one-sided clamp.** Capping the maximum and forgetting the minimum is
 the classic shipped bug:
@@ -83,6 +89,13 @@ Every number reconciles:
 - Intake issues `2 × 480 = 960` sends, sheds 229 → `731 = 372 + 359` ✓
 - RiskEngine sheds 44 → `372 − 44 = 328` ✓
 - `328 ≤ 372 ≤ 480` and `359 ≤ 480` — every proven invariant holds ✓
+
+## Hardening
+
+The generated crate forbids `unsafe` outright, enables overflow checks in
+every profile (a wrapped counter would invalidate a proof), and rejects
+non-finite floats at handler entry — `+inf` satisfies `>= 0.0` and would
+otherwise poison `exposure`.
 
 The audit path degraded under pressure, exactly as declared. The settlement
 path stayed fully accounted. Nothing was lost silently, and no invariant

@@ -282,7 +282,21 @@ cause a message to be dispatched to the wrong handler.
 
 ```
 backpressure = "@block" | "@shed" | "@deadline" ~ "(" ~ expr ~ ")"
+when_clause  = "when" ~ expr
 ```
+
+A `send` may be conditional:
+
+```
+send checked to Settlement @deadline(5.ms) when checked.lots > 0
+```
+
+This is what lets a conditionally-forwarded message be bounded by a
+conditionally-incremented counter. The Level-4 prover evaluates the sending
+handler's counter delta **under the same guard**, so the correlation between
+"count it" and "forward it" is proven rather than assumed. Drop the guard
+while leaving the counter conditional and the bound becomes false — and the
+build fails.
 
 What a `send` does when the destination's queue is full:
 
@@ -301,6 +315,23 @@ handlers terminate (bounded retries over bounded timeouts), so every sink
 always drains and back-pressure propagates cleanly upstream.
 
 Shed counts appear per actor in `ActorStats.shed` and in the run report.
+
+## Generated-code hardening
+
+Every emitted crate carries protections against the failure modes that are
+hardest to anticipate:
+
+| Protection | Why |
+| ---------- | --- |
+| `#![forbid(unsafe_code)]` | not merely unused — unrepresentable |
+| `overflow-checks = true` in **all** profiles | silent wrapping past `i64::MAX` would break a proven invariant; overflow aborts the message instead, counted as a drop |
+| finiteness guards on every `Float` field | `+inf` satisfies `>= 0.0` and poisons accumulators; `NaN` fails every comparison. Both are outside the interval model the proofs are stated over, so both are refused at handler entry |
+| no `Mutex`, `Arc`, or atomics | asserted by test, so data races are unrepresentable rather than merely avoided |
+
+Values are **moved on their last use** and cloned only when genuinely needed
+again — a last-use analysis over each handler. Getting that wrong cannot
+corrupt anything: it produces a borrow-check error in the generated crate,
+which the build catches immediately.
 
 ## Specs
 

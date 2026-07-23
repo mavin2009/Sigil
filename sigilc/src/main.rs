@@ -142,6 +142,20 @@ mod integration {
         level2_check, lower, parse, residual_risk_report, GraphIR,
     };
 
+    /// The structural safety properties every generated crate must have:
+    /// no locks, no shared ownership, no unsafe block, and the crate-level
+    /// `forbid(unsafe_code)` that makes the last one unrepresentable.
+    fn no_shared_mutability(rust: &str) -> bool {
+        assert!(!rust.contains("Mutex"), "generated code must not use locks");
+        assert!(!rust.contains("Arc<"), "generated code must not share ownership");
+        assert!(!rust.contains("unsafe {"), "generated code must not use unsafe blocks");
+        assert!(
+            rust.contains("#![forbid(unsafe_code)]"),
+            "generated crates must forbid unsafe outright"
+        );
+        true
+    }
+
     /// Full pipeline: parse → lower → L1 → signatures → L2 → emit → residual.
     fn compile_source(source: &str) -> (String, String, Vec<GraphIR>) {
         let program = parse(source).expect("parse");
@@ -338,6 +352,110 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Hardening of the generated crate against the failure modes that are
+    /// hard to think of: unsafe, silent integer overflow, and hostile floats.
+    #[test]
+    fn generated_crates_are_hardened() {
+        let src = include_str!("../../examples/clearinghouse/clearing.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let rust = emit(&program, &irs);
+
+        // No escape hatch: unsafe is forbidden crate-wide, not merely unused.
+        assert!(rust.contains("#![forbid(unsafe_code)]"));
+        assert!(no_shared_mutability(&rust));
+
+        // Silent wrapping would let a counter roll past i64::MAX and break a
+        // proven invariant, so overflow checks are on in EVERY profile.
+        let toml = sigilc::emit_cargo_toml("x", "../..", false);
+        assert!(toml.contains("[profile.release]") && toml.contains("overflow-checks = true"));
+        assert_eq!(toml.matches("overflow-checks = true").count(), 2, "dev AND release");
+
+        // IEEE-754 has values that satisfy `>= 0.0` yet break the interval
+        // model the proofs are stated over. Every Float field is checked
+        // finite at handler entry, whether or not it carries a `require`.
+        assert!(rust.contains("is_finite()"), "float inputs must be validated");
+        for field in ["notional", "delta_notional"] {
+            assert!(
+                rust.contains(&format!("{field}.is_finite()")),
+                "missing finiteness guard for {field}"
+            );
+        }
+        // The rejection is a typed error the actor counts, not a panic.
+        assert!(rust.contains("SigilError::Schema"));
+    }
+
+    /// Conditional routing: `send ... when <cond>`. The prover correlates the
+    /// guard with the counter, so conditional forwarding can be bounded by a
+    /// conditional counter.
+    #[test]
+    fn conditional_send() {
+        use sigilc::{level4_prove, run_checks, AssuranceLevel};
+        let base = r#"
+schema M { id: String, n: Int }
+process Up {
+  state seen: Int = 0
+  state kept: Int = 0
+  on m: M {
+    seen := seen + 1
+    kept := kept + if m.n > 0 { 1 } else { 0 }
+    send m to Down SEND
+  }
+}
+process Down {
+  state got: Int = 0
+  on m: M { got := got + 1 }
+}
+spec S { hold Down.got <= Up.kept }
+"#;
+        // Unconditional forwarding against a conditional counter is FALSE.
+        let src = base.replace("SEND", "");
+        let program = parse(&src).expect("parse");
+        let err = level4_prove(&program).expect_err("unguarded send breaks the bound");
+        assert!(format!("{err}").contains("GAP fails"));
+
+        // Forwarding under the SAME condition makes it provable.
+        let src = base.replace("SEND", "when m.n > 0");
+        let program = parse(&src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+            .expect("guarded send must prove");
+        assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 1);
+
+        // And it emits an actual conditional.
+        let rust = emit(&program, &irs);
+        assert!(rust.contains("if (m.n > 0) {"), "guarded send codegen: {rust}");
+    }
+
+    /// Clone elision: values are moved on their last use and cloned only when
+    /// genuinely needed again.
+    #[test]
+    fn move_analysis_elides_clones() {
+        let src = r#"
+schema M { id: String, n: Int }
+transform f(m: M) -> M {}
+transform g(m: M) -> M { m }
+process Src {
+  state n: Int = 0
+  on m: M {
+    let ok = m ~> f @recover(with: g)
+    n := n + 1
+    send ok to A
+    send ok to B
+  }
+}
+process A { state a: Int = 0  on m: M { a := a + 1 } }
+process B { state b: Int = 0  on m: M { b := b + 1 } }
+"#;
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let rust = emit(&program, &irs);
+        // Fan-out: the first send still needs the value, the last one owns it.
+        assert!(rust.contains("ok.clone()"), "first send must clone");
+        let clones = rust.matches("ok.clone()").count();
+        assert_eq!(clones, 1, "only ONE clone should survive, got {clones}:\n{rust}");
+    }
+
     /// Conditionals: `if` expressions, condition-aware interval narrowing
     /// (which is what makes clamping provable), and schema literals.
     #[test]
@@ -452,16 +570,21 @@ process P {
         assert!(rust.contains("sigil_rt::backpressure::shed("));
         // Fan-out must CLONE, not move, the shared binding.
         assert!(rust.contains("ok.clone()"), "fan-out must not move the value");
-        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        assert!(no_shared_mutability(&rust));
 
-        // The tempting-but-false invariant is rejected.
-        let false_spec = src.replace(
-            "hold Settlement.settled <= RiskEngine.assessed",
-            "hold Settlement.settled <= RiskEngine.cleared",
+        // The strong invariant holds ONLY because forwarding is conditional
+        // on the same predicate that governs the counter. Drop the `when`
+        // guard and every message reaches Settlement while `cleared` still
+        // rises conditionally — so the bound becomes false and is rejected.
+        let unguarded = src.replace(
+            "send checked to Settlement @deadline(5.ms) when checked.lots > 0",
+            "send checked to Settlement @deadline(5.ms)",
         );
-        let program = parse(&false_spec).expect("parse");
-        let err = sigilc::level4_prove(&program).expect_err("settled <= cleared is false");
-        assert!(format!("{err}").contains("GAP fails"));
+        assert_ne!(unguarded, src, "the conditional send must be present in the example");
+        let program = parse(&unguarded).expect("parse");
+        let err = sigilc::level4_prove(&program)
+            .expect_err("without the guard, settled <= cleared is false");
+        assert!(format!("{err}").contains("GAP fails"), "got: {err}");
     }
 
     /// Back-pressure: three policies, each with its latency and loss
@@ -549,7 +672,7 @@ spec S {
         assert!(rust.contains("sigil_rt::backpressure::shed("));
         assert!(rust.contains("self.__shed += 1"), "shed must be counted");
         assert!(rust.contains("note_shed"));
-        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        assert!(no_shared_mutability(&rust));
 
         let src = base.replace("POLICY", "@deadline(7.ms)").replace("REQUIRE", "");
         let program = parse(&src).unwrap();
@@ -607,7 +730,7 @@ spec S {
         assert!(rust.contains("out.by_key(&ok.account).raw(), RiskEngineMsg::Cancel(ok.clone())"));
         assert!(rust.contains("out.round_robin().raw(), MatchingEngineMsg::NewOrder"));
         assert!(rust.contains("out.round_robin().raw(), MatchingEngineMsg::Cancel"));
-        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        assert!(no_shared_mutability(&rust));
 
         // The demo exercises EVERY handler of the entry process.
         let main_rs = sigilc::emit_demo_main(&program);
@@ -688,7 +811,7 @@ spec S { hold Down.got <= Up.seen }
             "longest-path budget"
         );
         let rust = emit(&program, &irs);
-        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        assert!(no_shared_mutability(&rust));
         // The float accumulator that would need Arc<Mutex<f64>> by hand.
         assert!(rust.contains("pub settled_value: f64"));
     }
@@ -942,7 +1065,7 @@ process Right {
         assert!(rust.contains("__attempt < 2"), "bounded retry loop missing");
         assert!(rust.contains("note_retry(\"score\")"));
         assert!(rust.contains("note_retry(\"post\")"), "untimed retry loop missing");
-        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        assert!(no_shared_mutability(&rust));
     }
 
     /// Routing: Float keys rejected; the three policies emit distinct code.
@@ -958,7 +1081,7 @@ process Right {
         assert!(rust.contains("by_key(&ok.id)"), "hash routing missing");
         assert!(rust.contains("round_robin().raw()"), "round-robin missing");
         assert!(rust.contains("for h in out.shards()"), "broadcast missing");
-        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        assert!(no_shared_mutability(&rust));
     }
 
     /// Multi-process topology: compiler wires outboxes, types the edges,
@@ -975,7 +1098,7 @@ process Right {
         assert!(rust.contains("self.risk_out = None"));
         assert!(rust.contains("self.settlement_out = None"));
         // Still lock-free
-        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        assert!(no_shared_mutability(&rust));
         // Residual report knows the verified topology
         assert!(risk.contains("`Gateway` → `Risk`"), "topology missing from residual report");
 
@@ -1002,9 +1125,7 @@ process Right {
             rust.contains("pub fn spawn(mut self"),
             "spawn must take state by move — isolation by construction"
         );
-        assert!(!rust.contains("Mutex"), "generated code must not use locks");
-        assert!(!rust.contains("Arc<"), "generated code must not share ownership");
-        assert!(!rust.contains("unsafe"), "generated code must not use unsafe");
+        assert!(no_shared_mutability(&rust));
     }
 
     /// The demo driver must exercise real concurrency: a fleet of shards fed
