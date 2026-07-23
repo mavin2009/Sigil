@@ -68,9 +68,9 @@ pub struct OnHandler {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Let { name: String, expr: Expr },
-    Assign { name: String, expr: Expr },
-    Expr(Expr),
+    Let { name: String, expr: Expr, span: Span },
+    Assign { name: String, expr: Expr, span: Span },
+    Expr { expr: Expr, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -202,28 +202,31 @@ fn parse_handler(pair: pest::iterators::Pair<Rule>) -> Result<OnHandler> {
 }
 
 fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
+    let span = Span::from_pest(pair.as_span());
     match pair.as_rule() {
         Rule::let_stmt => {
             let mut inner = pair.into_inner();
             let name = inner.next().unwrap().as_str().to_string();
             let expr = parse_expr(inner.next().unwrap())?;
-            Ok(Stmt::Let { name, expr })
+            Ok(Stmt::Let { name, expr, span })
         }
         Rule::assign_stmt => {
             let mut inner = pair.into_inner();
             let name = inner.next().unwrap().as_str().to_string();
             let expr = parse_expr(inner.next().unwrap())?;
-            Ok(Stmt::Assign { name, expr })
+            Ok(Stmt::Assign { name, expr, span })
         }
         Rule::expr_stmt => {
             let inner = pair.into_inner().next().unwrap();
-            Ok(Stmt::Expr(parse_expr(inner)?))
+            Ok(Stmt::Expr { expr: parse_expr(inner)?, span })
         }
         Rule::stmt => {
             let inner = pair.into_inner().next().unwrap();
             parse_stmt(inner)
         }
-        Rule::expr | Rule::sum | Rule::product | Rule::pipeline => Ok(Stmt::Expr(parse_expr(pair)?)),
+        Rule::expr | Rule::sum | Rule::product | Rule::pipeline => {
+            Ok(Stmt::Expr { expr: parse_expr(pair)?, span })
+        }
         other => bail!("unexpected stmt rule: {:?}", other),
     }
 }

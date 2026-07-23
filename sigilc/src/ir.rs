@@ -68,10 +68,10 @@ pub fn lower(program: &Program) -> Result<GraphIR> {
 
             for stmt in &handler.body {
                 match stmt {
-                    Stmt::Let { name: _, expr } | Stmt::Expr(expr) => {
+                    Stmt::Let { name: _, expr, .. } | Stmt::Expr { expr, .. } => {
                         prev = lower_expr(expr, prev, &mut ir);
                     }
-                    Stmt::Assign { name, expr } => {
+                    Stmt::Assign { name, expr, .. } => {
                         let expr_idx = lower_expr(expr, prev, &mut ir);
                         let write_idx = ir.nodes.len();
                         ir.nodes.push(Node::StateWrite { slot: name.clone() });
