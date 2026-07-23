@@ -32,10 +32,10 @@ process OrderPipeline {
 
   on order: Order {
     let priced = order ~> add_fee
-    let auth = priced ~> authorize
+    let auth = priced ~> authorize @error
     let reserved = auth ~> reserve @timeout(120.ms) @recover(with: release)
     let charged = reserved ~> charge @timeout(200.ms) @recover(with: refund)
-    let receipt = charged ~> confirm
+    let receipt = charged ~> confirm @error
     last_order := receipt.id
     total_charged := total_charged + order.amount
   }

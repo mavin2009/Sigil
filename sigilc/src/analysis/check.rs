@@ -331,3 +331,87 @@ process P {
         assert!(msg.contains("Receipt") && msg.contains("Order"), "{msg}");
     }
 }
+
+/// Level-1: no unhandled failure paths.
+///
+/// Every pipeline stage that invokes an EXTERNAL transform (declared with an
+/// empty body, or never declared) can fail at runtime. Each such stage must
+/// either declare a recovery path (`@recover(with: f)`) or explicitly
+/// acknowledge the failure (`@error`, meaning: on failure this message is
+/// intentionally dropped and the drop is accounted for).
+///
+/// Pure transforms (non-empty bodies) are compiled and infallible, so they
+/// need no tag. Recovery fallbacks SHOULD be pure transforms — a fallible
+/// fallback reintroduces exactly the loss it was meant to prevent.
+pub fn check_failure_paths(program: &Program) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let pure: BTreeSet<&str> = program
+        .transforms
+        .iter()
+        .filter(|t| !t.body.is_empty())
+        .map(|t| t.name.as_str())
+        .collect();
+
+    let mut fallible_fallbacks: Vec<String> = Vec::new();
+
+    for process in &program.processes {
+        for handler in &process.handlers {
+            for stmt in &handler.body {
+                let expr = match stmt {
+                    Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => expr,
+                };
+                walk_failure_paths(expr, &pure, &process.name, &mut fallible_fallbacks)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn walk_failure_paths(
+    expr: &Expr,
+    pure: &std::collections::BTreeSet<&str>,
+    process: &str,
+    fallible_fallbacks: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        Expr::Pipeline { base, steps, .. } => {
+            walk_failure_paths(base, pure, process, fallible_fallbacks)?;
+            for step in steps {
+                let target = match &step.expr {
+                    Expr::Ident { name, .. } => Some(name.as_str()),
+                    Expr::Call { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                if let Some(name) = target {
+                    let is_external = !pure.contains(name);
+                    let has_recover = step.tags.iter().any(|t| matches!(t, Tag::Recover { .. }));
+                    let has_error = step.tags.iter().any(|t| matches!(t, Tag::Error { .. }));
+                    if is_external && !has_recover && !has_error {
+                        bail!(
+                            "Level-1 violation in process '{process}': external stage '{name}' \
+                             has no failure path — add @recover(with: <pure transform>) or \
+                             acknowledge the drop explicitly with @error"
+                        );
+                    }
+                    // Advisory: fallible fallback (external recover target)
+                    for t in &step.tags {
+                        if let Tag::Recover { with, .. } = t {
+                            if let Expr::Ident { name: fb, .. } | Expr::Call { name: fb, .. } = with {
+                                if !pure.contains(fb.as_str()) {
+                                    fallible_fallbacks.push(fb.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_failure_paths(lhs, pure, process, fallible_fallbacks)?;
+            walk_failure_paths(rhs, pure, process, fallible_fallbacks)?;
+        }
+        Expr::Call { .. } | Expr::Ident { .. } | Expr::Literal { .. } | Expr::FieldAccess { .. } => {}
+    }
+    Ok(())
+}

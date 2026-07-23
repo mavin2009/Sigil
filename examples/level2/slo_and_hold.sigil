@@ -30,7 +30,7 @@ process Service {
   on event: Event {
     let n = event ~> normalize
     let e = n ~> enrich @timeout(80.ms) @recover(with: fallback)
-    let a = e ~> ack
+    let a = e ~> ack @error
     let h = hits ~> bump
     hits := h
     last_id := a.id

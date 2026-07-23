@@ -8,7 +8,7 @@
 //! automatic: skipping a level never fails the build silently — every skipped
 //! guarantee is surfaced in the residual-risk report.
 
-use crate::analysis::check::{check_transform_signatures, level1_check};
+use crate::analysis::check::{check_failure_paths, check_transform_signatures, level1_check};
 use crate::analysis::ir::GraphIR;
 use crate::analysis::level2::{level2_check, Level2Report};
 use crate::frontend::ast::Program;
@@ -72,10 +72,12 @@ pub fn run_checks(program: &Program, ir: &GraphIR, level: AssuranceLevel) -> Res
     if level >= AssuranceLevel::Safe {
         level1_check(ir)?;
         check_transform_signatures(program)?;
+        check_failure_paths(program)?;
     } else {
         skipped.push("shared-mutability / local-state discipline (Level-1 not run)".into());
         skipped.push("@timeout ↔ @recover pairing (Level-1 not run)".into());
         skipped.push("pipeline ↔ transform signature agreement (not checked)".into());
+        skipped.push("failure-path coverage of external stages (not checked)".into());
         notes.push(
             "SKETCH MODE: no safety guarantees are established. \
              Do not deploy artifacts built at Level 0."

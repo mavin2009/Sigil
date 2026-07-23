@@ -117,7 +117,7 @@ fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
         body_src.push_str(&format!("    Ok({param})\n"));
     }
     format!(
-        "fn {}({param}: {in_ty}) -> Result<{out_ty}> {{\n{body_src}}}\n",
+        "async fn {}({param}: {in_ty}) -> Result<{out_ty}> {{\n{body_src}}}\n",
         t.name
     )
 }
@@ -212,15 +212,17 @@ fn emit_actor(process: &Process) -> String {
              \x20   /// Move this process's state into an isolated task.\n\
              \x20   /// After `spawn`, the state is unreachable except via messages;\n\
              \x20   /// it is returned intact when the last Handle is dropped.\n\
-             \x20   pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<Self>) {{\n\
+             \x20   pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>) {{\n\
              \x20       let (tx, mut rx) = tokio::sync::mpsc::channel::<{msg_ty}>(capacity);\n\
              \x20       let join = tokio::spawn(async move {{\n\
+             \x20           let mut stats = sigil_rt::ActorStats::default();\n\
              \x20           while let Some(msg) = rx.recv().await {{\n\
-             \x20               if let Err(e) = self.{method}(msg).await {{\n\
-             \x20                   eprintln!(\"[{p}] handler error (recovered stages already applied): {{e:?}}\");\n\
+             \x20               match self.{method}(msg).await {{\n\
+             \x20                   Ok(()) => stats.handled += 1,\n\
+             \x20                   Err(_) => stats.dropped += 1, // residual stage failed with no recover path\n\
              \x20               }}\n\
              \x20           }}\n\
-             \x20           self\n\
+             \x20           (self, stats)\n\
              \x20       }});\n\
              \x20       ({p}Handle {{ tx }}, join)\n\
              \x20   }}\n\
@@ -255,7 +257,7 @@ fn emit_actor(process: &Process) -> String {
     s.push_str("}\n\n");
 
     s.push_str(&format!(
-        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<Self>) {{\n        let (tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let join = tokio::spawn(async move {{\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
+        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>) {{\n        let (tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let join = tokio::spawn(async move {{\n            let mut stats = sigil_rt::ActorStats::default();\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
     ));
     for h in &process.handlers {
         s.push_str(&format!(
@@ -265,7 +267,7 @@ fn emit_actor(process: &Process) -> String {
         ));
     }
     s.push_str(&format!(
-        "                }};\n                if let Err(e) = r {{\n                    eprintln!(\"[{p}] handler error: {{e:?}}\");\n                }}\n            }}\n            self\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
+        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n            (self, stats)\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
     ));
     s
 }
@@ -355,7 +357,7 @@ fn emit_expr(expr: &Expr, states: &[String], msg: &str) -> String {
                 .map(|e| emit_expr(e, states, msg))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{name}({a})?")
+            format!("{name}({a}).await?")
         }
         Expr::Binary { op, lhs, rhs, .. } => {
             let op_s = match op {
@@ -428,19 +430,30 @@ fn emit_pipeline(
             let fallback = recover.unwrap_or_else(|| transform.clone());
             if multiline {
                 let inner = format!(
-                    "match timeout(Duration::from_millis({ms}), async {{ {transform}({current}.clone()) }}).await {{\n\
-{indent}    Ok(Ok(v)) => v,\n\
-{indent}    Ok(Err(_)) | Err(_) => {fallback}({current})?,\n\
+                    "{{\n\
+{indent}    let __in = {current};\n\
+{indent}    match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{\n\
+{indent}        Ok(Ok(v)) => v,\n\
+{indent}        Ok(Err(_)) | Err(_) => {{\n\
+{indent}            sigil_rt::chaos::note_recovery(\"{transform}\");\n\
+{indent}            {fallback}(__in).await?\n\
+{indent}        }}\n\
+{indent}    }}\n\
 {indent}}}"
                 );
                 current = inner;
             } else {
                 current = format!(
-                    "(match timeout(Duration::from_millis({ms}), async {{ {transform}({current}.clone()) }}).await {{ Ok(Ok(v)) => v, Ok(Err(_)) | Err(_) => {fallback}({current})?, }})"
+                    "({{ let __in = {current}; match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => v, Ok(Err(_)) | Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }})"
                 );
             }
+        } else if let Some(fallback) = recover {
+            // Untimed external stage with a declared recovery path.
+            current = format!(
+                "({{ let __in = {current}; match {transform}(__in.clone()).await {{ Ok(v) => v, Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }})"
+            );
         } else {
-            current = format!("{transform}({current})?");
+            current = format!("{transform}({current}).await?");
         }
     }
     current
@@ -477,14 +490,16 @@ fn rust_type(ty: &Type) -> String {
 }
 
 fn emit_external_stub(name: &str, in_ty: &str, out_ty: &str) -> String {
+    // External residual stages route through sigil_rt::chaos so injected
+    // latency and faults exercise the verified @timeout/@recover paths.
     if in_ty == out_ty {
         format!(
-            "fn {name}(input: {in_ty}) -> Result<{out_ty}> {{\n    Ok(input)\n}}\n"
+            "async fn {name}(input: {in_ty}) -> Result<{out_ty}> {{\n    sigil_rt::chaos::external_stage(\"{name}\").await?;\n    Ok(input)\n}}\n"
         )
     } else {
         // Stage changes schema: build a default output (residual: real logic belongs here).
         format!(
-            "fn {name}(_input: {in_ty}) -> Result<{out_ty}> {{\n    Ok({out_ty}::default())\n}}\n"
+            "async fn {name}(_input: {in_ty}) -> Result<{out_ty}> {{\n    sigil_rt::chaos::external_stage(\"{name}\").await?;\n    Ok({out_ty}::default())\n}}\n"
         )
     }
 }
@@ -674,25 +689,28 @@ use std::time::Instant;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {{
-    const SHARDS: usize = {shards};
-    const PRODUCERS: usize = {producers};
-    const MSGS_PER_PRODUCER: usize = {per_producer};
-    const TOTAL: usize = PRODUCERS * MSGS_PER_PRODUCER;
+    fn env_usize(key: &str, default: usize) -> usize {{
+        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }}
+    let shards: usize = env_usize("SIGIL_DEMO_SHARDS", {shards});
+    let producers: usize = env_usize("SIGIL_DEMO_PRODUCERS", {producers});
+    let msgs_per_producer: usize = env_usize("SIGIL_DEMO_MSGS", {per_producer});
+    let total = producers * msgs_per_producer;
 
     let mut handles = Vec::new();
     let mut joins = Vec::new();
-    for _ in 0..SHARDS {{
+    for _ in 0..shards {{
         let (h, j) = {p}::new().spawn(1024);
         handles.push(h);
         joins.push(j);
     }}
 
     let t0 = Instant::now();
-    let mut producers = Vec::new();
-    for prod in 0..PRODUCERS {{
+    let mut producer_tasks = Vec::new();
+    for prod in 0..producers {{
         let hs = handles.clone();
-        producers.push(tokio::spawn(async move {{
-            for i in 0..MSGS_PER_PRODUCER {{
+        producer_tasks.push(tokio::spawn(async move {{
+            for i in 0..msgs_per_producer {{
                 let mut msg = {msg_ty}::default();
 {field_init}                let shard = (prod + i) % hs.len();
                 if hs[shard].send(msg).await.is_err() {{
@@ -701,7 +719,7 @@ async fn main() {{
             }}
         }}));
     }}
-    for t in producers {{
+    for t in producer_tasks {{
         let _ = t.await;
     }}
     drop(handles); // close all channels → actors drain and return their state
@@ -709,17 +727,28 @@ async fn main() {{
     println!("=== {p} concurrent demo ===");
     println!(
         "{{}} shards x {{}} producers, {{}} messages, {{}} worker threads",
-        SHARDS,
-        PRODUCERS,
-        TOTAL,
+        shards,
+        producers,
+        total,
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     );
-{agg_decl}    for (idx, j) in joins.into_iter().enumerate() {{
-        let st = j.await.expect("actor task panicked");
-        println!("shard {{idx}}:{shard_print_fmt}"{shard_print_args});
-{agg_add}    }}
-{agg_print}    println!("expected messages   = {{TOTAL}}");
+{agg_decl}    let mut agg_dropped: u64 = 0;
+    let mut agg_handled: u64 = 0;
+    for (idx, j) in joins.into_iter().enumerate() {{
+        let (st, stats) = j.await.expect("actor task panicked");
+        println!("shard {{idx}}:{shard_print_fmt} handled={{}} dropped={{}}"{shard_print_args}, stats.handled, stats.dropped);
+{agg_add}        agg_handled += stats.handled;
+        agg_dropped += stats.dropped;
+    }}
+{agg_print}    println!("handled + dropped   = {{}} + {{}} = {{}}", agg_handled, agg_dropped, agg_handled + agg_dropped);
+    println!("expected messages   = {{total}}");
+    assert_eq!(
+        agg_handled + agg_dropped,
+        total as u64,
+        "message conservation violated"
+    );
     println!("elapsed = {{:?}} (locks used: 0)", t0.elapsed());
+    println!("{{}}", sigil_rt::chaos::report());
 }}
 "#,
         shards = 8,

@@ -22,10 +22,10 @@ process Ingest {
   state count: Int = 0
 
   on packet: Telemetry {
-    let v = packet ~> validate
+    let v = packet ~> validate @error
     let d = v ~> decompress @timeout(50.ms) @recover(with: empty)
-    let m = d ~> extract
-    let _s = m ~> store
+    let m = d ~> extract @error
+    let _s = m ~> store @error
     last := m.id
     count := count + 1
     let _v = m.value

@@ -9,7 +9,7 @@ pub mod backend;
 
 pub use frontend::{parse, Program, Span};
 pub use analysis::{
-    check_transform_signatures, level2_check, level_banner, level1_check, lower, residual_risk_report,
+    check_failure_paths, check_transform_signatures, level2_check, level_banner, level1_check, lower, residual_risk_report,
     run_checks, AssuranceLevel, CheckOutcome, GraphIR, Level2Report,
 };
 pub use backend::{emit, emit_cargo_toml, emit_demo_main, relative_sigil_rt_path};

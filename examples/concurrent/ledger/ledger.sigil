@@ -1,10 +1,9 @@
-// Concurrent payment ledger.
+// Concurrent payment ledger — total failure-path coverage.
 //
-// Compiled with --emit-main this becomes a fleet of 8 shared-nothing Ledger
-// actors fed by 64 concurrent producer tasks (16,000 payments) on a
-// multi-threaded runtime. Every aggregate is exact with ZERO locks, Arcs, or
-// atomics — the equivalent hand-written Rust needs Arc<Mutex<f64>> (floats
-// can't be atomic) plus per-stage timeout/fallback plumbing.
+// Every external stage carries a recovery path, and every recovery path is a
+// PURE transform (compiled, infallible). Under fault injection this pipeline
+// loses ZERO messages: handled == total, dropped == 0, aggregates exact,
+// with no locks anywhere in the generated program.
 
 schema Payment {
   id: String,
@@ -12,23 +11,27 @@ schema Payment {
   units: Int
 }
 
-// External residual transforms (empty bodies → identity stubs in generated code).
+// External residual stages (empty bodies → chaos-injectable stubs).
 transform validate(p: Payment) -> Payment {}
 transform risk_check(p: Payment) -> Payment {}
 transform hold_funds(p: Payment) -> Payment {}
-transform release(p: Payment) -> Payment {}
-transform refund(p: Payment) -> Payment {}
 transform post(p: Payment) -> Payment {}
+
+// Pure recovery paths: compiled into the crate, cannot fail, cannot be
+// slowed. A fallible fallback would reintroduce the loss it exists to stop.
+transform quarantine(p: Payment) -> Payment { p }
+transform release(p: Payment) -> Payment { p }
+transform refund(p: Payment) -> Payment { p }
 
 process Ledger {
   state posted: Int = 0
   state total_amount: Float = 0.0
 
   on payment: Payment {
-    let ok = payment ~> validate
+    let ok = payment ~> validate @recover(with: quarantine)
     let risked = ok ~> risk_check @timeout(50.ms) @recover(with: release)
     let held = risked ~> hold_funds @timeout(80.ms) @recover(with: refund)
-    let done = held ~> post
+    let done = held ~> post @recover(with: refund)
     posted := posted + done.units
     total_amount := total_amount + done.amount
   }

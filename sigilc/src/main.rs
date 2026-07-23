@@ -125,8 +125,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod integration {
     use sigilc::{
-        check_transform_signatures, emit, emit_demo_main, level1_check, level2_check, lower, parse,
-        residual_risk_report, GraphIR,
+        check_failure_paths, check_transform_signatures, emit, emit_demo_main, level1_check,
+        level2_check, lower, parse, residual_risk_report, GraphIR,
     };
 
     /// Full pipeline: parse → lower → L1 → signatures → L2 → emit → residual.
@@ -135,6 +135,7 @@ mod integration {
         let graph = lower(&program).expect("lower");
         level1_check(&graph).expect("level1");
         check_transform_signatures(&program).expect("signatures");
+        check_failure_paths(&program).expect("failure paths");
         let l2 = level2_check(&program, &graph).expect("level2");
         let rust = emit(&program, &graph);
         let risk = residual_risk_report(&program, &graph, Some(&l2), true);
@@ -297,6 +298,28 @@ mod integration {
         }
     }
 
+    /// Level-1 must reject external stages with no declared failure path.
+    #[test]
+    fn rejects_unrecovered_external_stage() {
+        let src = include_str!("../../examples/proofs/unrecovered_external.sigil");
+        let program = parse(src).expect("parse");
+        let err = check_failure_paths(&program).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("no failure path") && msg.contains("fetch"), "got: {msg}");
+    }
+
+    /// @error acknowledges a drop; @recover without @timeout is now legal.
+    #[test]
+    fn error_ack_and_untimed_recover_pass() {
+        let src = include_str!("../../examples/concurrent/ledger/ledger.sigil");
+        let program = parse(src).expect("parse");
+        check_failure_paths(&program).expect("fully covered pipeline must pass");
+        let (rust, _, _) = compile_source(src);
+        // Untimed @recover emits a match on the stage result with a recovery note.
+        assert!(rust.contains("note_recovery(\"validate\")"), "untimed recover path missing");
+        assert!(rust.contains("note_recovery(\"post\")"));
+    }
+
     /// Every process must compile to a shared-nothing actor: state moves into
     /// an isolated task, reachable only through a Clone-able message handle.
     /// No lock or shared-ownership machinery may appear in generated code.
@@ -327,8 +350,8 @@ mod integration {
         let program = parse(source).unwrap();
         let main_rs = emit_demo_main(&program);
         assert!(main_rs.contains("multi_thread"));
-        assert!(main_rs.contains("const SHARDS"));
-        assert!(main_rs.contains("const PRODUCERS"));
+        assert!(main_rs.contains("SIGIL_DEMO_SHARDS"));
+        assert!(main_rs.contains("SIGIL_DEMO_PRODUCERS"));
         assert!(main_rs.contains("agg_posted") && main_rs.contains("agg_total_amount"));
         assert!(!main_rs.contains("Mutex") && !main_rs.contains("Arc<"));
     }

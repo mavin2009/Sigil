@@ -26,7 +26,7 @@ process ResilientProcessor {
   on event: Event {
     let validated = event ~> normalize
     let enriched = validated ~> enrich @timeout(80.ms) @recover(with: fallback)
-    let stored = enriched ~> store
+    let stored = enriched ~> store @error
     last_ok := stored.id
     processed := processed + 1
   }

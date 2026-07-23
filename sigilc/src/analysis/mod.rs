@@ -8,7 +8,7 @@ pub mod levels;
 
 pub use ir::{lower, GraphIR, Node, Edge, EffectSet};
 pub use levels::{level_banner, run_checks, AssuranceLevel, CheckOutcome};
-pub use check::{level1_check, check_transform_signatures};
+pub use check::{check_failure_paths, check_transform_signatures, level1_check};
 pub use residual::residual_risk_report;
 pub use types::{infer_program, type_name, TypeEnv, TransformTypes};
 pub use level2::{level2_check, Level2Report};

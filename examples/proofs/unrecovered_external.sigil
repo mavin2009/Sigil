@@ -1,0 +1,10 @@
+// MUST FAIL Level-1: external stage 'fetch' has no @recover and no @error.
+schema M { v: Int }
+transform fetch(m: M) -> M {}
+process Broken {
+  state last: Int = 0
+  on m: M {
+    let out = m ~> fetch
+    last := out.v
+  }
+}

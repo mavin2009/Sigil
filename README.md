@@ -11,6 +11,7 @@ These failure modes are rejected or unrepresentable at the default safety level:
 - Data races and shared mutable state
 - Null or undefined values
 - `@timeout` without a matching `@recover`
+- External stages with no declared failure path (must carry `@recover` or an explicit `@error` acknowledgment)
 - State writes to non-local slots
 - Pipeline stages whose types disagree with declared transform signatures
 
@@ -71,6 +72,9 @@ cargo run -p sigilc -- examples/proofs/unhandled_timeout.sigil /tmp/nope
 
 # Must fail — Order fed to transform expecting Receipt
 cargo run -p sigilc -- examples/proofs/type_mismatch.sigil /tmp/nope
+
+# Must fail — external stage with no @recover / @error
+cargo run -p sigilc -- examples/proofs/unrecovered_external.sigil /tmp/nope
 ```
 
 Integration tests assert both programs are rejected with Level-1 / signature diagnostics.

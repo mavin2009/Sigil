@@ -1,48 +1,53 @@
 # Concurrent Ledger
 
-A payment pipeline compiled into a **fleet of shared-nothing actors** — the
-kind of program that is easy to get subtly wrong in hand-written Rust and is
-safe here by construction.
+A payment pipeline compiled into a **fleet of shared-nothing actors** with
+**total failure-path coverage** — verified at build time, demonstrated under
+fault injection at run time.
 
 ## Run it
 
 ```
 cargo run -p sigilc -- examples/concurrent/ledger/ledger.sigil generated/ledger --emit-main --level 2
-cd generated/ledger && cargo run --bin demo
+cd generated/ledger
+
+# Calm run: 16,000 payments, 8 actors, 64 producers
+cargo run --bin demo
+
+# Chaos run: 15% injected faults, latency spikes past both timeouts
+SIGIL_CHAOS_FAIL_PCT=15 SIGIL_CHAOS_LATENCY_MS=150 cargo run --bin demo
 ```
 
-## What the demo does
+Demo load is tunable: `SIGIL_DEMO_SHARDS`, `SIGIL_DEMO_PRODUCERS`,
+`SIGIL_DEMO_MSGS`. Chaos knobs: `SIGIL_CHAOS_FAIL_PCT`,
+`SIGIL_CHAOS_LATENCY_MS`, `SIGIL_CHAOS_SLOW_PCT`.
 
-- Spawns **8 isolated `Ledger` actors** (state moves into each actor's task;
-  after `spawn` it is unreachable except via messages)
-- Fires **16,000 payments from 64 concurrent producer tasks** on a
-  multi-threaded tokio runtime
-- Each payment flows through `validate → risk_check @timeout(50.ms)
-  @recover(release) → hold_funds @timeout(80.ms) @recover(refund) → post`
-- Prints per-shard and aggregate state after all channels drain
+## Measured result (identical chaos, before/after the failure-path rule)
 
-## Expected output
+| Pipeline                                   | faults injected | recoveries | dropped | aggregates |
+| ------------------------------------------ | --------------- | ---------- | ------- | ---------- |
+| v1: untimed stages unprotected             | 1,749           | 1,330      | **1,031** | exact conservation (posted + dropped = total) |
+| v2: every stage `@recover`, pure fallbacks | 1,807           | 2,529      | **0**     | posted = total exactly |
 
-```
-aggregate posted       = 16000
-aggregate total_amount = 16000.0
-elapsed = ... (locks used: 0)
-```
+v1 no longer compiles: the Level-1 failure-path check rejects any external
+stage lacking `@recover` or an explicit `@error`. The design that survives
+chaos is the only design the compiler accepts.
 
-Both aggregates are **exact**. `total_amount` is an `f64` accumulator mutated
-from 16,000 concurrent messages — in plain Rust that requires
-`Arc<Mutex<f64>>` (floats have no atomic ops), and every timed stage needs
-hand-rolled `tokio::time::timeout` + fallback plumbing that the compiler
-cannot check you got right.
+## Why recovery paths are pure transforms
+
+`quarantine`, `release`, `refund` have bodies, so they compile into the crate:
+infallible, un-slowable, exempt from chaos. A fallible fallback reintroduces
+exactly the loss it exists to prevent — v1's drops included recover stubs
+failing mid-recovery.
 
 ## Why this is hard to make safe in regular Rust
 
-| Hazard in hand-written Rust            | Sigil                                          |
-| -------------------------------------- | ---------------------------------------------- |
-| Shared `f64` needs `Mutex` (deadlocks, contention) | State is task-local by construction   |
-| Forgetting a timeout fallback → hung request        | `@timeout` without `@recover` fails the build |
-| Accidentally holding a lock across `.await`         | No locks exist to hold             |
-| State observable mid-update from another thread     | Only reachable via `join()` after channel close |
+| Hazard in hand-written Rust                          | Sigil                                        |
+| ---------------------------------------------------- | -------------------------------------------- |
+| Shared `f64` needs `Arc<Mutex<f64>>` (no float atomics) | State is task-local by construction       |
+| Forgetting a timeout fallback → hung request         | `@timeout` without `@recover` fails the build |
+| Forgetting error handling on one RPC → silent loss   | Untagged external stage fails the build      |
+| Holding a lock across `.await`                       | No locks exist to hold                       |
+| Message loss invisible until reconciliation          | Actors count handled/dropped; demo asserts conservation |
 
-The generated crate contains **zero** `Mutex`, `Arc`, atomics, or `unsafe` —
-enforced by an integration test (`emitted_process_is_a_lock_free_actor`).
+Generated code contains **zero** `Mutex`, `Arc`, atomics, or `unsafe`
+(enforced by test `emitted_process_is_a_lock_free_actor`).
