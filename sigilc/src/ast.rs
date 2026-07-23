@@ -443,6 +443,18 @@ process P {
     }
 
     #[test]
+    fn parse_resilient_example() {
+        let src = include_str!("../../examples/resilient.sigil");
+        let prog = parse(src).expect("should parse resilient.sigil");
+        assert_eq!(prog.processes.len(), 1);
+        assert_eq!(prog.processes[0].name, "ResilientProcessor");
+        assert_eq!(prog.processes[0].states.len(), 1);
+        assert_eq!(prog.processes[0].states[0].name, "last_ok");
+        assert_eq!(prog.processes[0].handlers.len(), 1);
+        assert!(prog.processes[0].handlers[0].body.len() >= 3);
+    }
+
+    #[test]
     fn parse_binary_arithmetic() {
         let src = r#"
 schema S { x: Int }

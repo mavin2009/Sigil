@@ -97,6 +97,18 @@ mod integration {
     }
 
     #[test]
+    
+    #[test]
+    fn compile_resilient_example() {
+        let source = include_str!("../../examples/resilient.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert!(graph.has_timeout(), "resilient example must have a timeout");
+        assert!(graph.has_recover(), "resilient example must recover the timeout");
+        assert!(risk.contains("Level-1"));
+        assert!(graph.local_states.iter().any(|s| s == "last_ok"));
+        assert!(rust.len() > 50);
+    }
+
     fn compile_counter_example() {
         let source = include_str!("../../examples/counter.sigil");
         let (rust, risk, graph) = compile_source(source);

@@ -1,0 +1,27 @@
+// Resilient event processor — demonstrates Sigil's core power:
+// - Explicit failure recovery with @timeout + @recover
+// - Isolated local state
+// - Causal dataflow pipelines
+// - Level-1 extinct-by-design guarantees (no shared mutability, no nulls, no unhandled timeouts)
+// - Residual risk is reported for the external transforms
+
+schema Event {
+  id: String,
+  payload: String
+}
+
+schema Result {
+  id: String,
+  status: String
+}
+
+process ResilientProcessor {
+  state last_ok: String = "none"
+
+  on event: Event {
+    let validated = event ~> validate
+    let processed = validated ~> enrich @timeout(80.ms) @recover(with: fallback)
+    let stored = processed ~> store
+    last_ok := stored.id
+  }
+}
