@@ -1,0 +1,186 @@
+// ===========================================================================
+// DERIVATIVES CLEARING HOUSE
+//
+// This is the shape of system that is genuinely hard to harden by hand:
+//
+//                        ┌──────────────> AuditTrail        (@shed, best effort)
+//   Intake ──by account──┤
+//                        └──> RiskEngine ──> Settlement     (@deadline, critical)
+//
+//   * FAN-OUT: one intake feeds two downstream paths with DIFFERENT
+//     reliability requirements. The audit path may shed under load; the
+//     settlement path may not silently disappear.
+//   * MULTI-HANDLER: trades and amendments both traverse every stage.
+//     Amendments are the path people forget to risk-check.
+//   * CONDITIONAL ACCEPTANCE: risk rejects some trades. The counter must
+//     still never exceed intake — proven, not assumed.
+//   * CLAMPED VALUE ACCUMULATION: exposure is bounded on BOTH sides. The
+//     prover rejects a one-sided clamp, which is the bug people ship.
+//   * DIVERGENT BACK-PRESSURE: @shed on audit, @deadline on settlement,
+//     and the latency claim is only provable because neither blocks.
+//
+// PROVEN AT --level 4:
+//   RiskEngine.assessed  <= Intake.accepted
+//   Settlement.settled   <= RiskEngine.assessed
+//   AuditTrail.recorded  <= Intake.accepted
+//
+//   NOTE: `Settlement.settled <= RiskEngine.cleared` LOOKS right and is
+//   FALSE — RiskEngine forwards every message but only counts `cleared`
+//   conditionally, so a rejected trade still reaches Settlement. The
+//   compiler rejected that spec when this example was first written:
+//     GAP fails — the `trade` handler of `RiskEngine` forwards up to 1
+//     message(s) toward `Settlement`, each able to add 1 to `settled`, but
+//     only guarantees +0 to `cleared`.
+//   Bounding against `assessed` (which rises unconditionally) is correct.
+//
+// PROVEN AT --level 3:
+//   RiskEngine.cleared <= RiskEngine.assessed    (relational: conditional
+//                                                 acceptance never exceeds
+//                                                 what was assessed)
+//   exposure >= 0.0, settled_value >= 0.0        (inductive, with clamping)
+//
+// PROVEN AT --level 2:
+//   end-to-end latency <= 500ms INCLUDING queue hand-off
+// ===========================================================================
+
+schema Trade {
+  id: String,
+  account: String,
+  notional: Float,
+  lots: Int
+}
+
+schema Amendment {
+  id: String,
+  account: String,
+  delta_notional: Float
+}
+
+// ---- External residual stages: the real world lives behind these ----
+transform validate_trade(t: Trade) -> Trade {}
+transform validate_amend(a: Amendment) -> Amendment {}
+transform margin_check(t: Trade) -> Trade {}
+transform amend_margin(a: Amendment) -> Amendment {}
+transform post_trade(t: Trade) -> Trade {}
+transform post_amend(a: Amendment) -> Amendment {}
+transform write_audit_trade(t: Trade) -> Trade {}
+transform write_audit_amend(a: Amendment) -> Amendment {}
+
+// ---- Pure rejection paths: compiled, infallible, cannot fail open ----
+transform reject_trade(t: Trade) -> Trade { t }
+transform reject_amend(a: Amendment) -> Amendment { a }
+transform no_margin(t: Trade) -> Trade { t }
+transform no_amend_margin(a: Amendment) -> Amendment { a }
+transform unposted_trade(t: Trade) -> Trade { t }
+transform unposted_amend(a: Amendment) -> Amendment { a }
+transform audit_gap_trade(t: Trade) -> Trade { t }
+transform audit_gap_amend(a: Amendment) -> Amendment { a }
+
+process Intake {
+  state accepted: Int = 0
+
+  on trade: Trade {
+    let ok = trade ~> validate_trade @timeout(30.ms) @retry(1) @recover(with: reject_trade)
+    accepted := accepted + 1
+    // Critical path: bounded hand-off, never silently dropped without count.
+    send ok to RiskEngine by ok.account @deadline(5.ms)
+    // Best-effort path: audit may shed under load rather than stall clearing.
+    send ok to AuditTrail @shed
+  }
+
+  on amendment: Amendment {
+    let ok = amendment ~> validate_amend @timeout(30.ms) @retry(1) @recover(with: reject_amend)
+    accepted := accepted + 1
+    send ok to RiskEngine by ok.account @deadline(5.ms)
+    send ok to AuditTrail @shed
+  }
+}
+
+process RiskEngine {
+  state assessed: Int = 0
+  state cleared: Int = 0
+  state exposure: Float = 0.0
+
+  on trade: Trade {
+    let checked = trade ~> margin_check @timeout(60.ms) @retry(2) @recover(with: no_margin)
+    assessed := assessed + 1
+
+    // Two-sided clamp. A one-sided clamp does NOT prove `exposure >= 0.0`;
+    // the prover rejects it, which is the whole point.
+    let bounded = if checked.notional > 1000000.0 {
+      1000000.0
+    } else {
+      if checked.notional < 0.0 { 0.0 } else { checked.notional }
+    }
+    exposure := exposure + bounded
+
+    // Conditional acceptance: oversized lots are assessed but not cleared.
+    // `cleared` therefore rises by 0 or 1 while `assessed` rises by exactly
+    // 1, which is what makes `cleared <= assessed` provable.
+    cleared := cleared + if checked.lots > 0 { 1 } else { 0 }
+
+    send checked to Settlement @deadline(5.ms)
+  }
+
+  on amendment: Amendment {
+    let checked = amendment ~> amend_margin @timeout(40.ms) @retry(1) @recover(with: no_amend_margin)
+    assessed := assessed + 1
+
+    let bounded = if checked.delta_notional > 1000000.0 {
+      1000000.0
+    } else {
+      if checked.delta_notional < 0.0 { 0.0 } else { checked.delta_notional }
+    }
+    exposure := exposure + bounded
+    cleared := cleared + 1
+
+    send checked to Settlement @deadline(5.ms)
+  }
+}
+
+process Settlement {
+  state settled: Int = 0
+  state settled_value: Float = 0.0
+
+  on trade: Trade {
+    let posted = trade ~> post_trade @timeout(80.ms) @retry(1) @recover(with: unposted_trade)
+    settled := settled + 1
+    let value = if posted.notional < 0.0 { 0.0 } else { posted.notional }
+    settled_value := settled_value + value
+  }
+
+  on amendment: Amendment {
+    let posted = amendment ~> post_amend @timeout(80.ms) @retry(1) @recover(with: unposted_amend)
+    settled := settled + 1
+    let value = if posted.delta_notional < 0.0 { 0.0 } else { posted.delta_notional }
+    settled_value := settled_value + value
+  }
+}
+
+process AuditTrail {
+  state recorded: Int = 0
+
+  on trade: Trade {
+    let logged = trade ~> write_audit_trade @timeout(50.ms) @retry(1) @recover(with: audit_gap_trade)
+    recorded := recorded + 1
+  }
+
+  on amendment: Amendment {
+    let logged = amendment ~> write_audit_amend @timeout(50.ms) @retry(1) @recover(with: audit_gap_amend)
+    recorded := recorded + 1
+  }
+}
+
+spec ClearingSafety {
+  require path_latency <= 500.ms
+
+  hold exposure >= 0.0
+  hold settled_value >= 0.0
+  hold cleared <= assessed
+
+  hold RiskEngine.assessed <= Intake.accepted
+  hold Settlement.settled <= RiskEngine.assessed
+  hold AuditTrail.recorded <= Intake.accepted
+
+  extinct [null]
+}

@@ -1,0 +1,17 @@
+// MUST FAIL --level 3: clamping only the upper bound leaves the value
+// unbounded below, so the accumulator can escape `exposure >= 0.0`.
+// This is the bug people ship: cap the max, forget the min.
+schema Trade { id: String, notional: Float }
+transform check(t: Trade) -> Trade {}
+transform hold(t: Trade) -> Trade { t }
+process Risk {
+  state exposure: Float = 0.0
+  on trade: Trade {
+    let ok = trade ~> check @recover(with: hold)
+    let bounded = if ok.notional > 1000.0 { 1000.0 } else { ok.notional }
+    exposure := exposure + bounded
+  }
+}
+spec Broken {
+  hold exposure >= 0.0
+}

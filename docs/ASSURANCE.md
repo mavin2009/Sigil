@@ -157,6 +157,8 @@ right reason.
 | `latency_budget_overflow.sigil` | hand-off deadline pushes the path over budget |
 | `hold_bad_init.sigil` | init violates its own invariant |
 | `hold_not_inductive.sigil` | update can escape the invariant |
+| `one_sided_clamp.sigil` | clamping only the upper bound |
+| `mixed_numeric_types.sigil` | `Int` and `Float` mixed in arithmetic |
 | `system_ordering.sigil` | counting after forwarding |
 | `system_leak.sigil` | a second entry bypassing the counter |
 | `system_broadcast.sigil` | broadcast on a counted path |

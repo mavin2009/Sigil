@@ -159,6 +159,18 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
             }
         }
         Expr::FieldAccess { .. } | Expr::Literal { .. } => prev,
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            let a = lower_expr(cond, prev, ir);
+            let b = lower_expr(then_branch, a, ir);
+            lower_expr(else_branch, b, ir)
+        }
+        Expr::SchemaLit { fields, .. } => {
+            let mut cur = prev;
+            for (_, e) in fields {
+                cur = lower_expr(e, cur, ir);
+            }
+            cur
+        }
         Expr::Binary { lhs, rhs, .. } => {
             let _ = lower_expr(lhs, prev, ir);
             lower_expr(rhs, prev, ir)

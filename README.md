@@ -121,13 +121,14 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 
 | Directory | Focus |
 | --------- | ----- |
+| [`examples/clearinghouse/`](examples/clearinghouse/) | **derivatives clearing house** — fan-out with divergent reliability, conditional acceptance, clamped accumulation; the most complex example |
 | [`examples/security/`](examples/security/) | **zero-trust secrets vault** — audit-before-serve proven; fail-closed by construction |
 | [`examples/finance/`](examples/finance/) | **clearing & settlement** — 5 proofs, 380 ms budget, an `f64` accumulator with no `Arc<Mutex<>>` |
 | [`examples/trading/`](examples/trading/) | **exchange order gateway** — multi-handler; cancels are risk-checked, provably |
 | [`examples/level4/`](examples/level4/) | system conservation across a topology |
 | [`examples/level3/`](examples/level3/) | inductive invariants with runtime-guarded assumptions |
 | [`examples/concurrent/`](examples/concurrent/) | lock-free actor fleets, routing policies, chaos runs |
-| [`examples/proofs/`](examples/proofs/) | 25 programs that **must fail to compile** |
+| [`examples/proofs/`](examples/proofs/) | 27 programs that **must fail to compile** |
 
 ## What it rules out
 
@@ -162,7 +163,7 @@ docs/             language reference, assurance levels, runtime, rationale
 cargo test
 ```
 
-75 tests: parser, per-level checks, both provers, topology and routing,
+77 tests: parser, per-level checks, both provers, topology and routing,
 codegen shape, and end-to-end compilation of every example. Every rule has a
 program in `examples/proofs/` asserted to fail *for the right reason*.
 

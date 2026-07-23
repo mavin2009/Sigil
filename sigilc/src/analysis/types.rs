@@ -111,6 +111,16 @@ fn collect_field_uses(stmt: &Stmt, uses: &mut BTreeMap<String, BTreeSet<String>>
 
 fn walk_field_uses(expr: &Expr, uses: &mut BTreeMap<String, BTreeSet<String>>) {
     match expr {
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_field_uses(cond, uses);
+            walk_field_uses(then_branch, uses);
+            walk_field_uses(else_branch, uses);
+        }
+        Expr::SchemaLit { fields, .. } => {
+            for (_, e) in fields {
+                walk_field_uses(e, uses);
+            }
+        }
         Expr::FieldAccess { base, field, .. } => {
             uses.entry(base.clone()).or_default().insert(field.clone());
         }
@@ -172,6 +182,21 @@ fn infer_expr_type(
     transforms: &mut TransformTypes,
 ) -> String {
     match expr {
+        Expr::SchemaLit { name, .. } => name.clone(),
+        Expr::If { then_branch, else_branch, .. } => {
+            // Both branches must agree; prefer the then-branch and fall back
+            // to the else-branch when the first is uninformative.
+            let t = infer_expr_type(
+                then_branch, env, msg_ty, schema_fields, binding_fields, transforms,
+            );
+            if t == msg_ty {
+                infer_expr_type(
+                    else_branch, env, msg_ty, schema_fields, binding_fields, transforms,
+                )
+            } else {
+                t
+            }
+        }
         Expr::Ident { name, .. } => env
             .get(name)
             .cloned()

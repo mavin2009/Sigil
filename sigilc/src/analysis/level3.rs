@@ -41,6 +41,21 @@ impl Interval {
         Interval { lo: self.lo - o.hi, hi: self.hi - o.lo }
     }
 
+    /// Smallest interval containing both — the join of two branches.
+    fn hull(self, o: Self) -> Self {
+        Interval {
+            lo: self.lo.min(o.lo),
+            hi: self.hi.max(o.hi),
+        }
+    }
+
+    fn meet(self, o: Self) -> Self {
+        Interval {
+            lo: self.lo.max(o.lo),
+            hi: self.hi.min(o.hi),
+        }
+    }
+
     fn mul(self, o: Self) -> Self {
         let mut c: Vec<f64> = Vec::new();
         for a in [self.lo, self.hi] {
@@ -502,6 +517,10 @@ pub(crate) fn eval_interval(
             }
         }
         Expr::FieldAccess { base, field, .. } => {
+            // A narrowed branch may have refined this exact field.
+            if let Some(v) = lets.get(&format!("{base}.{field}")) {
+                return *v;
+            }
             if base == msg_name {
                 let bounds: Vec<&InputPrecondition> = preconds
                     .iter()
@@ -543,11 +562,96 @@ pub(crate) fn eval_interval(
             why.push("value flows through transforms (not in the linear fragment)".into());
             Interval::TOP
         }
+        Expr::SchemaLit { .. } => {
+            why.push("schema literals are not numeric values".into());
+            Interval::TOP
+        }
+        // `if` is where real code enforces its own invariants (clamping,
+        // flooring, capping). Evaluating each branch under the NARROWED
+        // condition — rather than taking a blind hull — is what makes those
+        // patterns provable.
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            let (then_env, else_env) = narrow(cond, lets, owner, msg_name, holds, preconds);
+            let t = eval_interval(
+                then_branch, owner, msg_name, holds, preconds, &then_env, why,
+            );
+            let e = eval_interval(
+                else_branch, owner, msg_name, holds, preconds, &else_env, why,
+            );
+            t.hull(e)
+        }
     }
+}
+
+/// Refine the environment for each branch of `if <var> <cmp> <literal>`.
+///
+/// In the then-branch the variable is known to satisfy the comparison; in
+/// the else-branch it satisfies the negation. Any other condition shape
+/// leaves both environments unchanged (sound, just less precise).
+fn narrow(
+    cond: &Expr,
+    lets: &BTreeMap<String, Interval>,
+    owner: &Process,
+    msg_name: &str,
+    holds: &BTreeMap<String, (Pred, String)>,
+    preconds: &[InputPrecondition],
+) -> (BTreeMap<String, Interval>, BTreeMap<String, Interval>) {
+    let mut then_env = lets.clone();
+    let mut else_env = lets.clone();
+
+    let Expr::Binary { op, lhs, rhs, .. } = cond else {
+        return (then_env, else_env);
+    };
+    let Some(bound) = (match rhs.as_ref() {
+        Expr::Literal { value, .. } => lit_value(value),
+        _ => None,
+    }) else {
+        return (then_env, else_env);
+    };
+    // Only simple named values can be narrowed.
+    let key = match lhs.as_ref() {
+        Expr::Ident { name, .. } => name.clone(),
+        Expr::FieldAccess { base, field, .. } => format!("{base}.{field}"),
+        _ => return (then_env, else_env),
+    };
+
+    let mut scratch = Vec::new();
+    let current = eval_interval(lhs, owner, msg_name, holds, preconds, lets, &mut scratch);
+
+    // Regions admitted by the comparison and by its negation.
+    let (t_region, e_region) = match op {
+        BinOp::Gt => (
+            Interval { lo: bound, hi: f64::INFINITY },
+            Interval { lo: f64::NEG_INFINITY, hi: bound },
+        ),
+        BinOp::Ge => (
+            Interval { lo: bound, hi: f64::INFINITY },
+            Interval { lo: f64::NEG_INFINITY, hi: bound },
+        ),
+        BinOp::Lt => (
+            Interval { lo: f64::NEG_INFINITY, hi: bound },
+            Interval { lo: bound, hi: f64::INFINITY },
+        ),
+        BinOp::Le => (
+            Interval { lo: f64::NEG_INFINITY, hi: bound },
+            Interval { lo: bound, hi: f64::INFINITY },
+        ),
+        _ => return (then_env, else_env),
+    };
+    then_env.insert(key.clone(), current.meet(t_region));
+    else_env.insert(key, current.meet(e_region));
+    (then_env, else_env)
 }
 
 fn describe_expr(e: &Expr) -> String {
     match e {
+        Expr::If { cond, then_branch, else_branch, .. } => format!(
+            "if {} {{ {} }} else {{ {} }}",
+            describe_expr(cond),
+            describe_expr(then_branch),
+            describe_expr(else_branch)
+        ),
+        Expr::SchemaLit { name, .. } => format!("{name} {{ .. }}"),
         Expr::Ident { name, .. } => name.clone(),
         Expr::FieldAccess { base, field, .. } => format!("{base}.{field}"),
         Expr::Literal { value, .. } => format!("{value:?}"),

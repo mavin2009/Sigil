@@ -190,6 +190,21 @@ if_expr      = "if" ~ expr ~ "{" ~ expr ~ "}" ~ "else" ~ "{" ~ expr ~ "}"
 literal      = duration | string | number | boolean
 ```
 
+Conditionals are expressions, and the provers evaluate each branch under the
+**narrowed** condition — so a two-sided clamp proves a bound while a
+one-sided one does not:
+
+```
+let bounded = if x > 1000.0 { 1000.0 } else { if x < 0.0 { 0.0 } else { x } }
+```
+
+Conditional counting (`kept := kept + if c { 1 } else { 0 }`) yields a delta
+of `[0, 1]`, which is what makes conditional acceptance provable against an
+unconditional counter.
+
+Numeric types do **not** coerce: `Int * Float` is a compile error, not a
+silent widening. Write `1.0` when you mean a float.
+
 `~>` is the pipeline operator: `x ~> f` applies `f` to `x`. Chained steps
 thread the value through, and each step may carry effect tags.
 

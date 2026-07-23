@@ -338,6 +338,132 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Conditionals: `if` expressions, condition-aware interval narrowing
+    /// (which is what makes clamping provable), and schema literals.
+    #[test]
+    fn conditionals_and_narrowing() {
+        use sigilc::{check_numeric_types, level3_prove, run_checks, AssuranceLevel};
+
+        let base = r#"
+schema Order { id: String, qty: Int }
+transform check(o: Order) -> Order {}
+transform hold(o: Order) -> Order { o }
+process Book {
+  state filled: Int = 0
+  on order: Order {
+    let ok = order ~> check @recover(with: hold)
+    let capped = CLAMP
+    filled := filled + capped
+  }
+}
+spec S { hold filled >= 0 }
+"#;
+        // One-sided clamp leaves the value unbounded BELOW: not provable.
+        let src = base.replace("CLAMP", "if ok.qty > 100 { 100 } else { ok.qty }");
+        let program = parse(&src).expect("parse");
+        let err = level3_prove(&program).expect_err("one-sided clamp is not enough");
+        assert!(format!("{err}").contains("INDUCTIVE STEP fails"));
+
+        // Two-sided clamp proves, because each branch is evaluated under the
+        // NARROWED condition rather than a blind hull.
+        let src = base.replace(
+            "CLAMP",
+            "if ok.qty > 100 { 100 } else { if ok.qty < 0 { 0 } else { ok.qty } }",
+        );
+        let program = parse(&src).expect("parse");
+        let report = level3_prove(&program).expect("two-sided clamp must prove");
+        assert_eq!(report.proven.len(), 1);
+
+        // Conditional counting: `+ if c { 1 } else { 0 }` yields delta [0,1],
+        // which is what makes conditional acceptance provable.
+        let cond_count = r#"
+schema M { id: String, n: Int }
+process P {
+  state seen: Int = 0
+  state kept: Int = 0
+  on m: M {
+    seen := seen + 1
+    kept := kept + if m.n > 0 { 1 } else { 0 }
+  }
+}
+spec S { hold kept <= seen }
+"#;
+        let program = parse(cond_count).expect("parse");
+        let report = level3_prove(&program).expect("conditional counting must prove");
+        assert!(report.proven.iter().any(|p| p.contains("kept <= seen")));
+
+        // Codegen emits real Rust conditionals and struct literals.
+        let src = base.replace("CLAMP", "if ok.qty > 100 { 100 } else { 0 }");
+        let program = parse(&src).unwrap();
+        let irs = lower(&program).unwrap();
+        let rust = emit(&program, &irs);
+        assert!(rust.contains("if (ok.qty > 100) { 100 } else { 0 }"));
+
+        let lit = r#"
+schema A { x: Int }
+schema B { y: Int }
+transform f(a: A) -> A {}
+transform g(a: A) -> A { a }
+process P {
+  state n: Int = 0
+  on a: A {
+    let ok = a ~> f @recover(with: g)
+    let made = B { y: ok.x }
+    n := n + made.y
+  }
+}
+"#;
+        let program = parse(lit).expect("schema literals must parse");
+        let irs = lower(&program).expect("lower");
+        run_checks(&program, &irs, AssuranceLevel::Safe).expect("schema literal is legal");
+        let rust = emit(&program, &irs);
+        assert!(rust.contains("B { y: ok.x }"), "schema literal codegen: {rust}");
+
+        // Numeric types do not coerce; the error surfaces in Sigil, not in
+        // the generated Rust.
+        let bad = include_str!("../../examples/proofs/mixed_numeric_types.sigil");
+        let program = parse(bad).expect("parse");
+        let err = check_numeric_types(&program).expect_err("Int * Float must be rejected");
+        assert!(format!("{err}").contains("mixes numeric types"));
+    }
+
+    /// The clearing house: fan-out to paths with different reliability
+    /// requirements, conditional acceptance, clamped accumulation.
+    #[test]
+    fn clearinghouse_component() {
+        use sigilc::{run_checks, AssuranceLevel};
+        let src = include_str!("../../examples/clearinghouse/clearing.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+            .expect("clearing house must pass Level 4");
+        assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 3, "3 system holds");
+        assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 3, "2 scalar + 1 relational");
+
+        // Fan-out: Intake feeds two processes with different policies.
+        let topo = sigilc::derive_topology(&program).expect("topology");
+        let from_intake: std::collections::BTreeSet<_> =
+            topo.edges.iter().filter(|e| e.from == "Intake").map(|e| e.to.as_str()).collect();
+        assert!(from_intake.contains("RiskEngine") && from_intake.contains("AuditTrail"));
+
+        let rust = emit(&program, &irs);
+        // Critical path bounded, audit path sheds.
+        assert!(rust.contains("sigil_rt::backpressure::deadline("));
+        assert!(rust.contains("sigil_rt::backpressure::shed("));
+        // Fan-out must CLONE, not move, the shared binding.
+        assert!(rust.contains("ok.clone()"), "fan-out must not move the value");
+        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+
+        // The tempting-but-false invariant is rejected.
+        let false_spec = src.replace(
+            "hold Settlement.settled <= RiskEngine.assessed",
+            "hold Settlement.settled <= RiskEngine.cleared",
+        );
+        let program = parse(&false_spec).expect("parse");
+        let err = sigilc::level4_prove(&program).expect_err("settled <= cleared is false");
+        assert!(format!("{err}").contains("GAP fails"));
+    }
+
     /// Back-pressure: three policies, each with its latency and loss
     /// characteristics enforced rather than documented.
     #[test]
@@ -477,8 +603,8 @@ spec S {
         assert!(rust.contains("NewOrder(NewOrder)") && rust.contains("Cancel(Cancel)"));
         assert!(rust.contains("send_new_order") && rust.contains("send_cancel"));
         // Each send routes by key AND wraps in the correct dispatch variant.
-        assert!(rust.contains("out.by_key(&ok.account).raw(), RiskEngineMsg::NewOrder(ok)"));
-        assert!(rust.contains("out.by_key(&ok.account).raw(), RiskEngineMsg::Cancel(ok)"));
+        assert!(rust.contains("out.by_key(&ok.account).raw(), RiskEngineMsg::NewOrder(ok.clone())"));
+        assert!(rust.contains("out.by_key(&ok.account).raw(), RiskEngineMsg::Cancel(ok.clone())"));
         assert!(rust.contains("out.round_robin().raw(), MatchingEngineMsg::NewOrder"));
         assert!(rust.contains("out.round_robin().raw(), MatchingEngineMsg::Cancel"));
         assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));

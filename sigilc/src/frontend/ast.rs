@@ -166,6 +166,21 @@ pub enum Expr {
     Pipeline { base: Box<Expr>, steps: Vec<PipeStep>, span: Span },
     Call { name: String, args: Vec<Expr>, span: Span },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
+    /// `if cond { a } else { b }` — both branches are expressions of the
+    /// same type. Provers evaluate branches under the narrowed condition,
+    /// which is what makes clamping provable.
+    If {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+        span: Span,
+    },
+    /// `Schema { field: expr, ... }` — construct a schema value.
+    SchemaLit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +549,32 @@ fn parse_atom(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             let base = inner.next().unwrap().as_str().to_string();
             let field = inner.next().unwrap().as_str().to_string();
             Ok(Expr::FieldAccess { base, field, span })
+        }
+        Rule::if_expr => {
+            let span = Span::from_pest(pair.as_span());
+            let mut inner = pair.into_inner();
+            let cond = parse_expr(inner.next().unwrap())?;
+            let then_branch = parse_expr(inner.next().unwrap())?;
+            let else_branch = parse_expr(inner.next().unwrap())?;
+            Ok(Expr::If {
+                cond: Box::new(cond),
+                then_branch: Box::new(then_branch),
+                else_branch: Box::new(else_branch),
+                span,
+            })
+        }
+        Rule::schema_lit => {
+            let span = Span::from_pest(pair.as_span());
+            let mut inner = pair.into_inner();
+            let name = inner.next().unwrap().as_str().to_string();
+            let mut fields = Vec::new();
+            for fi in inner {
+                let mut it = fi.into_inner();
+                let fname = it.next().unwrap().as_str().to_string();
+                let fexpr = parse_expr(it.next().unwrap())?;
+                fields.push((fname, fexpr));
+            }
+            Ok(Expr::SchemaLit { name, fields, span })
         }
         Rule::literal => parse_literal(pair),
         Rule::call => {

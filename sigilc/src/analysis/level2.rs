@@ -254,6 +254,16 @@ fn classify_rhs(
         impure: &mut bool,
     ) {
         match expr {
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                walk(cond, pure_transforms, state_names, saw_msg, impure);
+                walk(then_branch, pure_transforms, state_names, saw_msg, impure);
+                walk(else_branch, pure_transforms, state_names, saw_msg, impure);
+            }
+            Expr::SchemaLit { fields, .. } => {
+                for (_, e) in fields {
+                    walk(e, pure_transforms, state_names, saw_msg, impure);
+                }
+            }
             Expr::Ident { name, .. } => {
                 if !state_names.contains(name.as_str())
                     && name != "true"
@@ -653,6 +663,13 @@ fn check_require(
 
 fn format_expr(expr: &Expr) -> String {
     match expr {
+        Expr::If { cond, then_branch, else_branch, .. } => format!(
+            "if {} {{ {} }} else {{ {} }}",
+            format_expr(cond),
+            format_expr(then_branch),
+            format_expr(else_branch)
+        ),
+        Expr::SchemaLit { name, .. } => format!("{name} {{ .. }}"),
         Expr::Ident { name, .. } => name.clone(),
         Expr::Literal { value, .. } => match value {
             Literal::Int(i) => i.to_string(),

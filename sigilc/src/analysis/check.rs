@@ -2,7 +2,7 @@
 
 use crate::analysis::ir::{GraphIR, Node};
 use crate::analysis::types::{infer_program, type_name};
-use crate::frontend::ast::{Expr, Program, Stmt, Tag};
+use crate::frontend::ast::{BinOp, Expr, Program, Stmt, Tag};
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 
@@ -510,6 +510,16 @@ fn walk_failure_paths(
                 walk_failure_paths(a, pure, process, fallible_fallbacks)?;
             }
         }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_failure_paths(cond, pure, process, fallible_fallbacks)?;
+            walk_failure_paths(then_branch, pure, process, fallible_fallbacks)?;
+            walk_failure_paths(else_branch, pure, process, fallible_fallbacks)?;
+        }
+        Expr::SchemaLit { fields, .. } => {
+            for (_, e) in fields {
+                walk_failure_paths(e, pure, process, fallible_fallbacks)?;
+            }
+        }
         Expr::Ident { .. } | Expr::Literal { .. } | Expr::FieldAccess { .. } => {}
     }
     Ok(())
@@ -523,7 +533,178 @@ fn step_span_of(step: &crate::frontend::ast::PipeStep) -> crate::frontend::ast::
         | Expr::FieldAccess { span, .. }
         | Expr::Literal { span, .. }
         | Expr::Pipeline { span, .. }
+        | Expr::If { span, .. }
+        | Expr::SchemaLit { span, .. }
         | Expr::Binary { span, .. } => *span,
+    }
+}
+
+/// Numeric type agreement in arithmetic and comparisons.
+///
+/// Sigil does not coerce between `Int` and `Float`: silent widening is how
+/// rounding bugs enter financial code, and an un-checked mix here previously
+/// produced generated Rust that would not compile — the error surfaced in
+/// the output crate instead of in the source. Write `100.0` when you mean a
+/// float.
+pub fn check_numeric_types(program: &Program) -> Result<()> {
+    use crate::analysis::types::type_name;
+    use std::collections::BTreeMap;
+
+    let schemas: BTreeMap<&str, BTreeMap<&str, String>> = program
+        .schemas
+        .iter()
+        .map(|sc| {
+            (
+                sc.name.as_str(),
+                sc.fields
+                    .iter()
+                    .map(|(f, t)| (f.as_str(), type_name(t)))
+                    .collect(),
+            )
+        })
+        .collect();
+    let sigs: BTreeMap<&str, String> = program
+        .transforms
+        .iter()
+        .map(|t| (t.name.as_str(), type_name(&t.return_ty)))
+        .collect();
+
+    for process in &program.processes {
+        let mut base: BTreeMap<String, String> = process
+            .states
+            .iter()
+            .map(|st| (st.name.clone(), type_name(&st.ty)))
+            .collect();
+        for st in &process.states {
+            check_expr_numeric(&st.init, &base, &schemas, &sigs, &process.name)?;
+        }
+        for handler in &process.handlers {
+            let mut env = base.clone();
+            env.insert(handler.msg_name.clone(), type_name(&handler.msg_ty));
+            for stmt in &handler.body {
+                let expr = match stmt {
+                    Stmt::Let { name, expr, .. } => {
+                        check_expr_numeric(expr, &env, &schemas, &sigs, &process.name)?;
+                        if let Some(t) = expr_ty(expr, &env, &schemas, &sigs) {
+                            env.insert(name.clone(), t);
+                        }
+                        continue;
+                    }
+                    Stmt::Assign { expr, .. }
+                    | Stmt::Send { expr, .. }
+                    | Stmt::Expr { expr, .. } => expr,
+                };
+                check_expr_numeric(expr, &env, &schemas, &sigs, &process.name)?;
+            }
+        }
+        base.clear();
+    }
+    Ok(())
+}
+
+type SchemaMap<'a> = std::collections::BTreeMap<&'a str, std::collections::BTreeMap<&'a str, String>>;
+type SigMap<'a> = std::collections::BTreeMap<&'a str, String>;
+
+fn expr_ty(
+    e: &Expr,
+    env: &std::collections::BTreeMap<String, String>,
+    schemas: &SchemaMap,
+    sigs: &SigMap,
+) -> Option<String> {
+    use crate::frontend::ast::Literal;
+    match e {
+        Expr::Literal { value, .. } => Some(
+            match value {
+                Literal::Int(_) => "Int",
+                Literal::Float(_) => "Float",
+                Literal::String(_) => "String",
+                Literal::Bool(_) => "Bool",
+                Literal::DurationMs(_) => "Duration",
+            }
+            .to_string(),
+        ),
+        Expr::Ident { name, .. } => env.get(name).cloned(),
+        Expr::FieldAccess { base, field, .. } => {
+            let bt = env.get(base)?;
+            schemas.get(bt.as_str())?.get(field.as_str()).cloned()
+        }
+        Expr::Call { name, .. } => sigs.get(name.as_str()).cloned(),
+        Expr::SchemaLit { name, .. } => Some(name.clone()),
+        Expr::Pipeline { base, steps, .. } => {
+            let mut cur = expr_ty(base, env, schemas, sigs);
+            for step in steps {
+                cur = match &step.expr {
+                    Expr::Ident { name, .. } | Expr::Call { name, .. } => {
+                        sigs.get(name.as_str()).cloned()
+                    }
+                    _ => None,
+                };
+            }
+            cur
+        }
+        Expr::If { then_branch, else_branch, .. } => expr_ty(then_branch, env, schemas, sigs)
+            .or_else(|| expr_ty(else_branch, env, schemas, sigs)),
+        Expr::Binary { op, lhs, rhs, .. } => match op {
+            BinOp::Le | BinOp::Ge | BinOp::Lt | BinOp::Gt | BinOp::Eq => Some("Bool".into()),
+            _ => expr_ty(lhs, env, schemas, sigs).or_else(|| expr_ty(rhs, env, schemas, sigs)),
+        },
+    }
+}
+
+fn check_expr_numeric(
+    e: &Expr,
+    env: &std::collections::BTreeMap<String, String>,
+    schemas: &SchemaMap,
+    sigs: &SigMap,
+    process: &str,
+) -> Result<()> {
+    match e {
+        Expr::Binary { op, lhs, rhs, span } => {
+            check_expr_numeric(lhs, env, schemas, sigs, process)?;
+            check_expr_numeric(rhs, env, schemas, sigs, process)?;
+            let (lt, rt) = (
+                expr_ty(lhs, env, schemas, sigs),
+                expr_ty(rhs, env, schemas, sigs),
+            );
+            if let (Some(lt), Some(rt)) = (lt, rt) {
+                let numeric = |t: &str| t == "Int" || t == "Float";
+                if numeric(&lt) && numeric(&rt) && lt != rt {
+                    let op_s = match op {
+                        BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
+                        BinOp::Div => "/", BinOp::Le => "<=", BinOp::Ge => ">=",
+                        BinOp::Lt => "<", BinOp::Gt => ">", BinOp::Eq => "==",
+                    };
+                    bail!(
+                        "Level-1 violation in process '{process}' at bytes {}..{}: \
+                         `{lt} {op_s} {rt}` mixes numeric types — Sigil does not coerce \
+                         between Int and Float. Write the literal as a Float (e.g. `1.0`) \
+                         or keep both operands the same type.",
+                        span.start,
+                        span.end
+                    );
+                }
+            }
+            Ok(())
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            check_expr_numeric(cond, env, schemas, sigs, process)?;
+            check_expr_numeric(then_branch, env, schemas, sigs, process)?;
+            check_expr_numeric(else_branch, env, schemas, sigs, process)
+        }
+        Expr::SchemaLit { fields, .. } => {
+            for (_, fe) in fields {
+                check_expr_numeric(fe, env, schemas, sigs, process)?;
+            }
+            Ok(())
+        }
+        Expr::Pipeline { base, .. } => check_expr_numeric(base, env, schemas, sigs, process),
+        Expr::Call { args, .. } => {
+            for a in args {
+                check_expr_numeric(a, env, schemas, sigs, process)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -663,6 +844,17 @@ fn walk_purity(
         Expr::Binary { lhs, rhs, .. } => {
             walk_purity(lhs, pure, owner)?;
             walk_purity(rhs, pure, owner)
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_purity(cond, pure, owner)?;
+            walk_purity(then_branch, pure, owner)?;
+            walk_purity(else_branch, pure, owner)
+        }
+        Expr::SchemaLit { fields, .. } => {
+            for (_, e) in fields {
+                walk_purity(e, pure, owner)?;
+            }
+            Ok(())
         }
         _ => Ok(()),
     }

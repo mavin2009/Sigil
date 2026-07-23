@@ -611,7 +611,16 @@ fn emit_stmt(
         }
         Stmt::Send { target, expr, route, backpressure, span } => {
             let target_lc = target.to_lowercase();
-            let value = emit_expr(expr, states, msg);
+            // Fan-out sends the SAME binding to several targets, so a named
+            // value is cloned rather than moved into the first send.
+            let value = {
+                let v = emit_expr(expr, states, msg);
+                if matches!(expr, Expr::Ident { .. } | Expr::FieldAccess { .. }) {
+                    format!("{v}.clone()")
+                } else {
+                    v
+                }
+            };
             let wrapped = routes.wrap(target, span.start, &value);
 
             // How the value reaches a shard's raw channel, per routing policy.
@@ -756,6 +765,20 @@ fn emit_expr(expr: &Expr, states: &[String], msg: &str) -> String {
                 op_s,
                 emit_expr(rhs, states, msg)
             )
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => format!(
+            "if {} {{ {} }} else {{ {} }}",
+            emit_expr(cond, states, msg),
+            emit_expr(then_branch, states, msg),
+            emit_expr(else_branch, states, msg)
+        ),
+        Expr::SchemaLit { name, fields, .. } => {
+            let inits = fields
+                .iter()
+                .map(|(f, e)| format!("{f}: {}", emit_expr(e, states, msg)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name} {{ {inits} }}")
         }
         Expr::Pipeline { base, steps, .. } => emit_pipeline(base, steps, states, msg, false, ""),
     }
@@ -969,6 +992,16 @@ fn collect_externals(program: &Program) -> BTreeSet<String> {
 
 fn walk_externals(expr: &Expr, set: &mut BTreeSet<String>) {
     match expr {
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_externals(cond, set);
+            walk_externals(then_branch, set);
+            walk_externals(else_branch, set);
+        }
+        Expr::SchemaLit { fields, .. } => {
+            for (_, e) in fields {
+                walk_externals(e, set);
+            }
+        }
         Expr::Call { name, args, .. } => {
             set.insert(name.clone());
             for a in args {

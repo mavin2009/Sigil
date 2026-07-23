@@ -1,0 +1,9 @@
+// MUST FAIL: Sigil does not coerce between Int and Float. Without this
+// check the error surfaced in the GENERATED Rust instead of in the source.
+schema Order { id: String, qty: Int, price: Float }
+process Book {
+  state value: Float = 0.0
+  on order: Order {
+    value := value + order.qty * order.price
+  }
+}
