@@ -108,6 +108,44 @@ This distinction drives most of the compiler:
 
 Declared signatures are authoritative for type checking.
 
+## Binding to existing Rust
+
+A transform with an empty body is a stub you must fill in — which means the
+generated crate is not drop-in, because regenerating clobbers your edits.
+Binding removes that.
+
+```
+extern crate sensor_hal = path "../hal"     // or: = "1.2" for crates.io
+
+schema ImuFrame = sensor_hal::ImuFrame { id: String, roll_rate: Float }
+
+transform read_imu(f: ImuFrame) -> ImuFrame    = blocking sensor_hal::read_imu
+transform downlink(a: Attitude) -> Attitude    = sensor_hal::downlink_packet
+transform fuse(a: Attitude) -> Attitude        = infallible sensor_hal::fuse
+```
+
+| Kind | Expected Rust signature | Emitted as |
+| ---- | ----------------------- | ---------- |
+| (default) | `async fn(T) -> Result<U, E>` | awaited directly |
+| `blocking` | `fn(T) -> Result<U, E>` that blocks | `spawn_blocking`, so it cannot stall a runtime worker |
+| `infallible` | `fn(T) -> U` | called directly; no error path |
+
+`blocking` is the important one: a blocking call made from an async handler
+degrades the *scheduler* rather than the program, so it survives review and
+no proof here would catch it. Declaring it lets codegen place it correctly.
+
+**Schemas must bind too** when transforms do. A locally-defined struct with
+the same shape is a *different type*, and every call into the bound crate
+would fail to typecheck. `schema X = path::Y` re-exports rather than defines;
+the foreign type must derive `Clone`, `Debug`, and `Default`.
+
+Binding removes the hand-editing, **not the obligation**. Bound `async` and
+`blocking` transforms still perform real I/O, so they remain external: they
+still require `@recover` or `@error`, still count toward the latency budget,
+and still appear in the residual-risk report. Only `infallible` bindings are
+treated as unable to fail, which makes them valid recovery targets and
+exempts them from fault injection.
+
 ## Processes and handlers
 
 ```

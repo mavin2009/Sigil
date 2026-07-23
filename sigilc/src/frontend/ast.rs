@@ -26,6 +26,7 @@ impl Span {
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub extern_crates: Vec<ExternCrate>,
     pub schemas: Vec<Schema>,
     pub processes: Vec<Process>,
     pub transforms: Vec<TransformDecl>,
@@ -46,6 +47,47 @@ pub enum SpecItem {
     Hold { expr: Expr, span: Span },
 }
 
+/// Where a generated crate should get a Rust dependency from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CrateSource {
+    Version(String),
+    Path(String),
+}
+
+/// A Rust dependency declared in the .sigil source, so the generated crate
+/// is complete rather than something you must hand-edit afterwards.
+#[derive(Debug, Clone)]
+pub struct ExternCrate {
+    pub name: String,
+    pub source: CrateSource,
+    pub span: Span,
+}
+
+/// How a bound Rust function must be called.
+///
+/// The distinction is not cosmetic. A blocking call made directly from an
+/// async handler stalls a runtime worker thread — a failure mode invisible to
+/// every proof in this compiler, because it degrades the scheduler rather
+/// than the program. Declaring it lets codegen place the call correctly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindKind {
+    /// `async fn(T) -> Result<U, E>` — awaited directly.
+    Async,
+    /// `fn(T) -> Result<U, E>` that blocks — dispatched to a blocking pool.
+    Blocking,
+    /// `fn(T) -> U` — cannot fail, but is still foreign code.
+    Infallible,
+}
+
+/// A transform bound to an existing Rust function.
+#[derive(Debug, Clone)]
+pub struct Binding {
+    pub kind: BindKind,
+    /// Fully-qualified Rust path, e.g. `sensor_hal::read_imu`.
+    pub path: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransformDecl {
     pub name: String,
@@ -53,12 +95,41 @@ pub struct TransformDecl {
     pub param_ty: Type,
     pub return_ty: Type,
     pub body: Vec<Stmt>,
+    /// Present when the transform is bound to a real Rust function. A bound
+    /// transform is still EXTERNAL for every analysis — it performs real I/O,
+    /// so it can fail and hang, and still requires a declared failure path.
+    /// Binding removes the hand-editing, not the obligation.
+    pub binding: Option<Binding>,
     pub span: Span,
+}
+
+impl TransformDecl {
+    /// Declared as unable to fail: a compiled pure body, or a binding to a
+    /// Rust function that returns a value rather than a Result.
+    pub fn is_infallible(&self) -> bool {
+        matches!(
+            self.binding.as_ref().map(|b| &b.kind),
+            Some(BindKind::Infallible)
+        )
+    }
+
+    /// Performs real I/O: an empty stub, or a binding to fallible code.
+    pub fn is_external(&self) -> bool {
+        match &self.binding {
+            Some(b) => !matches!(b.kind, BindKind::Infallible),
+            None => self.body.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
+    /// When set, this schema IS an existing Rust type rather than a struct
+    /// the compiler defines. Required for binding transforms to a crate that
+    /// already has its own types — otherwise the generated struct and the
+    /// foreign one are different types with the same shape.
+    pub binding: Option<String>,
     pub fields: Vec<(String, Type)>,
     pub span: Span,
 }
@@ -285,6 +356,7 @@ pub fn parse(source: &str) -> Result<Program> {
         .map_err(|e| anyhow!("parse error:\n{}", e))?;
 
     let mut program = Program {
+        extern_crates: vec![],
         schemas: vec![],
         processes: vec![],
         transforms: vec![],
@@ -296,6 +368,20 @@ pub fn parse(source: &str) -> Result<Program> {
             match inner.as_rule() {
                 Rule::schema_def => program.schemas.push(parse_schema(inner)?),
                 Rule::process_def => program.processes.push(parse_process(inner)?),
+                Rule::extern_crate => {
+                    let espan = Span::from_pest(inner.as_span());
+                    let mut it = inner.into_inner();
+                    let name = it.next().ok_or_else(|| anyhow!("extern crate name"))?.as_str().to_string();
+                    let src_pair = it.next().ok_or_else(|| anyhow!("extern crate source"))?;
+                    let source = match src_pair.as_rule() {
+                        Rule::path_dep => {
+                            let sp = src_pair.into_inner().next().ok_or_else(|| anyhow!("path"))?;
+                            CrateSource::Path(sp.as_str().trim_matches('"').to_string())
+                        }
+                        _ => CrateSource::Version(src_pair.as_str().trim_matches('"').to_string()),
+                    };
+                    program.extern_crates.push(ExternCrate { name, source, span: espan });
+                }
                 Rule::transform_def => program.transforms.push(parse_transform(inner)?),
                 Rule::spec_def => program.specs.push(parse_spec(inner)?),
                 Rule::EOI => {}
@@ -314,7 +400,28 @@ fn parse_transform(pair: pest::iterators::Pair<Rule>) -> Result<TransformDecl> {
     let param_ty = parse_type(inner.next().ok_or_else(|| anyhow!("transform param type"))?)?;
     let return_ty = parse_type(inner.next().ok_or_else(|| anyhow!("transform return type"))?)?;
     let mut body = vec![];
+    let mut binding = None;
     for item in inner {
+        if item.as_rule() == Rule::binding {
+            let bspan = Span::from_pest(item.as_span());
+            let mut kind = BindKind::Async;
+            let mut path = String::new();
+            for part in item.into_inner() {
+                match part.as_rule() {
+                    Rule::bind_kind => {
+                        kind = match part.as_str() {
+                            "blocking" => BindKind::Blocking,
+                            "infallible" => BindKind::Infallible,
+                            other => bail!("unknown binding kind '{other}'"),
+                        };
+                    }
+                    Rule::rust_path => path = part.as_str().to_string(),
+                    other => bail!("unexpected binding part: {other:?}"),
+                }
+            }
+            binding = Some(Binding { kind, path, span: bspan });
+            continue;
+        }
         if item.as_rule() == Rule::stmt {
             body.push(parse_stmt(item)?);
         }
@@ -325,6 +432,7 @@ fn parse_transform(pair: pest::iterators::Pair<Rule>) -> Result<TransformDecl> {
         param_ty,
         return_ty,
         body,
+        binding,
         span,
     })
 }
@@ -376,8 +484,14 @@ fn parse_schema(pair: pest::iterators::Pair<Rule>) -> Result<Schema> {
     let span = Span::from_pest(pair.as_span());
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
+    let mut binding = None;
     let mut fields = vec![];
-    if let Some(fs) = inner.next() {
+    for part in inner {
+        if part.as_rule() == Rule::rust_path {
+            binding = Some(part.as_str().to_string());
+            continue;
+        }
+        let fs = part;
         for f in fs.into_inner() {
             if f.as_rule() == Rule::field {
                 let mut fi = f.into_inner();
@@ -387,7 +501,7 @@ fn parse_schema(pair: pest::iterators::Pair<Rule>) -> Result<Schema> {
             }
         }
     }
-    Ok(Schema { name, fields, span })
+    Ok(Schema { name, binding, fields, span })
 }
 
 fn parse_type(pair: pest::iterators::Pair<Rule>) -> Result<Type> {

@@ -291,6 +291,7 @@ fn merge_for_report(irs: &[GraphIR]) -> GraphIR {
 pub fn residual_risk_report_ir(ir: &GraphIR) -> String {
     residual_risk_report(
         &Program {
+            extern_crates: vec![],
             schemas: vec![],
             processes: vec![],
             transforms: vec![],

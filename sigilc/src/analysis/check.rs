@@ -368,10 +368,13 @@ pub fn check_failure_paths(program: &Program) -> Result<()> {
 pub fn fallible_fallbacks(program: &Program) -> Result<Vec<String>> {
     use std::collections::BTreeSet;
 
+    // Infallible-bound transforms are declared as unable to fail, so they are
+    // legitimate recovery targets alongside compiled pure bodies. Async and
+    // blocking bindings perform real I/O and remain external.
     let pure: BTreeSet<&str> = program
         .transforms
         .iter()
-        .filter(|t| !t.body.is_empty())
+        .filter(|t| !t.body.is_empty() || t.is_infallible())
         .map(|t| t.name.as_str())
         .collect();
 

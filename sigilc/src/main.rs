@@ -113,7 +113,7 @@ fn main() -> Result<()> {
     let rt_path = relative_sigil_rt_path(&out);
     fs::write(
         out.join("Cargo.toml"),
-        emit_cargo_toml(&pkg_name, &rt_path, emit_main_flag),
+        sigilc::emit_cargo_toml_with_deps(&pkg_name, &rt_path, emit_main_flag, &program.extern_crates),
     )?;
     println!(
         "[codegen] Wrote {} (sigil_rt path: {})",
@@ -369,6 +369,77 @@ mod integration {
         // Untimed @recover emits a match on the stage result with a recovery note.
         assert!(rust.contains("note_recovery(\"validate\")"), "untimed recover path missing");
         assert!(rust.contains("note_recovery(\"post\")"));
+    }
+
+    /// Bindings: transforms and schemas wired to an existing Rust crate, so
+    /// the generated crate is complete and never needs hand-editing.
+    #[test]
+    fn bindings_to_existing_crates() {
+        use sigilc::{run_checks, AssuranceLevel};
+        let src = include_str!("../../examples/avionics/attitude_control.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+            .expect("avionics must pass Level 4");
+        assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 3);
+        assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 2);
+
+        let rust = emit(&program, &irs);
+
+        // A blocking driver call must go to the blocking pool. Calling it
+        // directly from an async handler stalls a runtime worker — the exact
+        // hazard the `blocking` declaration exists to remove.
+        assert!(
+            rust.contains("tokio::task::spawn_blocking(move || sensor_hal::read_imu(input))"),
+            "blocking bindings must be dispatched off the async runtime"
+        );
+        // Async bindings are awaited directly, not wrapped.
+        assert!(rust.contains("sensor_hal::downlink_packet(input)"));
+        assert!(!rust.contains("spawn_blocking(move || sensor_hal::downlink_packet"));
+        // Infallible bindings take no error path and are NOT fault-injected;
+        // injecting faults into a recovery path would defeat its purpose.
+        assert!(rust.contains("Ok(sensor_hal::fuse_attitude(input))"));
+        let dead_reckon = rust
+            .split("async fn dead_reckon")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .unwrap_or("");
+        assert!(
+            !dead_reckon.contains("external_stage"),
+            "infallible bindings must not be fault-injected: {dead_reckon}"
+        );
+
+        // Bound schemas re-export the foreign type; defining a structurally
+        // identical struct would be a DIFFERENT type and fail to typecheck
+        // at every call into the bound crate.
+        assert!(rust.contains("pub use sensor_hal::ImuFrame as ImuFrame;"));
+        assert!(!rust.contains("pub struct ImuFrame"));
+
+        // No stub remains: nothing to hand-edit, so regenerating is safe.
+        assert!(
+            !rust.contains("Ok(input)\n}") || !rust.contains("residual stub"),
+            "the avionics example should have no unbound external stage"
+        );
+
+        // The declared dependency reaches the generated manifest.
+        let toml = sigilc::emit_cargo_toml_with_deps(
+            "x", "../..", true, &program.extern_crates,
+        );
+        assert!(toml.contains("sensor_hal = { path ="), "{toml}");
+
+        // Bound I/O is still external: it can fail and hang, so it still
+        // needs a declared failure path. Binding removes the hand-editing,
+        // not the obligation.
+        let unguarded = src.replace(
+            "read_imu @timeout(15.ms) @retry(1) @recover(with: coast)",
+            "read_imu",
+        );
+        let program = parse(&unguarded).expect("parse");
+        let irs = lower(&program).expect("lower");
+        assert!(
+            run_checks(&program, &irs, AssuranceLevel::Safe).is_err(),
+            "a bound blocking call must still require a failure path"
+        );
     }
 
     /// Generated demos assert the invariants the compiler proved, so every

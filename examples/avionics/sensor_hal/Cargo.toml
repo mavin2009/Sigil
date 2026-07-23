@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "sensor_hal"
+version = "0.1.0"
+edition = "2021"
+description = "Stand-in for a real avionics HAL crate: blocking driver reads, async telemetry, pure math."
+
+[dependencies]
+tokio = { version = "1", features = ["time"] }

@@ -1,0 +1,155 @@
+// ===========================================================================
+// SPACECRAFT ATTITUDE DETERMINATION & CONTROL
+//
+// The point of this example: EVERY transform below is bound to a real
+// function in an ordinary Rust crate (examples/avionics/sensor_hal). The
+// generated crate compiles and runs as-is. There is no stub to fill in, so
+// regenerating never clobbers hand-written code.
+//
+//     SensorBus ──by frame─> Fusion ──> Guidance ──> Telemetry
+//
+// What is tedious and error-prone to write by hand, and is generated here:
+//
+//   * `read_imu` and `read_star_tracker` are BLOCKING driver calls. Declaring
+//     them `blocking` places them on the blocking pool. Calling a blocking
+//     driver directly from an async handler stalls a runtime worker — it
+//     degrades the scheduler, not the program, so it passes review and shows
+//     up later as unexplained latency. The compiler cannot detect that from
+//     an opaque stub; it can honour a declaration.
+//   * every driver call is wrapped in a timeout with a bounded retry and a
+//     pure fallback, so a wedged bus cannot wedge the vehicle;
+//   * the fallbacks are PURE fusion math — compiled, infallible, immune to
+//     the injected latency that afflicts the drivers;
+//   * back-pressure is declared per edge: the control path has a deadline,
+//     telemetry sheds. A spacecraft drops telemetry before it drops control.
+//
+// PROVEN AT --level 4:
+//   Fusion.fused      <= SensorBus.sampled     nothing fused unsampled
+//   Guidance.commands <= Fusion.fused          no command without fusion
+//   Telemetry.sent    <= Guidance.commands     no downlink without a command
+//
+// PROVEN AT --level 3:
+//   confidence_sum >= 0.0    (two-sided clamp; a one-sided clamp is rejected)
+//   valid_frames <= sampled  (conditional acceptance never exceeds intake)
+//
+// PROVEN AT --level 2:
+//   end-to-end latency <= 250ms including queue hand-off, because every send
+//   declares a bounded policy. Actual: 160ms.
+//     SensorBus  (1+1)x15 + 10 + 5 hand-off  =  45ms
+//     Fusion     (1+1)x30      + 5 hand-off  =  65ms
+//     Guidance                 + 0 (@shed)   =   0ms
+//     Telemetry  (1+1)x25                    =  50ms
+//   The first draft of this file used 40/20/60/30ms timeouts and totalled
+//   330ms. The compiler rejected it against the declared SLO, and the loop
+//   was tightened to fit. That conversation happened at build time.
+// ===========================================================================
+
+extern crate sensor_hal = path "../../examples/avionics/sensor_hal"
+
+schema ImuFrame = sensor_hal::ImuFrame {
+  id: String,
+  roll_rate: Float,
+  pitch_rate: Float,
+  yaw_rate: Float,
+  valid: Int
+}
+
+schema Attitude = sensor_hal::Attitude {
+  id: String,
+  roll: Float,
+  pitch: Float,
+  yaw: Float,
+  confidence: Float,
+  valid: Int
+}
+
+// ---- Bound to real driver code. Blocking calls are declared as such. ----
+transform read_imu(f: ImuFrame) -> ImuFrame = blocking sensor_hal::read_imu
+transform read_star_tracker(a: Attitude) -> Attitude = blocking sensor_hal::read_star_tracker
+transform downlink(a: Attitude) -> Attitude = sensor_hal::downlink_packet
+
+// ---- Pure fallbacks: compiled, infallible, un-slowable. ----
+// A fallible fallback would reintroduce exactly the loss it exists to
+// prevent, and Level 3 rejects one.
+transform coast(f: ImuFrame) -> ImuFrame { f }
+transform dead_reckon(a: Attitude) -> Attitude = infallible sensor_hal::fuse_attitude
+transform hold_attitude(a: Attitude) -> Attitude { a }
+transform drop_packet(a: Attitude) -> Attitude { a }
+
+// ---- Schema transition: raw frame to estimated attitude. ----
+transform estimate(f: ImuFrame) -> Attitude = blocking sensor_hal::estimate_attitude
+
+// Pure fallback that constructs a zeroed, explicitly-invalid attitude. A
+// schema literal makes this expressible without a stub, so the estimator
+// failing degrades the estimate rather than dropping the frame.
+transform safe_estimate(f: ImuFrame) -> Attitude {
+  Attitude { id: f.id, roll: 0.0, pitch: 0.0, yaw: 0.0, confidence: 0.0, valid: 0 }
+}
+
+process SensorBus {
+  state sampled: Int = 0
+  state valid_frames: Int = 0
+
+  on frame: ImuFrame {
+    let raw = frame ~> read_imu @timeout(15.ms) @retry(1) @recover(with: coast)
+    sampled := sampled + 1
+    // A frame the IMU could not validate is counted but not trusted.
+    valid_frames := valid_frames + if raw.valid > 0 { 1 } else { 0 }
+
+    let est = raw ~> estimate @timeout(10.ms) @recover(with: safe_estimate)
+    send est to Fusion by est.id @deadline(5.ms)
+  }
+}
+
+process Fusion {
+  state fused: Int = 0
+  state confidence_sum: Float = 0.0
+
+  on att: Attitude {
+    let tracked = att ~> read_star_tracker @timeout(30.ms) @retry(1) @recover(with: dead_reckon)
+    fused := fused + 1
+
+    // Two-sided clamp. A one-sided clamp does not establish the hold, which
+    // is the failure people ship: bound the max, forget the min.
+    let c = if tracked.confidence > 1.0 {
+      1.0
+    } else {
+      if tracked.confidence < 0.0 { 0.0 } else { tracked.confidence }
+    }
+    confidence_sum := confidence_sum + c
+
+    send tracked to Guidance @deadline(5.ms)
+  }
+}
+
+process Guidance {
+  state commands: Int = 0
+
+  on att: Attitude {
+    let held = att ~> hold_attitude @error
+    commands := commands + 1
+    send held to Telemetry @shed
+  }
+}
+
+process Telemetry {
+  state sent: Int = 0
+
+  on att: Attitude {
+    let down = att ~> downlink @timeout(25.ms) @retry(1) @recover(with: drop_packet)
+    sent := sent + 1
+  }
+}
+
+spec FlightSafety {
+  require path_latency <= 250.ms
+
+  hold confidence_sum >= 0.0
+  hold valid_frames <= sampled
+
+  hold Fusion.fused <= SensorBus.sampled
+  hold Guidance.commands <= Fusion.fused
+  hold Telemetry.sent <= Guidance.commands
+
+  extinct [null]
+}

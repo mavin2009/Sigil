@@ -127,9 +127,49 @@ fn merged_header_ir(irs: &[GraphIR]) -> GraphIR {
 }
 
 fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
+    use crate::frontend::ast::BindKind;
     let in_ty = rust_type(&t.param_ty);
     let out_ty = rust_type(&t.return_ty);
     let param = &t.param;
+
+    // A bound transform calls real code, so the generated crate is complete:
+    // nothing here needs hand-editing, and regenerating never clobbers work.
+    if let Some(b) = &t.binding {
+        let path = &b.path;
+        let body = match b.kind {
+            BindKind::Async => format!(
+                "    {path}(input)\n        .await\n        .map_err(|e| sigil_rt::SigilError::Transform(format!(\"{}: {{e}}\", \"{}\")))",
+                "{}", t.name
+            ),
+            // The important one. Calling a blocking function directly from an
+            // async handler stalls a runtime worker — a failure that degrades
+            // the scheduler rather than the program, so no proof here would
+            // catch it. Declaring `blocking` moves it to the blocking pool.
+            BindKind::Blocking => format!(
+                "    tokio::task::spawn_blocking(move || {path}(input))\n                 \x20       .await\n                 \x20       .map_err(|e| sigil_rt::SigilError::Transform(format!(\"{}: join: {{e}}\", \"{}\")))?\n                 \x20       .map_err(|e| sigil_rt::SigilError::Transform(format!(\"{}: {{e}}\", \"{}\")))",
+                "{}", t.name, "{}", t.name
+            ),
+            BindKind::Infallible => format!("    Ok({path}(input))"),
+        };
+        // An `infallible` binding is declared as unable to fail, so it is not
+        // routed through fault injection — injecting faults into a recovery
+        // path would defeat the reason it exists.
+        let chaos = if matches!(b.kind, BindKind::Infallible) {
+            String::new()
+        } else {
+            format!("    sigil_rt::chaos::external_stage(\"{}\").await?;\n", t.name)
+        };
+        return format!(
+            "// bound to `{path}` ({})\nasync fn {}(input: {in_ty}) -> Result<{out_ty}> {{\n{chaos}{body}\n}}\n",
+            match b.kind {
+                BindKind::Async => "async",
+                BindKind::Blocking => "blocking, dispatched to the blocking pool",
+                BindKind::Infallible => "infallible",
+            },
+            t.name
+        );
+    }
+
     if t.body.is_empty() {
         return emit_external_stub(&t.name, &in_ty, &out_ty);
     }
@@ -175,6 +215,15 @@ fn primary_message_type(program: &Program) -> String {
 }
 
 fn emit_schema(schema: &Schema) -> String {
+    // A bound schema IS the foreign type. Defining a structurally identical
+    // struct here would produce a DIFFERENT type, and every call into the
+    // bound crate would fail to typecheck.
+    if let Some(path) = &schema.binding {
+        return format!(
+            "// `{}` is `{path}` from a bound crate; it must derive Clone, Debug\n             // and Default for the generated actors and demo driver.\npub use {path} as {};\n",
+            schema.name, schema.name
+        );
+    }
     let mut s = String::new();
     s.push_str("#[derive(Clone, Debug, Default)]\n");
     s.push_str(&format!("pub struct {} {{\n", schema.name));
@@ -1561,6 +1610,41 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
     let _ = write!(out, "    println!(\"elapsed = {{:?}} (locks used: 0)\", t0.elapsed());\n");
     let _ = write!(out, "    println!(\"{{}}\", sigil_rt::chaos::report());\n}}\n");
     out
+}
+
+pub fn emit_cargo_toml_with_deps(
+    package_name: &str,
+    sigil_rt_path: &str,
+    with_main: bool,
+    externs: &[crate::frontend::ast::ExternCrate],
+) -> String {
+    use crate::frontend::ast::CrateSource;
+    let base = emit_cargo_toml(package_name, sigil_rt_path, with_main);
+    if externs.is_empty() {
+        return base;
+    }
+    let mut extra = String::from("\n# Declared in the .sigil source via `extern crate`.\n");
+    for e in externs {
+        match &e.source {
+            CrateSource::Version(v) => {
+                extra.push_str(&format!("{} = \"{}\"\n", e.name, v));
+            }
+            CrateSource::Path(p) => {
+                extra.push_str(&format!("{} = {{ path = \"{}\" }}\n", e.name, p));
+            }
+        }
+    }
+    // Insert at the end of the [dependencies] table. `thiserror` is always
+    // the last unconditional entry, so anchor on it rather than on optional
+    // sections that may or may not be present.
+    let anchor = "thiserror = \"1\"\n";
+    match base.find(anchor) {
+        Some(i) => {
+            let at = i + anchor.len();
+            format!("{}{}{}", &base[..at], extra.trim_start_matches('\n'), &base[at..])
+        }
+        None => format!("{base}{extra}"),
+    }
 }
 
 pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool) -> String {

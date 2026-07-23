@@ -124,6 +124,7 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 
 | Directory | Focus |
 | --------- | ----- |
+| [`examples/avionics/`](examples/avionics/) | **spacecraft attitude control** — every transform bound to a real Rust crate; blocking drivers auto-dispatched off the async runtime; no stubs to hand-edit |
 | [`examples/clearinghouse/`](examples/clearinghouse/) | **derivatives clearing house** — fan-out with divergent reliability, conditional acceptance, clamped accumulation; the most complex example |
 | [`examples/security/`](examples/security/) | **zero-trust secrets vault** — audit-before-serve proven; fail-closed by construction |
 | [`examples/finance/`](examples/finance/) | **clearing & settlement** — 5 proofs, 380 ms budget, an `f64` accumulator with no `Arc<Mutex<>>` |
@@ -171,7 +172,7 @@ docs/             language reference, assurance levels, runtime, rationale
 cargo test
 ```
 
-83 tests: parser, per-level checks, both provers, topology and routing,
+87 tests: parser, per-level checks, both provers, topology and routing,
 codegen shape, and end-to-end compilation of every example. Every rule has a
 program in `examples/proofs/` asserted to fail *for the right reason*.
 
