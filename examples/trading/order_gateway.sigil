@@ -1,0 +1,119 @@
+// ============================================================================
+// EXCHANGE ORDER GATEWAY — a multi-message-type trading path.
+//
+//     OrderGateway ──by account──> RiskEngine ──> MatchingEngine
+//
+// Every process handles BOTH message types. That is the point: in real
+// trading systems the new-order path gets scrutinised and the cancel path
+// quietly does not, and a cancel that skips risk is how you get an
+// unhedged position or a runaway algo that cannot be stopped.
+//
+// PROVEN AT --level 4, over BOTH handlers of every process:
+//   MatchingEngine.processed <= RiskEngine.cleared
+//   RiskEngine.cleared       <= OrderGateway.received
+//
+// Composed: nothing reaches the book without clearing risk — orders AND
+// cancels alike. The compiler checks each handler independently:
+//   * every handler that forwards must count BEFORE it forwards
+//   * no handler may decrease a bounding counter
+//   * send multiplicity is static on every path
+// Add a third message type and forget to count it, and the build fails.
+//
+// PROVEN AT --level 3:
+//   notional_at_risk >= 0.0   (assumption `new_order.notional >= 0.0` is
+//                              compiled into a runtime guard)
+//
+// BY CONSTRUCTION (Level 1): no data races, no shared accumulators, every
+// external stage has a failure path, every recovery path is pure.
+// ============================================================================
+
+schema NewOrder {
+  id: String,
+  account: String,
+  symbol: String,
+  notional: Float
+}
+
+schema Cancel {
+  id: String,
+  account: String,
+  order_id: String
+}
+
+// ---- External residual stages ----
+transform validate_order(o: NewOrder) -> NewOrder {}
+transform validate_cancel(c: Cancel) -> Cancel {}
+transform check_limits(o: NewOrder) -> NewOrder {}
+transform check_cancel_rights(c: Cancel) -> Cancel {}
+transform book_order(o: NewOrder) -> NewOrder {}
+transform pull_order(c: Cancel) -> Cancel {}
+
+// ---- Pure rejection paths: compiled, infallible, cannot fail open ----
+transform reject_order(o: NewOrder) -> NewOrder { o }
+transform reject_cancel(c: Cancel) -> Cancel { c }
+transform breach_limit(o: NewOrder) -> NewOrder { o }
+transform deny_cancel(c: Cancel) -> Cancel { c }
+transform unbooked(o: NewOrder) -> NewOrder { o }
+transform unpulled(c: Cancel) -> Cancel { c }
+
+process OrderGateway {
+  state received: Int = 0
+
+  on new_order: NewOrder {
+    let ok = new_order ~> validate_order @timeout(20.ms) @retry(1) @recover(with: reject_order)
+    received := received + 1
+    send ok to RiskEngine by ok.account
+  }
+
+  on cancel: Cancel {
+    let ok = cancel ~> validate_cancel @timeout(20.ms) @retry(1) @recover(with: reject_cancel)
+    received := received + 1
+    send ok to RiskEngine by ok.account
+  }
+}
+
+process RiskEngine {
+  state cleared: Int = 0
+  state notional_at_risk: Float = 0.0
+
+  on new_order: NewOrder {
+    let checked = new_order ~> check_limits @timeout(40.ms) @retry(2) @recover(with: breach_limit)
+    cleared := cleared + 1
+    notional_at_risk := notional_at_risk + new_order.notional
+    send checked to MatchingEngine
+  }
+
+  // Cancels are risk-checked too — the compiler will not let this handler
+  // forward without counting, so it cannot silently bypass the gate.
+  on cancel: Cancel {
+    let checked = cancel ~> check_cancel_rights @timeout(30.ms) @retry(1) @recover(with: deny_cancel)
+    cleared := cleared + 1
+    send checked to MatchingEngine
+  }
+}
+
+process MatchingEngine {
+  state processed: Int = 0
+
+  on new_order: NewOrder {
+    let booked = new_order ~> book_order @timeout(50.ms) @retry(1) @recover(with: unbooked)
+    processed := processed + 1
+  }
+
+  on cancel: Cancel {
+    let pulled = cancel ~> pull_order @timeout(50.ms) @retry(1) @recover(with: unpulled)
+    processed := processed + 1
+  }
+}
+
+spec ExchangeSafety {
+  require new_order.notional >= 0.0
+  require path_timeout_sum <= 400.ms
+
+  hold notional_at_risk >= 0.0
+
+  hold RiskEngine.cleared <= OrderGateway.received
+  hold MatchingEngine.processed <= RiskEngine.cleared
+
+  extinct [null]
+}

@@ -338,6 +338,109 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Multi-handler processes: type-directed dispatch, per-handler proof
+    /// obligations, per-handler latency budgets, and the four ways to get it
+    /// wrong.
+    #[test]
+    fn multi_handler_processes() {
+        use sigilc::{check_handler_wellformedness, derive_topology, level4_prove, run_checks,
+                     AssuranceLevel};
+
+        let src = include_str!("../../examples/trading/order_gateway.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+            .expect("trading gateway must pass Level 4");
+        assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 2);
+
+        // Budget is the MAX over handlers per process, not the sum: a message
+        // traverses exactly one handler.
+        // Gateway max(40,40)=40 + Risk max(120,60)=120 + Match max(100,100)=100
+        assert_eq!(outcome.level2.as_ref().unwrap().path_timeout_sum_ms, 260);
+
+        // Topology resolves each send to a specific destination handler by type.
+        let topo = derive_topology(&program).expect("topology");
+        let gw_to_risk: Vec<_> = topo
+            .edges
+            .iter()
+            .filter(|e| e.from == "OrderGateway" && e.to == "RiskEngine")
+            .collect();
+        assert_eq!(gw_to_risk.len(), 2, "one edge per destination handler");
+        assert!(gw_to_risk.iter().any(|e| e.msg_type == "NewOrder" && e.to_handler == "new_order"));
+        assert!(gw_to_risk.iter().any(|e| e.msg_type == "Cancel" && e.to_handler == "cancel"));
+
+        // Codegen emits a typed dispatch enum and per-type send methods.
+        let rust = emit(&program, &irs);
+        assert!(rust.contains("pub enum RiskEngineMsg"));
+        assert!(rust.contains("NewOrder(NewOrder)") && rust.contains("Cancel(Cancel)"));
+        assert!(rust.contains("send_new_order") && rust.contains("send_cancel"));
+        // Each send picks the right variant.
+        assert!(rust.contains("by_key(&ok.account).send_new_order"));
+        assert!(rust.contains("by_key(&ok.account).send_cancel"));
+        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+
+        // The demo exercises EVERY handler of the entry process.
+        let main_rs = sigilc::emit_demo_main(&program);
+        assert!(main_rs.contains("send_new_order") && main_rs.contains("send_cancel"));
+
+        // --- the four ways to get multi-handler wrong ---
+        let l4_fails = |src: &str, needle: &str| {
+            let program = parse(src).expect("parse");
+            let err = level4_prove(&program).expect_err("must fail");
+            assert!(format!("{err}").contains(needle), "got: {err}");
+        };
+        // 1. a handler forwards without counting
+        l4_fails(
+            include_str!("../../examples/proofs/mh_uncounted_handler.sigil"),
+            "never updates",
+        );
+        // 2. duplicate handler message names (would emit duplicate enum variants)
+        let p = parse(include_str!("../../examples/proofs/mh_duplicate_msg_name.sigil")).unwrap();
+        let e = check_handler_wellformedness(&p).expect_err("dup name");
+        assert!(format!("{e}").contains("message name"));
+        // 3. duplicate handler types (ambiguous dispatch)
+        let p = parse(include_str!("../../examples/proofs/mh_duplicate_msg_type.sigil")).unwrap();
+        let e = check_handler_wellformedness(&p).expect_err("dup type");
+        assert!(format!("{e}").contains("resolves the destination handler by message type"));
+        // 4. sending a type the target cannot receive
+        let p = parse(include_str!("../../examples/proofs/mh_no_handler_for_type.sigil")).unwrap();
+        let e = derive_topology(&p).expect_err("no handler for type");
+        assert!(format!("{e}").contains("no handler for that type"));
+    }
+
+    /// Ordering is enforced PER HANDLER: one compliant handler does not
+    /// excuse another.
+    #[test]
+    fn multi_handler_ordering_is_per_handler() {
+        use sigilc::level4_prove;
+        let src = r#"
+schema A { x: Int }
+schema B { y: Int }
+process Up {
+  state seen: Int = 0
+  on a: A {
+    seen := seen + 1
+    send a to Down
+  }
+  on b: B {
+    send b to Down
+    seen := seen + 1
+  }
+}
+process Down {
+  state got: Int = 0
+  on a: A { got := got + 1 }
+  on b: B { got := got + 1 }
+}
+spec S { hold Down.got <= Up.seen }
+"#;
+        let program = parse(src).expect("parse");
+        let err = level4_prove(&program).expect_err("second handler violates ordering");
+        let msg = format!("{err}");
+        assert!(msg.contains("ORDERING fails"), "got: {msg}");
+        assert!(msg.contains("`b` handler"), "must name the offending handler: {msg}");
+    }
+
     /// The finance component: five proofs, a budget, and zero-loss codegen.
     #[test]
     fn finance_clearing_component() {

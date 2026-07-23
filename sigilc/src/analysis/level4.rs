@@ -29,7 +29,7 @@ use crate::analysis::level3::{eval_interval, handler_delta, input_preconditions,
 use crate::analysis::topology::derive_topology;
 use crate::frontend::ast::{BinOp, Expr, Program, Route, SpecItem, Stmt};
 use anyhow::{bail, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Default)]
 pub struct Level4Report {
@@ -93,69 +93,141 @@ pub fn level4_prove(program: &Program) -> Result<Level4Report> {
     let topo = derive_topology(program)?;
     let preconds = input_preconditions(program);
 
-    // Static edge multiplicities: send statements per handler execution.
-    // Broadcast has no static multiplicity (shard count is a runtime value).
-    let mut edge_mult: BTreeMap<(String, String), Option<u64>> = BTreeMap::new();
-    for process in &program.processes {
-        for handler in &process.handlers {
-            for stmt in &handler.body {
-                let Stmt::Send { target, route, .. } = stmt else { continue };
-                let e = edge_mult
-                    .entry((process.name.clone(), target.clone()))
-                    .or_insert(Some(0));
-                match route {
-                    Route::Broadcast => *e = None,
-                    _ => {
-                        if let Some(m) = e {
-                            *m += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     for h in &holds {
-        prove_system_hold(program, &topo, &edge_mult, &preconds, h)?;
+        prove_system_hold(program, &topo, &preconds, h)?;
         let cmp = if h.strict { "<" } else { "<=" };
         report.proven.push(format!(
-            "hold `{}.{} {cmp} {}.{}` (spec `{}`): base ordering + update-before-send + \
-             all-paths-through-`{}` + static multiplicity bound; robust to every drop the \
-             language admits",
+            "hold `{}.{} {cmp} {}.{}` (spec `{}`): base ordering + update-before-send in \
+             every sending handler + all-paths-through-`{}` + static multiplicity bound; \
+             robust to every drop the language admits",
             h.lo_proc, h.lo_state, h.hi_proc, h.hi_state, h.spec, h.hi_proc
         ));
     }
     Ok(report)
 }
 
+/// Sends to `target` performed by ONE handler execution.
+/// `None` means "no static bound" (a broadcast fans out to a runtime shard count).
+fn sends_to(handler: &crate::frontend::ast::OnHandler, target: &str) -> Option<u64> {
+    let mut n = 0u64;
+    for stmt in &handler.body {
+        let Stmt::Send { target: t, route, .. } = stmt else { continue };
+        if t != target {
+            continue;
+        }
+        if matches!(route, Route::Broadcast) {
+            return None;
+        }
+        n += 1;
+    }
+    Some(n)
+}
+
+/// Multiplicity of messages arriving at `dest` per message handled by each
+/// process, maximised over that process's handlers (exactly one handler runs
+/// per message, so the max is both sound and tight).
+///
+/// `None` = no static bound (a broadcast on a path that reaches `dest`).
+/// Computed in reverse topological order; the graph is proven acyclic first.
+fn multiplicity_to(
+    program: &Program,
+    topo: &crate::analysis::topology::Topology,
+    dest: &str,
+) -> BTreeMap<String, Option<u64>> {
+    let mut m: BTreeMap<String, Option<u64>> = BTreeMap::new();
+    m.insert(dest.to_string(), Some(1));
+
+    for pname in topo.order.iter().rev() {
+        if pname == dest {
+            continue;
+        }
+        let Some(p) = program.processes.iter().find(|x| x.name == *pname) else {
+            m.insert(pname.clone(), Some(0));
+            continue;
+        };
+        // Distinct successor PROCESSES: a multi-handler target contributes
+        // several edges, but `sends_to` already counts sends per process, so
+        // iterating edges would double-count.
+        let succs: BTreeSet<&str> = topo
+            .edges
+            .iter()
+            .filter(|e| e.from == *pname)
+            .map(|e| e.to.as_str())
+            .collect();
+        let mut best: Option<u64> = Some(0); // max over handlers
+        for handler in &p.handlers {
+            let mut acc: Option<u64> = Some(0); // this handler's multiplicity
+            for succ in &succs {
+                let downstream = m.get(*succ).cloned().unwrap_or(Some(0));
+                if matches!(downstream, Some(0)) {
+                    continue; // this successor never reaches dest
+                }
+                match sends_to(handler, succ) {
+                    None => acc = None, // broadcast onto a path that reaches dest
+                    Some(0) => {}
+                    Some(c) => {
+                        acc = match (acc, downstream) {
+                            (Some(a), Some(d)) => Some(a + c * d),
+                            _ => None,
+                        };
+                    }
+                }
+                if acc.is_none() {
+                    break;
+                }
+            }
+            best = match (best, acc) {
+                (Some(b), Some(a)) => Some(b.max(a)),
+                _ => None,
+            };
+        }
+        m.insert(pname.clone(), best);
+    }
+    m
+}
+
 fn prove_system_hold(
     program: &Program,
     topo: &crate::analysis::topology::Topology,
-    edge_mult: &BTreeMap<(String, String), Option<u64>>,
     preconds: &[crate::analysis::level3::InputPrecondition],
     h: &SystemHold,
 ) -> Result<()> {
     let spec = &h.spec;
-    let a = program.processes.iter().find(|p| p.name == h.hi_proc).unwrap();
-    let b = program.processes.iter().find(|p| p.name == h.lo_proc).unwrap();
-    let sa = a
-        .states
+    let a = program
+        .processes
         .iter()
-        .find(|s| s.name == h.hi_state)
+        .find(|p| p.name == h.hi_proc)
         .ok_or_else(|| anyhow::anyhow!(
+            "Level-4 violation in spec '{spec}': unknown process `{}`", h.hi_proc
+        ))?;
+    let b = program
+        .processes
+        .iter()
+        .find(|p| p.name == h.lo_proc)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Level-4 violation in spec '{spec}': unknown process `{}`", h.lo_proc
+        ))?;
+    if a.name == b.name {
+        bail!(
+            "Level-4 violation in spec '{spec}': `{}` and `{}` are the same process — \
+             use a Level-3 relational hold (`hold {} <= {}`)",
+            h.hi_proc, h.lo_proc, h.lo_state, h.hi_state
+        );
+    }
+    let sa = a.states.iter().find(|s| s.name == h.hi_state).ok_or_else(|| {
+        anyhow::anyhow!(
             "Level-4 violation in spec '{spec}': `{}` has no state `{}`",
             h.hi_proc, h.hi_state
-        ))?;
-    let sb = b
-        .states
-        .iter()
-        .find(|s| s.name == h.lo_state)
-        .ok_or_else(|| anyhow::anyhow!(
+        )
+    })?;
+    let sb = b.states.iter().find(|s| s.name == h.lo_state).ok_or_else(|| {
+        anyhow::anyhow!(
             "Level-4 violation in spec '{spec}': `{}` has no state `{}`",
             h.lo_proc, h.lo_state
-        ))?;
+        )
+    })?;
 
-    // BASE
+    // ---- BASE ----
     let lit = |e: &Expr| -> Option<f64> {
         match e {
             Expr::Literal { value, .. } => crate::analysis::level3::lit_value_pub(value),
@@ -168,20 +240,17 @@ fn prove_system_hold(
     };
     if (h.strict && !(ib < ia)) || (!h.strict && !(ib <= ia)) {
         bail!(
-            "Level-4 violation in spec '{spec}': BASE CASE fails — init {}.{} = {ib} vs \
-             {}.{} = {ia}",
+            "Level-4 violation in spec '{spec}': BASE CASE fails — init {}.{} = {ib} vs {}.{} = {ia}",
             h.lo_proc, h.lo_state, h.hi_proc, h.hi_state
         );
     }
 
-    // PER-MESSAGE deltas (single-handler processes; topology already enforces
-    // single-handler send targets).
+    // Per-handler delta of a state, with that handler's let-bindings resolved.
     let empty = BTreeMap::new();
-    let per_handler_delta = |p: &crate::frontend::ast::Process, st: &str| -> Result<Interval> {
-        let handler = p.handlers.first().ok_or_else(|| anyhow::anyhow!(
-            "Level-4 violation in spec '{spec}': process `{}` has no handler",
-            p.name
-        ))?;
+    let delta_of = |p: &crate::frontend::ast::Process,
+                    handler: &crate::frontend::ast::OnHandler,
+                    st: &str|
+     -> Result<Interval> {
         let mut lets: BTreeMap<String, Interval> = BTreeMap::new();
         for stmt in &handler.body {
             if let Stmt::Let { name, expr, .. } = stmt {
@@ -193,124 +262,196 @@ fn prove_system_hold(
         let mut why = Vec::new();
         handler_delta(st, handler, p, &empty, preconds, &lets, &mut why).ok_or_else(|| {
             anyhow::anyhow!(
-                "Level-4 violation in spec '{spec}': `{}` update in `{}` leaves the additive \
-                 fragment: {}",
-                st, p.name, why.join("; ")
+                "Level-4 violation in spec '{spec}': `{st}` update in `{}`'s `{}` handler \
+                 leaves the additive fragment: {}",
+                p.name, handler.msg_name, why.join("; ")
             )
         })
     };
-    let da = per_handler_delta(a, &h.hi_state)?;
-    let db = per_handler_delta(b, &h.lo_state)?;
-    if !(da.lo >= 0.0) || da.lo.is_infinite() && da.lo < 0.0 {
+
+    // ---- FLOW: every path into B must pass through A ----
+    // R = processes that can reach B WITHOUT passing through A (A absorbs:
+    // messages entering A are counted, so paths through it are accounted for).
+    let mut reaches_b_avoiding_a: BTreeSet<&str> = BTreeSet::new();
+    reaches_b_avoiding_a.insert(b.name.as_str());
+    // Reverse topological order guarantees successors are settled first.
+    for pname in topo.order.iter().rev() {
+        if pname == &a.name || pname == &b.name {
+            continue;
+        }
+        let hits = topo
+            .edges
+            .iter()
+            .any(|e| e.from == *pname && reaches_b_avoiding_a.contains(e.to.as_str()));
+        if hits {
+            reaches_b_avoiding_a.insert(pname.as_str());
+        }
+    }
+    // Anything with no inbound edges is fed from outside the system.
+    let inbound = |name: &str| topo.edges.iter().any(|e| e.to == name);
+    for p in &program.processes {
+        if p.name == a.name || inbound(&p.name) {
+            continue;
+        }
+        if reaches_b_avoiding_a.contains(p.name.as_str()) {
+            bail!(
+                "Level-4 violation in spec '{spec}': FLOW fails — `{}` is fed from outside \
+                 the system and reaches `{}` without passing through `{}`, so `{}.{}` \
+                 counts messages `{}` never saw",
+                p.name, h.lo_proc, h.hi_proc, h.lo_proc, h.lo_state, h.hi_proc
+            );
+        }
+    }
+    let mult_map = multiplicity_to(program, topo, &b.name);
+    if !inbound(&b.name) {
         bail!(
-            "Level-4 violation in spec '{spec}': `{}.{}` can decrease per message \
-             (delta lo = {}) — the counting argument needs a non-negative lower bound; \
-             guard the inputs",
-            h.hi_proc, h.hi_state, da.lo
+            "Level-4 violation in spec '{spec}': FLOW fails — `{}` has no inbound edges; \
+             it is fed from outside the system and is not bounded by `{}`",
+            h.lo_proc, h.hi_proc
         );
     }
 
-    // ORDERING: sa assigned before A's first send.
-    let handler = a.handlers.first().unwrap();
-    let mut seen_send = false;
-    let mut assigned_before_send = false;
-    for stmt in &handler.body {
-        match stmt {
-            Stmt::Send { .. } => seen_send = true,
-            Stmt::Assign { name, .. } if name == &h.hi_state => {
-                if !seen_send {
-                    assigned_before_send = true;
-                } else {
-                    bail!(
-                        "Level-4 violation in spec '{spec}': ORDERING fails — `{}` updates \
-                         `{}` AFTER sending; a message could reach `{}` without being \
-                         counted. Move the update above the send.",
-                        h.hi_proc, h.hi_state, h.lo_proc
-                    );
+    // ---- db_max: the most B's counter can grow per message it handles ----
+    // Only handlers that some inbound edge actually dispatches to can run.
+    let reachable_b: Vec<&crate::frontend::ast::OnHandler> = b
+        .handlers
+        .iter()
+        .filter(|hh| topo.edges.iter().any(|e| e.to == b.name && e.to_handler == hh.msg_name))
+        .collect();
+    if reachable_b.is_empty() {
+        bail!(
+            "Level-4 violation in spec '{spec}': no inbound edge dispatches to any handler \
+             of `{}`",
+            h.lo_proc
+        );
+    }
+    let mut db_max: f64 = 0.0;
+    for hh in &reachable_b {
+        let d = delta_of(b, hh, &h.lo_state)?;
+        if d.hi.is_infinite() {
+            bail!(
+                "Level-4 violation in spec '{spec}': `{}.{}` has no upper bound per message \
+                 in the `{}` handler — guard the increment (e.g. `require` an upper bound, \
+                 or use a literal counter)",
+                h.lo_proc, h.lo_state, hh.msg_name
+            );
+        }
+        db_max = db_max.max(d.hi.max(0.0));
+    }
+
+    // ---- Per-handler obligations on A ----
+    let mut any_sends = false;
+    for ha in &a.handlers {
+        let da = delta_of(a, ha, &h.hi_state)?;
+        // No handler may decrease the bounding counter.
+        if da.lo < 0.0 {
+            bail!(
+                "Level-4 violation in spec '{spec}': `{}.{}` can DECREASE in the `{}` \
+                 handler (delta lo = {}) — the counting argument needs every handler to be \
+                 non-decreasing",
+                h.hi_proc, h.hi_state, ha.msg_name, da.lo
+            );
+        }
+
+        // How many messages reach B per execution of THIS handler.
+        // Distinct target processes only — a multi-handler target yields one
+        // edge per destination handler, but sends are counted per process.
+        let a_succs: BTreeSet<&str> = topo
+            .edges
+            .iter()
+            .filter(|e| e.from == a.name)
+            .map(|e| e.to.as_str())
+            .collect();
+        let mut m_h: Option<u64> = Some(0);
+        for succ in &a_succs {
+            let downstream = mult_map.get(*succ).cloned().unwrap_or(Some(0));
+            if matches!(downstream, Some(0)) {
+                continue;
+            }
+            match sends_to(ha, succ) {
+                None => m_h = None,
+                Some(0) => {}
+                Some(c) => {
+                    m_h = match (m_h, downstream) {
+                        (Some(acc), Some(d)) => Some(acc + c * d),
+                        _ => None,
+                    }
                 }
             }
-            _ => {}
         }
-    }
-    if !assigned_before_send {
-        bail!(
-            "Level-4 violation in spec '{spec}': `{}` never updates `{}` — nothing bounds \
-             `{}.{}`",
-            h.hi_proc, h.hi_state, h.lo_proc, h.lo_state
-        );
-    }
+        let Some(m_h) = m_h else {
+            bail!(
+                "Level-4 violation in spec '{spec}': FLOW fails — the `{}` handler of `{}` \
+                 broadcasts onto a path reaching `{}`; broadcast multiplies by the runtime \
+                 shard count, which has no static bound",
+                ha.msg_name, h.hi_proc, h.lo_proc
+            );
+        };
+        if m_h == 0 {
+            continue; // this handler produces nothing that reaches B
+        }
+        any_sends = true;
 
-    // FLOW: every path into B passes through A, and multiplicity A→B is static.
-    // ways(X) counts A-originating multiplicity; leak(X) flags any way to reach
-    // X from an entry without passing through A.
-    let mut ways: BTreeMap<&str, Option<u64>> = BTreeMap::new(); // None = non-static (broadcast)
-    let mut leak: BTreeMap<&str, bool> = BTreeMap::new();
-    for pname in &topo.order {
-        let pname = pname.as_str();
-        if pname == h.hi_proc {
-            ways.insert(pname, Some(1));
-            leak.insert(pname, false);
-            continue;
+        // A handler that forwards but never counts is unbounded — say so
+        // plainly rather than reporting it as an ordering problem.
+        if !ha
+            .body
+            .iter()
+            .any(|st| matches!(st, Stmt::Assign { name, .. } if name == &h.hi_state))
+        {
+            bail!(
+                "Level-4 violation in spec '{spec}': the `{}` handler of `{}` sends toward \
+                 `{}` but never updates `{}` — those messages are unbounded",
+                ha.msg_name, h.hi_proc, h.lo_proc, h.hi_state
+            );
         }
-        let preds: Vec<_> = topo.edges.iter().filter(|e| e.to == pname).collect();
-        if preds.is_empty() {
-            // An entry other than A: contributes leak if it can reach B.
-            ways.insert(pname, Some(0));
-            leak.insert(pname, true);
-            continue;
-        }
-        let mut w: Option<u64> = Some(0);
-        let mut l = false;
-        for e in &preds {
-            let m = edge_mult
-                .get(&(e.from.clone(), e.to.clone()))
-                .cloned()
-                .unwrap_or(Some(0));
-            let pw = ways.get(e.from.as_str()).cloned().unwrap_or(Some(0));
-            l = l || *leak.get(e.from.as_str()).unwrap_or(&false);
-            match (w, pw, m) {
-                (Some(acc), Some(pw), Some(m)) => w = Some(acc + pw * m),
-                _ => w = None,
+
+        // ORDERING: the counter must be updated before the first send that
+        // can reach B, so a message can never arrive uncounted.
+        let mut counted = false;
+        for stmt in &ha.body {
+            match stmt {
+                Stmt::Assign { name, .. } if name == &h.hi_state => counted = true,
+                Stmt::Send { target, .. } => {
+                    let reaches = mult_map.get(target.as_str()).cloned().unwrap_or(Some(0));
+                    if !matches!(reaches, Some(0)) && !counted {
+                        bail!(
+                            "Level-4 violation in spec '{spec}': ORDERING fails — the `{}` \
+                             handler of `{}` sends toward `{}` BEFORE updating `{}`; a \
+                             message could arrive uncounted. Move the update above the send.",
+                            ha.msg_name, h.hi_proc, h.lo_proc, h.hi_state
+                        );
+                    }
+                }
+                _ => {}
             }
         }
-        ways.insert(pname, w);
-        leak.insert(pname, l);
-    }
-    if *leak.get(h.lo_proc.as_str()).unwrap_or(&true) {
-        bail!(
-            "Level-4 violation in spec '{spec}': FLOW fails — `{}` is reachable from an \
-             entry that does not pass through `{}`, so `{}.{}` counts messages `{}` never \
-             saw",
-            h.lo_proc, h.hi_proc, h.lo_proc, h.lo_state, h.hi_proc
-        );
-    }
-    let mult = match ways.get(h.lo_proc.as_str()) {
-        Some(Some(m)) => *m,
-        _ => bail!(
-            "Level-4 violation in spec '{spec}': FLOW fails — a broadcast edge lies on a \
-             path `{}` → `{}`; broadcast multiplies by the shard count, which is a runtime \
-             value with no static bound",
-            h.hi_proc, h.lo_proc
-        ),
-    };
-    if mult == 0 {
-        bail!(
-            "Level-4 violation in spec '{spec}': `{}` never reaches `{}` in the topology",
-            h.hi_proc, h.lo_proc
-        );
-    }
+        if !counted {
+            bail!(
+                "Level-4 violation in spec '{spec}': the `{}` handler of `{}` sends toward \
+                 `{}` but never updates `{}` — those messages are unbounded",
+                ha.msg_name, h.hi_proc, h.lo_proc, h.hi_state
+            );
+        }
 
-    // GAP: mult × max(db.hi, 0) <= da.lo
-    let db_up = db.hi.max(0.0);
-    let need = (mult as f64) * db_up;
-    let ok = if h.strict { need < da.lo } else { need <= da.lo };
-    if !ok {
+        // GAP: this handler's contribution downstream must be covered.
+        let need = (m_h as f64) * db_max;
+        let ok = if h.strict { need < da.lo } else { need <= da.lo };
+        if !ok {
+            bail!(
+                "Level-4 violation in spec '{spec}': GAP fails — the `{}` handler of `{}` \
+                 forwards up to {m_h} message(s) toward `{}`, each able to add {db_max} to \
+                 `{}`, but only guarantees +{} to `{}`. Guard the increments (literal \
+                 counters, or `require` an upper bound).",
+                ha.msg_name, h.hi_proc, h.lo_proc, h.lo_state, da.lo, h.hi_state
+            );
+        }
+    }
+    if !any_sends {
         bail!(
-            "Level-4 violation in spec '{spec}': GAP fails — along `{}` → `{}` a message \
-             can add up to {db_up} to `{}` across multiplicity {mult}, but is only \
-             guaranteed to add {} to `{}`. Guard the increments (e.g. use literal +1 \
-             counters, or `require` an upper bound on `{}`'s increment).",
-            h.hi_proc, h.lo_proc, h.lo_state, da.lo, h.hi_state, h.lo_state
+            "Level-4 violation in spec '{spec}': no handler of `{}` reaches `{}` in the \
+             topology — the bound is vacuous",
+            h.hi_proc, h.lo_proc
         );
     }
     Ok(())

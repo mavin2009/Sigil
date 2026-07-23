@@ -49,8 +49,9 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     }
 
     let guards = build_input_guards(program);
+    let routes = build_send_routes(program);
     for process in &program.processes {
-        out.push_str(&emit_process(process, &guards));
+        out.push_str(&emit_process(process, &guards, &routes));
         out.push('\n');
         out.push_str(&emit_actor(process));
         out.push('\n');
@@ -234,6 +235,7 @@ fn build_input_guards(
 fn emit_process(
     process: &Process,
     guards: &std::collections::BTreeMap<(String, String), Vec<String>>,
+    routes: &SendRoutes,
 ) -> String {
     let states: Vec<String> = process.states.iter().map(|s| s.name.clone()).collect();
     let mut s = String::new();
@@ -282,7 +284,7 @@ fn emit_process(
             .get(&(process.name.clone(), handler.msg_name.clone()))
             .cloned()
             .unwrap_or_default();
-        s.push_str(&emit_handler(handler, &states, &g));
+        s.push_str(&emit_handler(handler, &states, &g, routes));
         s.push('\n');
     }
     s.push_str("}\n");
@@ -394,15 +396,28 @@ fn emit_actor(process: &Process) -> String {
     s
 }
 
-fn variant_name(msg_name: &str) -> String {
-    let mut c = msg_name.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
-    }
+/// snake_case handler name → UpperCamelCase enum variant (`new_order` →
+/// `NewOrder`), so generated code is idiomatic and lint-clean.
+pub(crate) fn variant_name(msg_name: &str) -> String {
+    msg_name
+        .split('_')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| {
+            let mut c = seg.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
-fn emit_handler(handler: &OnHandler, states: &[String], guards: &[String]) -> String {
+fn emit_handler(
+    handler: &OnHandler,
+    states: &[String],
+    guards: &[String],
+    routes: &SendRoutes,
+) -> String {
     let msg_ty = rust_type(&handler.msg_ty);
     let method = format!("on_{}", handler.msg_name);
     let mut s = String::new();
@@ -415,7 +430,7 @@ fn emit_handler(handler: &OnHandler, states: &[String], guards: &[String]) -> St
     }
 
     for stmt in &handler.body {
-        s.push_str(&emit_stmt(stmt, "        ", states, &handler.msg_name));
+        s.push_str(&emit_stmt(stmt, "        ", states, &handler.msg_name, routes));
     }
 
     s.push_str("        Ok(())\n");
@@ -423,7 +438,141 @@ fn emit_handler(handler: &OnHandler, states: &[String], guards: &[String]) -> St
     s
 }
 
-fn emit_stmt(stmt: &Stmt, indent: &str, states: &[String], msg: &str) -> String {
+/// Resolution of every `send` statement in the program: statement span →
+/// the Handle method to call. Built from the verified topology so codegen
+/// and the checker can never disagree about which handler receives a
+/// message.
+#[derive(Default)]
+pub struct SendRoutes {
+    by_span: std::collections::BTreeMap<usize, String>,
+}
+
+impl SendRoutes {
+    fn method_for(&self, target: &str, span_start: usize) -> String {
+        self.by_span
+            .get(&span_start)
+            .cloned()
+            .unwrap_or_else(|| {
+                debug_assert!(false, "unresolved send to {target} at byte {span_start}");
+                "send".to_string()
+            })
+    }
+}
+
+fn build_send_routes(program: &Program) -> SendRoutes {
+    let mut routes = SendRoutes::default();
+    let Ok(topo) = crate::analysis::topology::derive_topology(program) else {
+        return routes;
+    };
+    for process in &program.processes {
+        for handler in &process.handlers {
+            for stmt in &handler.body {
+                let Stmt::Send { target, span, .. } = stmt else { continue };
+                let Some(dest) = program.processes.iter().find(|p| p.name == *target) else {
+                    continue;
+                };
+                let multi = dest.handlers.len() > 1;
+                // Unique edge for this (from, to) pair unless the source sends
+                // several types to the same multi-handler target; in that case
+                // re-resolve by the sent value's local type.
+                let candidates: Vec<&crate::analysis::topology::TopologyEdge> = topo
+                    .edges
+                    .iter()
+                    .filter(|e| e.from == process.name && e.to == *target)
+                    .collect();
+                let to_handler = if candidates.len() == 1 {
+                    candidates[0].to_handler.clone()
+                } else {
+                    match resolve_send_handler(program, handler, stmt, dest) {
+                        Some(h) => h,
+                        None => continue,
+                    }
+                };
+                routes
+                    .by_span
+                    .insert(span.start, handle_send_method(multi, &to_handler));
+            }
+        }
+    }
+    routes
+}
+
+/// Re-resolve a send's destination handler by the sent value's local type
+/// (only needed when one process sends several message types to the same
+/// multi-handler target).
+fn resolve_send_handler(
+    program: &Program,
+    handler: &OnHandler,
+    stmt: &Stmt,
+    dest: &Process,
+) -> Option<String> {
+    let Stmt::Send { expr, .. } = stmt else { return None };
+    let sigs: std::collections::BTreeMap<&str, String> = program
+        .transforms
+        .iter()
+        .map(|t| (t.name.as_str(), type_name_of(&t.return_ty)))
+        .collect();
+    let mut env: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    env.insert(handler.msg_name.clone(), type_name_of(&handler.msg_ty));
+    for st in &handler.body {
+        if let Stmt::Let { name, expr, .. } = st {
+            if let Some(t) = expr_type(expr, &env, &sigs) {
+                env.insert(name.clone(), t);
+            }
+        }
+    }
+    let ty = expr_type(expr, &env, &sigs)?;
+    dest.handlers
+        .iter()
+        .find(|h| type_name_of(&h.msg_ty) == ty)
+        .map(|h| h.msg_name.clone())
+}
+
+fn expr_type(
+    e: &Expr,
+    env: &std::collections::BTreeMap<String, String>,
+    sigs: &std::collections::BTreeMap<&str, String>,
+) -> Option<String> {
+    match e {
+        Expr::Ident { name, .. } => env.get(name).cloned(),
+        Expr::Call { name, .. } => sigs.get(name.as_str()).cloned(),
+        Expr::Pipeline { base, steps, .. } => {
+            let mut cur = expr_type(base, env, sigs);
+            for step in steps {
+                let t = match &step.expr {
+                    Expr::Ident { name, .. } | Expr::Call { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                cur = t.and_then(|n| sigs.get(n)).cloned();
+            }
+            cur
+        }
+        _ => None,
+    }
+}
+
+fn type_name_of(t: &Type) -> String {
+    crate::analysis::types::type_name(t)
+}
+
+/// Method name on the target's Handle for a resolved edge. Single-handler
+/// targets expose `send`; multi-handler targets expose `send_<msg_name>`.
+fn handle_send_method(multi: bool, to_handler: &str) -> String {
+    if multi {
+        format!("send_{to_handler}")
+    } else {
+        "send".to_string()
+    }
+}
+
+fn emit_stmt(
+    stmt: &Stmt,
+    indent: &str,
+    states: &[String],
+    msg: &str,
+    routes: &SendRoutes,
+) -> String {
     match stmt {
         Stmt::Let { name, expr, .. } => {
             // Prefer multi-line for timeout pipelines so the recover path is readable.
@@ -442,13 +591,14 @@ fn emit_stmt(stmt: &Stmt, indent: &str, states: &[String], msg: &str) -> String 
                 emit_expr(expr, states, msg)
             )
         }
-        Stmt::Send { target, expr, route, .. } => {
+        Stmt::Send { target, expr, route, span } => {
             let target_lc = target.to_lowercase();
             let value = emit_expr(expr, states, msg);
+            let send_m = routes.method_for(target, span.start);
             match route {
                 crate::frontend::ast::Route::RoundRobin => format!(
                     "{indent}match self.{target_lc}_out.as_mut() {{\n\
-                     {indent}    Some(out) => out.round_robin().send({value}).await?,\n\
+                     {indent}    Some(out) => out.round_robin().{send_m}({value}).await?,\n\
                      {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
                      {indent}}}\n"
                 ),
@@ -456,7 +606,7 @@ fn emit_stmt(stmt: &Stmt, indent: &str, states: &[String], msg: &str) -> String 
                     let key_src = emit_expr(key, states, msg);
                     format!(
                         "{indent}match self.{target_lc}_out.as_ref() {{\n\
-                         {indent}    Some(out) => out.by_key(&{key_src}).send({value}).await?,\n\
+                         {indent}    Some(out) => out.by_key(&{key_src}).{send_m}({value}).await?,\n\
                          {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
                          {indent}}}\n"
                     )
@@ -466,7 +616,7 @@ fn emit_stmt(stmt: &Stmt, indent: &str, states: &[String], msg: &str) -> String 
                      {indent}    Some(out) => {{\n\
                      {indent}        let __b = {value};\n\
                      {indent}        for h in out.shards() {{\n\
-                     {indent}            h.send(__b.clone()).await?;\n\
+                     {indent}            h.{send_m}(__b.clone()).await?;\n\
                      {indent}        }}\n\
                      {indent}    }}\n\
                      {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
@@ -806,6 +956,29 @@ fn emit_smoke_test(program: &Program) -> String {
 }
 
 
+/// Field synthesis for a demo message: Int=1, Float=1.0, Bool=true, String
+/// gets a unique id. Keeps aggregates checkable by construction.
+fn demo_field_init(program: &Program, msg_ty: &Type, var: &str, indent: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if let Type::Named(name) = msg_ty {
+        if let Some(schema) = program.schemas.iter().find(|sc| sc.name == *name) {
+            for (fname, fty) in &schema.fields {
+                match fty {
+                    Type::Int => { let _ = writeln!(out, "{indent}{var}.{fname} = 1;"); }
+                    Type::Float => { let _ = writeln!(out, "{indent}{var}.{fname} = 1.0;"); }
+                    Type::String => {
+                        let _ = writeln!(out, "{indent}{var}.{fname} = format!(\"m-{{prod}}-{{i}}\");");
+                    }
+                    Type::Bool => { let _ = writeln!(out, "{indent}{var}.{fname} = true;"); }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Multi-stage demo: spawn each process as a shard fleet in reverse
 /// topological order, wire outboxes, feed the entry stage from concurrent
 /// producers, then shut down stage by stage and print per-stage accounting.
@@ -886,7 +1059,42 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
     let entry_lc = entry_name.to_lowercase();
     let _ = write!(out, "    let t0 = Instant::now();\n");
     let _ = write!(out, "    let mut producer_tasks = Vec::new();\n");
-    let _ = write!(out, "    for prod in 0..producers {{\n        let hs = {entry_lc}_handles.clone();\n        producer_tasks.push(tokio::spawn(async move {{\n            for i in 0..msgs_per_producer {{\n                let mut msg = {msg_ty}::default();\n{field_init}                let shard = (prod + i) % hs.len();\n                if hs[shard].send(msg).await.is_err() {{\n                    break;\n                }}\n            }}\n        }}));\n    }}\n    for t in producer_tasks {{\n        let _ = t.await;\n    }}\n\n");
+    let multi_entry = entry.handlers.len() > 1;
+    // Producers cycle through EVERY handler of the entry process, so a
+    // multi-handler entry is genuinely exercised (and the totals stay exact).
+    let mut feed_arms = String::new();
+    for (k, hh) in entry.handlers.iter().enumerate() {
+        let ty = rust_type(&hh.msg_ty);
+        let init = demo_field_init(program, &hh.msg_ty, "msg", "                        ");
+        let method = if multi_entry {
+            format!("send_{}", hh.msg_name)
+        } else {
+            "send".to_string()
+        };
+        let _ = write!(
+            feed_arms,
+            "                    {k} => {{\n                        let mut msg = {ty}::default();\n{init}                        if hs[shard].{method}(msg).await.is_err() {{ break; }}\n                    }}\n"
+        );
+    }
+    let n_handlers = entry.handlers.len();
+    let _ = write!(
+        out,
+        "    for prod in 0..producers {{\n\
+        \x20       let hs = {entry_lc}_handles.clone();\n\
+        \x20       producer_tasks.push(tokio::spawn(async move {{\n\
+        \x20           for i in 0..msgs_per_producer {{\n\
+        \x20               let shard = (prod + i) % hs.len();\n\
+        \x20               match (prod + i) % {n_handlers} {{\n\
+{feed_arms}\
+        \x20                   _ => unreachable!(),\n\
+        \x20               }}\n\
+        \x20           }}\n\
+        \x20       }}));\n\
+        \x20   }}\n\
+        \x20   for t in producer_tasks {{\n\
+        \x20       let _ = t.await;\n\
+        \x20   }}\n\n"
+    );
 
     let _ = write!(out, "    println!(\"=== topology demo: {edge_list} ===\");\n");
     out.push_str("    println!(\"{} shards/stage, {} producers, {} messages, {} worker threads\", shards, producers, total, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));\n");

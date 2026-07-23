@@ -42,9 +42,10 @@ pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> 
     // (already charged (1 + retries) × timeout per stage). For a single
     // process this degenerates to that process's sum; parallel branches
     // take the max, not the sum.
-    let per_process: std::collections::BTreeMap<&str, u64> = irs
+    let per_process: std::collections::BTreeMap<&str, u64> = program
+        .processes
         .iter()
-        .map(|ir| (ir.process_name.as_str(), path_timeout_sum_ms(ir)))
+        .map(|p| (p.name.as_str(), process_worst_case_ms(p)))
         .collect();
     let sum = match crate::analysis::topology::derive_topology(program) {
         Ok(topo) if topo.is_pipeline() => {
@@ -431,14 +432,58 @@ fn check_expr_steps(expr: &Expr, process: &str) -> Result<()> {
     Ok(())
 }
 
-fn path_timeout_sum_ms(ir: &GraphIR) -> u64 {
-    ir.nodes
+/// Worst-case time a SINGLE message spends in one process.
+///
+/// A message is dispatched to exactly one handler, so a process contributes
+/// the maximum over its handlers — not the sum. (Summing over handlers
+/// inflates the budget of every multi-handler process and would reject
+/// programs that comfortably meet their SLO.) Within a handler the timed
+/// stages are sequential, so they add, each charged `(1 + retries) × timeout`.
+fn process_worst_case_ms(process: &crate::frontend::ast::Process) -> u64 {
+    process
+        .handlers
         .iter()
-        .filter_map(|n| match n {
-            crate::analysis::ir::Node::Timeout { ms, attempts, .. } => Some(*ms * *attempts),
-            _ => None,
+        .map(|h| {
+            h.body
+                .iter()
+                .map(|stmt| match stmt {
+                    Stmt::Let { expr, .. }
+                    | Stmt::Assign { expr, .. }
+                    | Stmt::Send { expr, .. }
+                    | Stmt::Expr { expr, .. } => expr_timeout_ms(expr),
+                })
+                .sum::<u64>()
         })
-        .sum()
+        .max()
+        .unwrap_or(0)
+}
+
+fn expr_timeout_ms(expr: &Expr) -> u64 {
+    match expr {
+        Expr::Pipeline { base, steps, .. } => {
+            let mut total = expr_timeout_ms(base);
+            for step in steps {
+                let ms = step.tags.iter().find_map(|t| match t {
+                    Tag::Timeout { expr: Expr::Literal { value: Literal::DurationMs(m), .. }, .. } => Some(*m),
+                    _ => None,
+                });
+                let retries = step
+                    .tags
+                    .iter()
+                    .find_map(|t| match t {
+                        Tag::Retry { expr: Expr::Literal { value: Literal::Int(n), .. }, .. } => {
+                            Some((*n).max(0) as u64)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                total += ms.unwrap_or(0) * (1 + retries);
+            }
+            total
+        }
+        Expr::Binary { lhs, rhs, .. } => expr_timeout_ms(lhs) + expr_timeout_ms(rhs),
+        _ => 0,
+    }
 }
 
 fn check_require(

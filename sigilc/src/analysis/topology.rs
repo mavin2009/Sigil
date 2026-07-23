@@ -8,7 +8,7 @@
 //!   - the graph is a DAG (cycles over bounded channels can deadlock;
 //!     rejected until an explicit async-boundary construct exists)
 
-use crate::analysis::types::{infer_program, type_name};
+use crate::analysis::types::type_name;
 use crate::frontend::ast::{Expr, Program, Route, Stmt};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +18,10 @@ pub struct TopologyEdge {
     pub from: String,
     pub to: String,
     pub msg_type: String,
+    /// Message name of the destination handler this edge dispatches to.
+    /// With multi-handler processes the target is resolved BY TYPE, so
+    /// codegen knows exactly which variant to construct.
+    pub to_handler: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,16 +43,76 @@ impl Topology {
     }
 }
 
+/// Static types of the bindings in one handler, resolved locally.
+///
+/// A program-global environment would let a binding name in one process
+/// silently resolve against a same-named binding in another; for `send`
+/// dispatch that would mean delivering to the wrong handler. This walks a
+/// single handler with declared transform signatures only.
+fn local_binding_types(
+    program: &Program,
+    handler: &crate::frontend::ast::OnHandler,
+) -> BTreeMap<String, String> {
+    let sigs: BTreeMap<&str, (String, String)> = program
+        .transforms
+        .iter()
+        .map(|t| {
+            (
+                t.name.as_str(),
+                (type_name(&t.param_ty), type_name(&t.return_ty)),
+            )
+        })
+        .collect();
+
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    env.insert(handler.msg_name.clone(), type_name(&handler.msg_ty));
+
+    // Type of an expression, given what is known so far.
+    fn ty_of(
+        e: &Expr,
+        env: &BTreeMap<String, String>,
+        sigs: &BTreeMap<&str, (String, String)>,
+    ) -> Option<String> {
+        match e {
+            Expr::Ident { name, .. } => env.get(name).cloned(),
+            Expr::Call { name, .. } => sigs.get(name.as_str()).map(|(_, o)| o.clone()),
+            Expr::Pipeline { base, steps, .. } => {
+                let mut cur = ty_of(base, env, sigs);
+                for step in steps {
+                    let target = match &step.expr {
+                        Expr::Ident { name, .. } | Expr::Call { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    };
+                    cur = target.and_then(|n| sigs.get(n)).map(|(_, o)| o.clone());
+                }
+                cur
+            }
+            _ => None,
+        }
+    }
+
+    for stmt in &handler.body {
+        if let Stmt::Let { name, expr, .. } = stmt {
+            if let Some(t) = ty_of(expr, &env, &sigs) {
+                env.insert(name.clone(), t);
+            }
+        }
+    }
+    env
+}
+
 /// Derive and validate the process topology.
 pub fn derive_topology(program: &Program) -> Result<Topology> {
     let process_names: BTreeSet<&str> =
         program.processes.iter().map(|p| p.name.as_str()).collect();
-    let (env, _) = infer_program(program);
 
     let mut edges: Vec<TopologyEdge> = Vec::new();
 
     for process in &program.processes {
         for handler in &process.handlers {
+            // Types are resolved per handler; a global environment would let
+            // same-named bindings in different processes cross-contaminate.
+            let local = local_binding_types(program, handler);
             for stmt in &handler.body {
                 let Stmt::Send { target, expr, route, .. } = stmt else {
                     continue;
@@ -59,11 +123,7 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
                     // production folklore for a reason.
                     let key_ty: Option<String> = match key {
                         Expr::FieldAccess { base, field, .. } => {
-                            let base_ty = if base == &handler.msg_name {
-                                Some(type_name(&handler.msg_ty))
-                            } else {
-                                env.get(base).cloned()
-                            };
+                            let base_ty = local.get(base).cloned();
                             base_ty.and_then(|bt| {
                                 program.schemas.iter().find(|sc| sc.name == bt).and_then(
                                     |sc| {
@@ -75,7 +135,7 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
                                 )
                             })
                         }
-                        Expr::Ident { name, .. } => env.get(name).cloned(),
+                        Expr::Ident { name, .. } => local.get(name).cloned(),
                         _ => None,
                     };
                     if key_ty.as_deref() == Some("Float") {
@@ -106,30 +166,62 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
                     .iter()
                     .find(|p| p.name == *target)
                     .expect("target existence checked above");
-                let Some(dest_handler) = dest.handlers.first() else {
-                    bail!(
-                        "topology violation: send target '{target}' has no handlers"
-                    );
-                };
-                if dest.handlers.len() > 1 {
-                    bail!(
-                        "topology violation: send target '{target}' has multiple \
-                         handlers; typed multi-handler routing is not yet supported"
-                    );
+                if dest.handlers.is_empty() {
+                    bail!("topology violation: send target '{target}' has no handlers");
                 }
-                let expected = type_name(&dest_handler.msg_ty);
 
-                // Best-effort static type of the sent value.
-                let actual = match expr {
-                    Expr::Ident { name, .. } => {
-                        if name == &handler.msg_name {
-                            Some(type_name(&handler.msg_ty))
-                        } else {
-                            env.get(name).cloned()
-                        }
-                    }
+                // Static type of the sent value, inferred locally.
+                let actual: Option<String> = match expr {
+                    Expr::Ident { name, .. } => local.get(name).cloned(),
+                    Expr::Call { name, .. } => program
+                        .transforms
+                        .iter()
+                        .find(|t| t.name == *name)
+                        .map(|t| type_name(&t.return_ty)),
                     _ => None,
                 };
+
+                // Resolve the destination handler BY TYPE.
+                let (dest_handler, expected) = if dest.handlers.len() == 1 {
+                    let h = &dest.handlers[0];
+                    (h, type_name(&h.msg_ty))
+                } else {
+                    let Some(actual_ty) = actual.clone() else {
+                        bail!(
+                            "topology violation in process '{}': cannot resolve which \
+                             handler of '{target}' receives this send — '{target}' has {} \
+                             handlers and the sent value's type is not statically known. \
+                             Bind it with `let` from a declared transform first.",
+                            process.name,
+                            dest.handlers.len()
+                        );
+                    };
+                    let matches: Vec<_> = dest
+                        .handlers
+                        .iter()
+                        .filter(|h| type_name(&h.msg_ty) == actual_ty)
+                        .collect();
+                    match matches.len() {
+                        1 => (matches[0], actual_ty),
+                        0 => bail!(
+                            "topology violation in process '{}': sends `{actual_ty}` to \
+                             '{target}', which has no handler for that type (handlers: {})",
+                            process.name,
+                            dest.handlers
+                                .iter()
+                                .map(|h| format!("`{}`", type_name(&h.msg_ty)))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        _ => bail!(
+                            "topology violation: process '{target}' has {} handlers for \
+                             type `{actual_ty}` — message types must uniquely identify a \
+                             handler",
+                            matches.len()
+                        ),
+                    }
+                };
+
                 if let Some(actual) = actual {
                     if actual != expected {
                         bail!(
@@ -140,14 +232,14 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
                     }
                 }
 
-                if !edges
-                    .iter()
-                    .any(|e| e.from == process.name && e.to == *target)
-                {
+                if !edges.iter().any(|e| {
+                    e.from == process.name && e.to == *target && e.to_handler == dest_handler.msg_name
+                }) {
                     edges.push(TopologyEdge {
                         from: process.name.clone(),
                         to: target.clone(),
                         msg_type: expected,
+                        to_handler: dest_handler.msg_name.clone(),
                     });
                 }
             }

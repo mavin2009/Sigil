@@ -1,0 +1,8 @@
+// MUST FAIL: two handlers accept the same type — `send` resolves the
+// destination handler by type, so this is ambiguous.
+schema A { x: Int }
+process P {
+  state n: Int = 0
+  on first: A { n := n + first.x }
+  on second: A { n := n + second.x }
+}

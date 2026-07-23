@@ -1,0 +1,19 @@
+// MUST FAIL: Sink has no handler for the type being sent.
+schema A { x: Int }
+schema B { y: Int }
+schema C { z: Int }
+transform to_c(a: A) -> C {}
+transform keep(a: A) -> A { a }
+process Src {
+  state n: Int = 0
+  on a: A {
+    let converted = a ~> to_c @recover(with: keep)
+    n := n + 1
+    send converted to Sink
+  }
+}
+process Sink {
+  state got: Int = 0
+  on x: A { got := got + 1 }
+  on y: B { got := got + 1 }
+}

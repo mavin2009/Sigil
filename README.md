@@ -16,6 +16,7 @@ These failure modes are rejected or unrepresentable at the default safety level:
 - State writes to non-local slots
 - Pipeline stages whose types disagree with declared transform signatures
 - `send` to undeclared processes, type-mismatched topology edges, cyclic process graphs, and Float shard-routing keys
+- Duplicate handler message names or types within a process, and sends to a type the target cannot receive
 - Cross-process state writes (Graph IR is per-process; locality is checked against the owning process only)
 - Bare calls to external transforms (external stages must be pipeline steps with a failure path)
 - External calls inside pure transform bodies (pure transforms are the infallibility anchor)
@@ -456,4 +457,4 @@ Negative programs live under `examples/proofs/`.
 
 ## Status
 
-v0.5 — Level 4 shipped: cross-process system invariants proven structurally over the topology (ordering / flow / multiplicity / gap obligations, each with a negative proof). Level 3 completed: relational holds via per-handler deltas, let-binding interval tracking. Level 3: built-in inductive prover for hold invariants (interval domain, no SMT dependency), runtime-guarded proof assumptions, actionable proof failures. Soundness-hardened: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.
+v0.6 — Multi-handler processes: type-directed dispatch, per-handler proof obligations and latency budgets, exchange-gateway example. Level 4: cross-process system invariants proven structurally over the topology (ordering / flow / multiplicity / gap obligations, each with a negative proof). Level 3 completed: relational holds via per-handler deltas, let-binding interval tracking. Level 3: built-in inductive prover for hold invariants (interval domain, no SMT dependency), runtime-guarded proof assumptions, actionable proof failures. Soundness-hardened: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.

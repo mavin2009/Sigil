@@ -1,0 +1,9 @@
+// MUST FAIL: two handlers bind the same message name — the generated
+// dispatch enum would have duplicate variants.
+schema A { x: Int }
+schema B { y: Int }
+process P {
+  state n: Int = 0
+  on m: A { n := n + m.x }
+  on m: B { n := n + m.y }
+}

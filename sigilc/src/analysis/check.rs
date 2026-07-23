@@ -527,6 +527,82 @@ fn step_span_of(step: &crate::frontend::ast::PipeStep) -> crate::frontend::ast::
     }
 }
 
+/// Well-formedness of multi-handler processes.
+///
+/// Two obligations, both of which produce broken or ambiguous programs if
+/// violated:
+///   - handler message NAMES must be unique in a process (they name the
+///     dispatch variant and scope the Level-3 input guards);
+///   - handler message TYPES must be unique in a process (`send` resolves
+///     the destination handler by type, so duplicates are ambiguous).
+pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
+    use crate::analysis::types::type_name;
+    use std::collections::BTreeMap;
+
+    for process in &program.processes {
+        if process.handlers.is_empty() {
+            bail!(
+                "Level-1 violation: process '{}' declares no handlers — it can never \
+                 receive a message",
+                process.name
+            );
+        }
+        let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut by_type: BTreeMap<String, usize> = BTreeMap::new();
+        for h in &process.handlers {
+            *by_name.entry(h.msg_name.as_str()).or_insert(0) += 1;
+            *by_type.entry(type_name(&h.msg_ty)).or_insert(0) += 1;
+        }
+        for (name, n) in &by_name {
+            if *n > 1 {
+                bail!(
+                    "Level-1 violation in process '{}' at bytes {}..{}: {n} handlers bind \
+                     the message name '{name}' — handler message names must be unique \
+                     within a process (they name the dispatch variant and scope input \
+                     guards)",
+                    process.name,
+                    process.span.start,
+                    process.span.end
+                );
+            }
+        }
+        // Dispatch variants are UpperCamelCase versions of the message names;
+        // distinct names must stay distinct after that transformation.
+        let mut by_variant: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for h in &process.handlers {
+            by_variant
+                .entry(crate::backend::codegen::variant_name(&h.msg_name))
+                .or_default()
+                .push(h.msg_name.as_str());
+        }
+        for (variant, names) in &by_variant {
+            if names.len() > 1 {
+                bail!(
+                    "Level-1 violation in process '{}' at bytes {}..{}: handler names {} all \
+                     map to the dispatch variant `{variant}` — rename so they stay distinct",
+                    process.name,
+                    process.span.start,
+                    process.span.end,
+                    names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        for (ty, n) in &by_type {
+            if *n > 1 {
+                bail!(
+                    "Level-1 violation in process '{}' at bytes {}..{}: {n} handlers accept \
+                     type `{ty}` — `send` resolves the destination handler by message type, \
+                     so each type may appear at most once per process",
+                    process.name,
+                    process.span.start,
+                    process.span.end
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Pure transforms are the language's infallibility anchor: their bodies may
 /// not invoke external transforms, directly or via pipelines.
 pub fn check_transform_purity(program: &Program) -> Result<()> {

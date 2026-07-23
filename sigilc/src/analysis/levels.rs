@@ -8,7 +8,7 @@
 //! automatic: skipping a level never fails the build silently — every skipped
 //! guarantee is surfaced in the residual-risk report.
 
-use crate::analysis::check::{check_failure_paths, check_transform_purity, check_transform_signatures, fallible_fallbacks, level1_check};
+use crate::analysis::check::{check_failure_paths, check_handler_wellformedness, check_transform_purity, check_transform_signatures, fallible_fallbacks, level1_check};
 use crate::analysis::ir::GraphIR;
 use crate::analysis::level2::{level2_check, Level2Report};
 use crate::analysis::topology::derive_topology;
@@ -90,6 +90,7 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
         for ir in irs {
             level1_check(ir)?;
         }
+        check_handler_wellformedness(program)?;
         check_transform_signatures(program)?;
         check_failure_paths(program)?;
         check_transform_purity(program)?;
@@ -98,6 +99,7 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
         skipped.push("shared-mutability / local-state discipline (Level-1 not run)".into());
         skipped.push("@timeout ↔ @recover pairing (Level-1 not run)".into());
         skipped.push("pipeline ↔ transform signature agreement (not checked)".into());
+        skipped.push("handler well-formedness (unique message names/types — not checked)".into());
         skipped.push("failure-path coverage of external stages (not checked)".into());
         skipped.push("process topology (targets, types, acyclicity — not checked)".into());
         notes.push(

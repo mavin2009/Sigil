@@ -1,0 +1,20 @@
+// MUST FAIL --level 4: the cancel handler forwards to Book without counting,
+// so cancels reach the book unbounded by the gateway's counter.
+schema Order { id: String }
+schema Cancel { id: String }
+process Gateway {
+  state received: Int = 0
+  on order: Order {
+    received := received + 1
+    send order to Book
+  }
+  on cancel: Cancel {
+    send cancel to Book
+  }
+}
+process Book {
+  state posted: Int = 0
+  on o: Order { posted := posted + 1 }
+  on c: Cancel { posted := posted + 1 }
+}
+spec Broken { hold Book.posted <= Gateway.received }
