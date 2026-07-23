@@ -1,0 +1,44 @@
+// Level-2: path timeout SLO + pure hold on a counter side-channel.
+// Timed residual stages stay under 250.ms; pure hits counter stays non-negative.
+
+schema Event {
+  id: String,
+  weight: Int
+}
+
+schema Ack {
+  id: String,
+  status: String
+}
+
+transform normalize(e: Event) -> Event {
+  e
+}
+
+transform bump(x: Int) -> Int {
+  x + 1
+}
+
+transform enrich(e: Event) -> Event {}
+transform fallback(e: Event) -> Event {}
+transform ack(e: Event) -> Ack {}
+
+process Service {
+  state hits: Int = 0
+  state last_id: String = "none"
+
+  on event: Event {
+    let n = event ~> normalize
+    let e = n ~> enrich @timeout(80.ms) @recover(with: fallback)
+    let a = e ~> ack
+    let h = hits ~> bump
+    hits := h
+    last_id := a.id
+  }
+}
+
+spec ServiceL2 {
+  require path_timeout_sum <= 250.ms
+  hold hits >= 0
+  extinct [null]
+}

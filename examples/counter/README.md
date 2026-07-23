@@ -1,24 +1,13 @@
 # counter
 
-Process-local total updated through a pure compiled transform.
+Process-local total with pure `add` and Level-2 `hold total >= 0`.
 
 ## Compile
 
 ```bash
-cargo run -p sigilc -- examples/counter/counter.sigil generated/counter
+cargo run -p sigilc -- examples/counter/counter.sigil generated/counter --emit-main
 ```
 
-## Constructs
+## Level-2
 
-| Item | Role |
-|------|------|
-| `add` | Pure body `x + 1` → compiled into generated Rust |
-
-## Local state
-
-- `total` — running total after each tick
-
-## Residual risk (expected shape)
-
-- Compiled: `add: Int → Int`
-- No timed stages
+`hold total >= 0` is discharged when init is non-negative and updates are pure.

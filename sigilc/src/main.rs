@@ -231,6 +231,17 @@ mod integration {
     }
 
     #[test]
+    fn compile_level2_example() {
+        let source = include_str!("../../examples/level2/slo_and_hold.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert!(graph.has_timeout());
+        assert!(graph.has_recover());
+        assert!(rust.contains("Service") || rust.contains("on_event"));
+        assert!(risk.contains("Level-2") || risk.contains("path_timeout") || risk.contains("discharged"));
+        assert!(risk.contains("hits") || risk.contains("hold") || risk.contains("80"));
+    }
+
+    #[test]
     fn compile_legacy_counter_example() {
         let source = include_str!("../../examples/counter/counter.sigil");
         let (rust, risk, _) = compile_source(source);

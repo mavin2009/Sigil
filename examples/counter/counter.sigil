@@ -1,4 +1,4 @@
-// Local counter with a pure compiled arithmetic transform.
+// Local counter with pure compiled transform and Level-2 hold.
 
 schema Tick {
   value: Int
@@ -16,4 +16,8 @@ process Counter {
     let bumped = next ~> add
     total := bumped
   }
+}
+
+spec CounterSafe {
+  hold total >= 0
 }

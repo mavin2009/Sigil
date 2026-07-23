@@ -83,8 +83,10 @@ Temporal / path obligations on a Level-1-legal graph:
 |-------|---------|
 | Per-step recovery | Every `@timeout` has `@recover` on the **same** pipeline step |
 | `require path_timeout_sum <= N.ms` | Sum of timed stages on the process path must not exceed N |
-| `hold <expr>` | Recorded invariant (full symbolic discharge is residual when externals involved) |
+| `hold state >= N` | Discharged when init satisfies and updates are pure; residual if externals feed state |
 | `extinct [...]` | Assumptions listed in residual risk |
+
+See `examples/level2/` for a combined SLO + hold program.
 
 ```sigil
 spec OrderSlo {
