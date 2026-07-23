@@ -1,0 +1,21 @@
+// MUST FAIL --level 2: `require path_latency` claims an end-to-end bound,
+// but the send blocks, and a blocking send waits an unbounded time when the
+// destination queue is full.
+schema M { id: String }
+transform work(m: M) -> M {}
+transform skip(m: M) -> M { m }
+process Src {
+  state sent: Int = 0
+  on m: M {
+    let ok = m ~> work @timeout(20.ms) @recover(with: skip)
+    sent := sent + 1
+    send ok to Sink @block
+  }
+}
+process Sink {
+  state got: Int = 0
+  on m: M { got := got + 1 }
+}
+spec Broken {
+  require path_latency <= 100.ms
+}

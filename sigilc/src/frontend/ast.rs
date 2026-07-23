@@ -96,10 +96,54 @@ pub struct OnHandler {
 pub enum Stmt {
     Let { name: String, expr: Expr, span: Span },
     Assign { name: String, expr: Expr, span: Span },
-    /// `send <expr> to <Process> [by <key>|broadcast]` — typed, routed message
-    /// to another process's shard fleet.
-    Send { target: String, expr: Expr, route: Route, span: Span },
+    /// `send <expr> to <Process> [by <key>|broadcast] [@block|@shed|@deadline(N.ms)]`
+    /// — typed, routed, back-pressured message to another process's fleet.
+    Send {
+        target: String,
+        expr: Expr,
+        route: Route,
+        backpressure: Backpressure,
+        span: Span,
+    },
     Expr { expr: Expr, span: Span },
+}
+
+/// What a `send` does when the destination's queue is full.
+///
+/// Every policy preserves downstream-counting invariants (shedding only
+/// *decreases* the downstream count), but only the bounded policies can
+/// back an end-to-end latency claim: `@block` waits for an unbounded time.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Backpressure {
+    /// Await capacity. Propagates backpressure upstream; cannot deadlock
+    /// because the process graph is proven acyclic — but has no time bound.
+    #[default]
+    Block,
+    /// Never wait: if the queue is full, drop the message and count it.
+    Shed,
+    /// Wait up to N ms, then drop and count. Bounded, so it can be charged
+    /// to the latency budget.
+    Deadline(u64),
+}
+
+impl Backpressure {
+    /// Worst-case milliseconds this send can add to a path, or `None` when
+    /// the wait is unbounded.
+    pub fn budget_ms(&self) -> Option<u64> {
+        match self {
+            Backpressure::Block => None,
+            Backpressure::Shed => Some(0),
+            Backpressure::Deadline(ms) => Some(*ms),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Backpressure::Block => "@block".into(),
+            Backpressure::Shed => "@shed".into(),
+            Backpressure::Deadline(ms) => format!("@deadline({ms}.ms)"),
+        }
+    }
 }
 
 /// Shard-routing policy for a `send`.
@@ -336,18 +380,43 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
             let expr = parse_expr(inner.next().unwrap())?;
             let target = inner.next().unwrap().as_str().to_string();
             let mut route = Route::RoundRobin;
-            if let Some(rc) = inner.next() {
-                let rc_inner = rc.into_inner().next().unwrap();
-                route = match rc_inner.as_rule() {
-                    Rule::by_route => {
-                        let key = parse_expr(rc_inner.into_inner().next().unwrap())?;
-                        Route::ByKey(key)
+            let mut backpressure = Backpressure::Block;
+            for extra in inner {
+                match extra.as_rule() {
+                    Rule::route_clause => {
+                        let rc_inner = extra.into_inner().next().unwrap();
+                        route = match rc_inner.as_rule() {
+                            Rule::by_route => {
+                                let key = parse_expr(rc_inner.into_inner().next().unwrap())?;
+                                Route::ByKey(key)
+                            }
+                            Rule::broadcast_kw => Route::Broadcast,
+                            other => bail!("unexpected route clause: {:?}", other),
+                        };
                     }
-                    Rule::broadcast_kw => Route::Broadcast,
-                    other => bail!("unexpected route clause: {:?}", other),
-                };
+                    Rule::backpressure => {
+                        let bp_inner = extra.into_inner().next().unwrap();
+                        backpressure = match bp_inner.as_rule() {
+                            Rule::shed_kw => Backpressure::Shed,
+                            Rule::block_kw => Backpressure::Block,
+                            Rule::deadline_bp => {
+                                let e = parse_expr(bp_inner.into_inner().next().unwrap())?;
+                                match e {
+                                    Expr::Literal { value: Literal::DurationMs(ms), .. } => {
+                                        Backpressure::Deadline(ms)
+                                    }
+                                    _ => bail!(
+                                        "@deadline requires a duration literal, e.g. @deadline(5.ms)"
+                                    ),
+                                }
+                            }
+                            other => bail!("unexpected backpressure clause: {:?}", other),
+                        };
+                    }
+                    other => bail!("unexpected send clause: {:?}", other),
+                }
             }
-            Ok(Stmt::Send { target, expr, route, span })
+            Ok(Stmt::Send { target, expr, route, backpressure, span })
         }
         Rule::expr_stmt => {
             let inner = pair.into_inner().next().unwrap();

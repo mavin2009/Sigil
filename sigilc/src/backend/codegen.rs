@@ -246,6 +246,10 @@ fn emit_process(
         // Public so integration tests / callers can observe local state.
         s.push_str(&format!("    pub {}: {},\n", st.name, rust_type(&st.ty)));
     }
+    if !targets.is_empty() {
+        s.push_str("    /// Outbound messages shed by back-pressure policy.\n");
+        s.push_str("    pub __shed: u64,\n");
+    }
     for t in &targets {
         s.push_str(&format!(
             "    /// Outbox to the {t} actor. Wire with connect_{}() before spawn.\n",
@@ -266,6 +270,9 @@ fn emit_process(
             st.name,
             emit_expr(&st.init, &[], "")
         ));
+    }
+    if !targets.is_empty() {
+        s.push_str("            __shed: 0,\n");
     }
     for t in &targets {
         s.push_str(&format!("            {}_out: None,\n", t.to_lowercase()));
@@ -294,6 +301,9 @@ fn emit_process(
 
 /// Emit shared-nothing actor machinery for a process.
 ///
+/// `__shed_of` is emitted per process so the spawn loop can report shed
+/// counts uniformly whether or not the process sends anything.
+///
 /// This is where the Level-1 "no shared mutable state" guarantee is realized
 /// in the generated Rust, not just checked by the compiler:
 ///   - `spawn(self)` MOVES the state into an isolated tokio task; after that
@@ -308,6 +318,13 @@ fn emit_actor(process: &Process) -> String {
     let p = &process.name;
     let mut s = String::new();
 
+    // Shed counts live on the process itself when it has outboxes; emit the
+    // expression inline so no cross-process helper names can collide.
+    let shed_expr = if process_send_targets(process).is_empty() {
+        "0"
+    } else {
+        "self.__shed"
+    };
     let drop_outboxes: String = process_send_targets(process)
         .iter()
         .map(|t| format!("            self.{}_out = None; // release downstream channel\n", t.to_lowercase()))
@@ -324,6 +341,10 @@ fn emit_actor(process: &Process) -> String {
              \x20   tx: tokio::sync::mpsc::Sender<{msg_ty}>,\n\
              }}\n\n\
              impl {p}Handle {{\n\
+             \x20   /// Raw channel, for the declared back-pressure policy.\n\
+             \x20   pub fn raw(&self) -> &tokio::sync::mpsc::Sender<{msg_ty}> {{\n\
+             \x20       &self.tx\n\
+             \x20   }}\n\n\
              \x20   pub async fn send(&self, msg: {msg_ty}) -> Result<()> {{\n\
              \x20       self.tx\n\
              \x20           .send(msg)\n\
@@ -346,6 +367,7 @@ fn emit_actor(process: &Process) -> String {
              \x20               }}\n\
              \x20           }}\n\
 {drop_outboxes}\
+             \x20           stats.shed = {shed_expr};\n\
              \x20           (self, stats)\n\
              \x20       }});\n\
              \x20       ({p}Handle {{ tx }}, join)\n\
@@ -368,7 +390,7 @@ fn emit_actor(process: &Process) -> String {
     s.push_str("}\n\n");
 
     s.push_str(&format!(
-        "#[derive(Clone)]\npub struct {p}Handle {{\n    tx: tokio::sync::mpsc::Sender<{enum_name}>,\n}}\n\nimpl {p}Handle {{\n"
+        "#[derive(Clone)]\npub struct {p}Handle {{\n    tx: tokio::sync::mpsc::Sender<{enum_name}>,\n}}\n\nimpl {p}Handle {{\n    /// Raw channel, for the declared back-pressure policy.\n    pub fn raw(&self) -> &tokio::sync::mpsc::Sender<{enum_name}> {{\n        &self.tx\n    }}\n\n"
     ));
     for h in &process.handlers {
         s.push_str(&format!(
@@ -391,7 +413,7 @@ fn emit_actor(process: &Process) -> String {
         ));
     }
     s.push_str(&format!(
-        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n{drop_outboxes}            (self, stats)\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
+        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n{drop_outboxes}            stats.shed = {shed_expr};\n            (self, stats)\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
     ));
     s
 }
@@ -444,18 +466,21 @@ fn emit_handler(
 /// message.
 #[derive(Default)]
 pub struct SendRoutes {
+    /// span start → template that wraps the value for the destination's
+    /// channel: `{v}` for single-handler targets, `TargetMsg::Variant({v})`
+    /// for multi-handler ones.
     by_span: std::collections::BTreeMap<usize, String>,
 }
 
 impl SendRoutes {
-    fn method_for(&self, target: &str, span_start: usize) -> String {
-        self.by_span
-            .get(&span_start)
-            .cloned()
-            .unwrap_or_else(|| {
+    fn wrap(&self, target: &str, span_start: usize, value: &str) -> String {
+        match self.by_span.get(&span_start) {
+            Some(tpl) => tpl.replace("{v}", value),
+            None => {
                 debug_assert!(false, "unresolved send to {target} at byte {span_start}");
-                "send".to_string()
-            })
+                value.to_string()
+            }
+        }
     }
 }
 
@@ -488,9 +513,12 @@ fn build_send_routes(program: &Program) -> SendRoutes {
                         None => continue,
                     }
                 };
-                routes
-                    .by_span
-                    .insert(span.start, handle_send_method(multi, &to_handler));
+                let tpl = if multi {
+                    format!("{target}Msg::{}({{v}})", variant_name(&to_handler))
+                } else {
+                    "{v}".to_string()
+                };
+                routes.by_span.insert(span.start, tpl);
             }
         }
     }
@@ -556,16 +584,6 @@ fn type_name_of(t: &Type) -> String {
     crate::analysis::types::type_name(t)
 }
 
-/// Method name on the target's Handle for a resolved edge. Single-handler
-/// targets expose `send`; multi-handler targets expose `send_<msg_name>`.
-fn handle_send_method(multi: bool, to_handler: &str) -> String {
-    if multi {
-        format!("send_{to_handler}")
-    } else {
-        "send".to_string()
-    }
-}
-
 fn emit_stmt(
     stmt: &Stmt,
     indent: &str,
@@ -591,35 +609,89 @@ fn emit_stmt(
                 emit_expr(expr, states, msg)
             )
         }
-        Stmt::Send { target, expr, route, span } => {
+        Stmt::Send { target, expr, route, backpressure, span } => {
             let target_lc = target.to_lowercase();
             let value = emit_expr(expr, states, msg);
-            let send_m = routes.method_for(target, span.start);
-            match route {
-                crate::frontend::ast::Route::RoundRobin => format!(
-                    "{indent}match self.{target_lc}_out.as_mut() {{\n\
-                     {indent}    Some(out) => out.round_robin().{send_m}({value}).await?,\n\
-                     {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
-                     {indent}}}\n"
-                ),
-                crate::frontend::ast::Route::ByKey(key) => {
-                    let key_src = emit_expr(key, states, msg);
-                    format!(
-                        "{indent}match self.{target_lc}_out.as_ref() {{\n\
-                         {indent}    Some(out) => out.by_key(&{key_src}).{send_m}({value}).await?,\n\
-                         {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
-                         {indent}}}\n"
-                    )
+            let wrapped = routes.wrap(target, span.start, &value);
+
+            // How the value reaches a shard's raw channel, per routing policy.
+            let (borrow, pick): (&str, String) = match route {
+                crate::frontend::ast::Route::RoundRobin => {
+                    ("as_mut", "out.round_robin().raw()".to_string())
                 }
-                crate::frontend::ast::Route::Broadcast => format!(
-                    "{indent}match self.{target_lc}_out.as_ref() {{\n\
+                crate::frontend::ast::Route::ByKey(key) => {
+                    let k = emit_expr(key, states, msg);
+                    ("as_ref", format!("out.by_key(&{k}).raw()"))
+                }
+                crate::frontend::ast::Route::Broadcast => ("as_ref", String::new()),
+            };
+            let not_connected = format!(
+                "None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),"
+            );
+
+            // Broadcast fans out to every shard; the policy applies per shard.
+            // The value is bound once and cloned per shard, so it is not moved
+            // on the first iteration.
+            if matches!(route, crate::frontend::ast::Route::Broadcast) {
+                let wrapped = routes.wrap(target, span.start, "__b.clone()");
+                let per_shard = match backpressure {
+                    crate::frontend::ast::Backpressure::Block => format!(
+                        "sigil_rt::backpressure::block(h.raw(), {wrapped}).await?;"
+                    ),
+                    crate::frontend::ast::Backpressure::Shed => format!(
+                        "if sigil_rt::backpressure::shed(h.raw(), {wrapped})? == sigil_rt::SendOutcome::Shed {{ __shed_n += 1; }}"
+                    ),
+                    crate::frontend::ast::Backpressure::Deadline(ms) => format!(
+                        "if sigil_rt::backpressure::deadline(h.raw(), {wrapped}, {ms}).await? == sigil_rt::SendOutcome::Shed {{ __shed_n += 1; }}"
+                    ),
+                };
+                return format!(
+                    "{indent}let mut __shed_n: u64 = 0;\n\
+                     {indent}match self.{target_lc}_out.as_ref() {{\n\
                      {indent}    Some(out) => {{\n\
                      {indent}        let __b = {value};\n\
                      {indent}        for h in out.shards() {{\n\
-                     {indent}            h.{send_m}(__b.clone()).await?;\n\
+                     {indent}            {per_shard}\n\
                      {indent}        }}\n\
                      {indent}    }}\n\
-                     {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
+                     {indent}    {not_connected}\n\
+                     {indent}}}\n\
+                     {indent}if __shed_n > 0 {{\n\
+                     {indent}    self.__shed += __shed_n;\n\
+                     {indent}    for _ in 0..__shed_n {{ sigil_rt::chaos::note_shed(\"{target}\"); }}\n\
+                     {indent}}}\n"
+                );
+            }
+
+            match backpressure {
+                crate::frontend::ast::Backpressure::Block => format!(
+                    "{indent}match self.{target_lc}_out.{borrow}() {{\n\
+                     {indent}    Some(out) => {{\n\
+                     {indent}        sigil_rt::backpressure::block({pick}, {wrapped}).await?;\n\
+                     {indent}    }}\n\
+                     {indent}    {not_connected}\n\
+                     {indent}}}\n"
+                ),
+                // Shed / deadline can drop by design: compute the outcome in a
+                // closed scope so the outbox borrow ends before we count it.
+                crate::frontend::ast::Backpressure::Shed => format!(
+                    "{indent}let __outcome = match self.{target_lc}_out.{borrow}() {{\n\
+                     {indent}    Some(out) => sigil_rt::backpressure::shed({pick}, {wrapped})?,\n\
+                     {indent}    {not_connected}\n\
+                     {indent}}};\n\
+                     {indent}if __outcome == sigil_rt::SendOutcome::Shed {{\n\
+                     {indent}    self.__shed += 1;\n\
+                     {indent}    sigil_rt::chaos::note_shed(\"{target}\");\n\
+                     {indent}}}\n"
+                ),
+                crate::frontend::ast::Backpressure::Deadline(ms) => format!(
+                    "{indent}let __outcome = match self.{target_lc}_out.{borrow}() {{\n\
+                     {indent}    Some(out) => sigil_rt::backpressure::deadline({pick}, {wrapped}, {ms}).await?,\n\
+                     {indent}    {not_connected}\n\
+                     {indent}}};\n\
+                     {indent}if __outcome == sigil_rt::SendOutcome::Shed {{\n\
+                     {indent}    self.__shed += 1;\n\
+                     {indent}    sigil_rt::chaos::note_shed(\"{target}\");\n\
                      {indent}}}\n"
                 ),
             }
@@ -1032,6 +1104,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
     out.push_str("    let shards: usize = env_usize(\"SIGIL_DEMO_SHARDS\", 8);\n");
     out.push_str("    let producers: usize = env_usize(\"SIGIL_DEMO_PRODUCERS\", 64);\n");
     out.push_str("    let msgs_per_producer: usize = env_usize(\"SIGIL_DEMO_MSGS\", 250);\n");
+    out.push_str("    let capacity: usize = env_usize(\"SIGIL_DEMO_CAPACITY\", 1024);\n");
     out.push_str("    let total = producers * msgs_per_producer;\n\n");
 
     // Spawn sinks first so upstream stages can be wired to live handles.
@@ -1053,7 +1126,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
                 );
             }
         }
-        let _ = write!(out, "        let (h, j) = inst.spawn(1024);\n        {lc}_handles.push(h);\n        {lc}_joins.push(j);\n    }}\n\n");
+        let _ = write!(out, "        let (h, j) = inst.spawn(capacity);\n        {lc}_handles.push(h);\n        {lc}_joins.push(j);\n    }}\n\n");
     }
 
     let entry_lc = entry_name.to_lowercase();
@@ -1130,10 +1203,10 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         let _ = write!(out, "\n    // ---- stage shutdown: {pname} ----\n");
         let _ = write!(out, "    drop({lc}_handles);\n");
         let _ = write!(out, "{agg_decl}");
-        let _ = write!(out, "    let mut {lc}_handled: u64 = 0;\n    let mut {lc}_dropped: u64 = 0;\n");
-        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = j.await.expect(\"actor task panicked\");\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n    }}\n");
+        let _ = write!(out, "    let mut {lc}_handled: u64 = 0;\n    let mut {lc}_dropped: u64 = 0;\n    let mut {lc}_shed: u64 = 0;\n");
+        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = j.await.expect(\"actor task panicked\");\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n        {lc}_shed += stats.shed;\n    }}\n");
         let _ = write!(out, "{agg_print}");
-        let _ = write!(out, "    println!(\"[{pname}] handled + dropped = {{}} + {{}} = {{}}\", {lc}_handled, {lc}_dropped, {lc}_handled + {lc}_dropped);\n");
+        let _ = write!(out, "    println!(\"[{pname}] handled + dropped = {{}} + {{}} = {{}}, shed downstream = {{}}\", {lc}_handled, {lc}_dropped, {lc}_handled + {lc}_dropped, {lc}_shed);\n");
     }
 
     let _ = write!(out, "\n    assert_eq!({entry_lc}_handled + {entry_lc}_dropped, total as u64, \"entry-stage message conservation violated\");\n");
@@ -1256,12 +1329,13 @@ async fn main() {{
     let shards: usize = env_usize("SIGIL_DEMO_SHARDS", {shards});
     let producers: usize = env_usize("SIGIL_DEMO_PRODUCERS", {producers});
     let msgs_per_producer: usize = env_usize("SIGIL_DEMO_MSGS", {per_producer});
+    let capacity: usize = env_usize("SIGIL_DEMO_CAPACITY", 1024);
     let total = producers * msgs_per_producer;
 
     let mut handles = Vec::new();
     let mut joins = Vec::new();
     for _ in 0..shards {{
-        let (h, j) = {p}::new().spawn(1024);
+        let (h, j) = {p}::new().spawn(capacity);
         handles.push(h);
         joins.push(j);
     }}

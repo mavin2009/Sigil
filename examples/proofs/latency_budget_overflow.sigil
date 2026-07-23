@@ -1,0 +1,19 @@
+// MUST FAIL --level 2: 30ms stage + 90ms hand-off deadline = 120ms > 100ms.
+schema M { id: String }
+transform work(m: M) -> M {}
+transform skip(m: M) -> M { m }
+process Src {
+  state sent: Int = 0
+  on m: M {
+    let ok = m ~> work @timeout(30.ms) @recover(with: skip)
+    sent := sent + 1
+    send ok to Sink @deadline(90.ms)
+  }
+}
+process Sink {
+  state got: Int = 0
+  on m: M { got := got + 1 }
+}
+spec Broken {
+  require path_latency <= 100.ms
+}

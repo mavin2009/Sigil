@@ -315,6 +315,28 @@ send s to Settlement            // round-robin (default)
 send done to Audit broadcast    // every shard receives a clone
 ```
 
+Each `send` also declares what happens when the destination queue is full:
+
+| Policy | Wait | Loss | Latency bound |
+| ------ | ---- | ---- | ------------- |
+| `@block` (default) | until capacity | none | **unbounded** |
+| `@shed` | never | drops when full (counted) | O(1) |
+| `@deadline(N.ms)` | up to N ms | drops past N (counted) | N |
+
+All three preserve downstream-counting invariants, because shedding only
+*decreases* the downstream count. Only the bounded policies can back an
+end-to-end latency claim:
+
+```
+require path_latency <= 400.ms   // processing AND queue hand-off
+```
+
+`require path_latency` is rejected outright if any send on the path uses
+`@block`, naming the offending handler — you cannot claim a bound you have
+not made provable. (`require path_timeout_sum` remains available and bounds
+processing time only.) Blocking sends cannot deadlock: the process graph is
+proven acyclic and handlers terminate, so every sink always drains.
+
 Every process compiles to a shared-nothing actor: `spawn(self)` moves state
 into an isolated task; a Clone-able typed handle is the only way in; `join()`
 returns state + `{handled, dropped}` accounting after the channel drains.
@@ -330,6 +352,7 @@ let_stmt     = "let" ~ ident ~ "=" ~ expr
 assign_stmt  = ident ~ ":=" ~ expr            // local state write
 send_stmt    = "send" ~ expr ~ "to" ~ ident ~ route_clause?
 route_clause = ("by" ~ expr) | "broadcast"    // default: round-robin
+backpressure = "@block" | "@shed" | "@deadline" ~ "(" ~ expr ~ ")"
 expr_stmt    = expr
 ```
 
@@ -457,4 +480,4 @@ Negative programs live under `examples/proofs/`.
 
 ## Status
 
-v0.6 — Multi-handler processes: type-directed dispatch, per-handler proof obligations and latency budgets, exchange-gateway example. Level 4: cross-process system invariants proven structurally over the topology (ordering / flow / multiplicity / gap obligations, each with a negative proof). Level 3 completed: relational holds via per-handler deltas, let-binding interval tracking. Level 3: built-in inductive prover for hold invariants (interval domain, no SMT dependency), runtime-guarded proof assumptions, actionable proof failures. Soundness-hardened: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.
+v0.7 — Declared back-pressure (@block / @shed / @deadline) with provable end-to-end latency via `require path_latency`. Multi-handler processes: type-directed dispatch, per-handler proof obligations and latency budgets, exchange-gateway example. Level 4: cross-process system invariants proven structurally over the topology (ordering / flow / multiplicity / gap obligations, each with a negative proof). Level 3 completed: relational holds via per-handler deltas, let-binding interval tracking. Level 3: built-in inductive prover for hold invariants (interval domain, no SMT dependency), runtime-guarded proof assumptions, actionable proof failures. Soundness-hardened: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.

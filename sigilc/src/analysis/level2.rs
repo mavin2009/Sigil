@@ -15,6 +15,10 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default)]
 pub struct Level2Report {
     pub path_timeout_sum_ms: u64,
+    /// Processing + declared hand-off waits, longest path.
+    pub path_latency_ms: u64,
+    /// Sends whose wait is unbounded (`@block`), blocking a latency proof.
+    pub latency_blockers: Vec<String>,
     pub path_timeout_bound_ms: Option<u64>,
     pub holds: Vec<String>,
     pub extinct: Vec<String>,
@@ -47,25 +51,26 @@ pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> 
         .iter()
         .map(|p| (p.name.as_str(), process_worst_case_ms(p)))
         .collect();
-    let sum = match crate::analysis::topology::derive_topology(program) {
-        Ok(topo) if topo.is_pipeline() => {
-            let mut longest: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
-            for pname in &topo.order {
-                let own = *per_process.get(pname.as_str()).unwrap_or(&0);
-                let best_pred = topo
-                    .edges
-                    .iter()
-                    .filter(|e| e.to == *pname)
-                    .filter_map(|e| longest.get(e.from.as_str()).copied())
-                    .max()
-                    .unwrap_or(0);
-                longest.insert(pname.as_str(), best_pred + own);
-            }
-            longest.values().copied().max().unwrap_or(0)
-        }
-        _ => per_process.values().copied().max().unwrap_or(0),
-    };
+    let sum = longest_path(program, &per_process);
     report.path_timeout_sum_ms = sum;
+
+    // End-to-end latency: processing + declared hand-off waits, longest path.
+    let mut latency_blockers: Vec<String> = Vec::new();
+    let per_process_latency: std::collections::BTreeMap<&str, u64> = program
+        .processes
+        .iter()
+        .map(|p| {
+            let (ms, blocker) = process_worst_case_latency_ms(p).unwrap_or((0, None));
+            if let Some(b) = blocker {
+                latency_blockers.push(b);
+            }
+            (p.name.as_str(), ms)
+        })
+        .collect();
+    let latency = longest_path(program, &per_process_latency);
+    report.path_latency_ms = latency;
+    report.latency_blockers = latency_blockers.clone();
+    let blockers_snapshot = latency_blockers;
 
     let pure_transforms: BTreeSet<String> = program
         .transforms
@@ -87,7 +92,7 @@ pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> 
                     }
                 }
                 SpecItem::Require { expr, span } => {
-                    check_require(expr, sum, &mut report, &spec.name, span.start, span.end)?;
+                    check_require(expr, sum, latency, &blockers_snapshot, &mut report, &spec.name, span.start, span.end)?;
                 }
                 SpecItem::Hold { expr, span } => {
                     report.holds.push(format_expr(expr));
@@ -458,6 +463,69 @@ fn process_worst_case_ms(process: &crate::frontend::ast::Process) -> u64 {
         .unwrap_or(0)
 }
 
+/// Worst case for one message in a process, INCLUDING time spent handing
+/// off downstream under the declared back-pressure policy.
+///
+/// `None` means unbounded: some handler uses `@block`, whose wait has no
+/// time bound. End-to-end latency then cannot be proven, only measured.
+fn process_worst_case_latency_ms(
+    process: &crate::frontend::ast::Process,
+) -> Option<(u64, Option<String>)> {
+    let mut worst = 0u64;
+    let mut blocker: Option<String> = None;
+    for h in &process.handlers {
+        let mut total = 0u64;
+        for stmt in &h.body {
+            match stmt {
+                Stmt::Send { target, backpressure, expr, .. } => {
+                    total += expr_timeout_ms(expr);
+                    match backpressure.budget_ms() {
+                        Some(ms) => total += ms,
+                        None => {
+                            blocker = Some(format!(
+                                "`{}` handler of `{}` sends to `{target}` with @block",
+                                h.msg_name, process.name
+                            ));
+                        }
+                    }
+                }
+                Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                    total += expr_timeout_ms(expr);
+                }
+            }
+        }
+        worst = worst.max(total);
+    }
+    Some((worst, blocker))
+}
+
+/// Longest path through the process topology, where each process
+/// contributes its own worst case. Parallel branches take the max.
+fn longest_path(
+    program: &Program,
+    per_process: &std::collections::BTreeMap<&str, u64>,
+) -> u64 {
+    match crate::analysis::topology::derive_topology(program) {
+        Ok(topo) if topo.is_pipeline() => {
+            let mut longest: std::collections::BTreeMap<&str, u64> =
+                std::collections::BTreeMap::new();
+            for pname in &topo.order {
+                let own = *per_process.get(pname.as_str()).unwrap_or(&0);
+                let best_pred = topo
+                    .edges
+                    .iter()
+                    .filter(|e| e.to == *pname)
+                    .filter_map(|e| longest.get(e.from.as_str()).copied())
+                    .max()
+                    .unwrap_or(0);
+                longest.insert(pname.as_str(), best_pred + own);
+            }
+            longest.values().copied().max().unwrap_or(0)
+        }
+        _ => per_process.values().copied().max().unwrap_or(0),
+    }
+}
+
 fn expr_timeout_ms(expr: &Expr) -> u64 {
     match expr {
         Expr::Pipeline { base, steps, .. } => {
@@ -489,6 +557,8 @@ fn expr_timeout_ms(expr: &Expr) -> u64 {
 fn check_require(
     expr: &Expr,
     path_sum: u64,
+    latency: u64,
+    blockers: &[String],
     report: &mut Level2Report,
     spec_name: &str,
     start: usize,
@@ -505,6 +575,41 @@ fn check_require(
             lhs.as_ref(),
             Expr::Ident { name, .. } if name == "path_timeout_sum"
         );
+        let is_latency = matches!(
+            lhs.as_ref(),
+            Expr::Ident { name, .. } if name == "path_latency"
+        );
+        if is_latency {
+            let bound = match rhs.as_ref() {
+                Expr::Literal { value: Literal::DurationMs(ms), .. } => *ms,
+                _ => bail!(
+                    "Level-2 violation in spec '{}' at bytes {}..{}: path_latency bound \
+                     must be a duration literal (e.g. 500.ms)",
+                    spec_name, start, end
+                ),
+            };
+            if !blockers.is_empty() {
+                bail!(
+                    "Level-2 violation in spec '{}' at bytes {}..{}: `require path_latency` \
+                     claims a bound on END-TO-END latency, but {} — `@block` waits for an \
+                     unbounded time when the destination queue is full. Declare a bounded \
+                     policy (`@deadline(N.ms)` or `@shed`) on every send, or use \
+                     `require path_timeout_sum` which bounds processing time only.",
+                    spec_name, start, end, blockers.join("; ")
+                );
+            }
+            if latency > bound {
+                bail!(
+                    "Level-2 violation in spec '{}' at bytes {}..{}: path_latency is {}ms \
+                     but require path_latency <= {}ms (processing + declared hand-off waits)",
+                    spec_name, start, end, latency, bound
+                );
+            }
+            report.discharged.push(format!(
+                "path_latency {latency}ms <= {bound}ms (processing + hand-off, all sends bounded)"
+            ));
+            return Ok(());
+        }
         if is_pts {
             let bound = match rhs.as_ref() {
                 Expr::Literal {

@@ -146,6 +146,57 @@ pub fn residual_risk_report(
          - No safety properties below are verified; treat all as residual risk"
     };
 
+    // Back-pressure policies are load-bearing for both latency and loss, so
+    // they are always itemised.
+    let mut bp_lines: Vec<String> = Vec::new();
+    let mut any_block = false;
+    for proc in &program.processes {
+        for h in &proc.handlers {
+            for stmt in &h.body {
+                if let crate::frontend::ast::Stmt::Send { target, backpressure, .. } = stmt {
+                    if matches!(backpressure, crate::frontend::ast::Backpressure::Block) {
+                        any_block = true;
+                    }
+                    bp_lines.push(format!(
+                        "- `{}` → `{target}` ({} handler): {}{}",
+                        proc.name,
+                        h.msg_name,
+                        backpressure.describe(),
+                        match backpressure {
+                            crate::frontend::ast::Backpressure::Block =>
+                                " — no loss; wait is UNBOUNDED (queueing time is not covered by `path_timeout_sum`)",
+                            crate::frontend::ast::Backpressure::Shed =>
+                                " — bounded O(1); sheds on a full queue (counted in ActorStats.shed)",
+                            crate::frontend::ast::Backpressure::Deadline(_) =>
+                                " — bounded; sheds only past the deadline (counted)",
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    let backpressure_section = if bp_lines.is_empty() {
+        String::new()
+    } else {
+        let mut out = String::from("## Back-Pressure Policies\n");
+        out.push_str(&bp_lines.join("\n"));
+        out.push_str(
+            "\n\nDeadlock freedom: blocking sends cannot deadlock because the process \
+             graph is proven ACYCLIC at Level 1 and handlers terminate (bounded retries \
+             over bounded timeouts), so every sink always drains.\n",
+        );
+        if any_block {
+            out.push_str(
+                "\nResidual: at least one send uses `@block`, so END-TO-END latency is \
+                 unbounded under sustained overload. `require path_latency <= N.ms` \
+                 rejects that combination; declare `@deadline(N.ms)` or `@shed` to make \
+                 the bound provable.\n",
+            );
+        }
+        out.push('\n');
+        out
+    };
+
     let topology_section = match crate::analysis::topology::derive_topology(program) {
         Ok(t) if t.is_pipeline() => {
             let mut lines = vec!["## Process Topology (verified)".to_string()];
@@ -161,7 +212,7 @@ pub fn residual_risk_report(
     format!(
         r#"# Residual Risk Report
 
-{topology_section}{l1_section}
+{backpressure_section}{topology_section}{l1_section}
 
 ## Analysis Summary
 - Process: `{process}`

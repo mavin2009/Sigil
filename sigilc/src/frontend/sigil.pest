@@ -31,7 +31,11 @@ require_clause = { "require" ~ expr }
 hold_clause = { "hold" ~ expr }
 
 stmt = { let_stmt | assign_stmt | send_stmt | expr_stmt }
-send_stmt = { "send" ~ expr ~ "to" ~ ident ~ route_clause? }
+send_stmt = { "send" ~ expr ~ "to" ~ ident ~ route_clause? ~ backpressure? }
+backpressure = { shed_kw | block_kw | deadline_bp }
+shed_kw = { "@shed" }
+block_kw = { "@block" }
+deadline_bp = { "@deadline" ~ "(" ~ expr ~ ")" }
 route_clause = { by_route | broadcast_kw }
 by_route = { "by" ~ expr }
 broadcast_kw = { "broadcast" }

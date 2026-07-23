@@ -19,6 +19,12 @@
 //   * send multiplicity is static on every path
 // Add a third message type and forget to count it, and the build fails.
 //
+// PROVEN AT --level 2:
+//   end-to-end latency <= 400ms INCLUDING queue hand-off, because every send
+//   declares @deadline(5.ms). Under sustained overload the gateway sheds
+//   (counted) rather than growing an unbounded queue — and shedding cannot
+//   break the invariants below, since it only DECREASES downstream counts.
+//
 // PROVEN AT --level 3:
 //   notional_at_risk >= 0.0   (assumption `new_order.notional >= 0.0` is
 //                              compiled into a runtime guard)
@@ -62,13 +68,13 @@ process OrderGateway {
   on new_order: NewOrder {
     let ok = new_order ~> validate_order @timeout(20.ms) @retry(1) @recover(with: reject_order)
     received := received + 1
-    send ok to RiskEngine by ok.account
+    send ok to RiskEngine by ok.account @deadline(5.ms)
   }
 
   on cancel: Cancel {
     let ok = cancel ~> validate_cancel @timeout(20.ms) @retry(1) @recover(with: reject_cancel)
     received := received + 1
-    send ok to RiskEngine by ok.account
+    send ok to RiskEngine by ok.account @deadline(5.ms)
   }
 }
 
@@ -80,7 +86,7 @@ process RiskEngine {
     let checked = new_order ~> check_limits @timeout(40.ms) @retry(2) @recover(with: breach_limit)
     cleared := cleared + 1
     notional_at_risk := notional_at_risk + new_order.notional
-    send checked to MatchingEngine
+    send checked to MatchingEngine @deadline(5.ms)
   }
 
   // Cancels are risk-checked too — the compiler will not let this handler
@@ -88,7 +94,7 @@ process RiskEngine {
   on cancel: Cancel {
     let checked = cancel ~> check_cancel_rights @timeout(30.ms) @retry(1) @recover(with: deny_cancel)
     cleared := cleared + 1
-    send checked to MatchingEngine
+    send checked to MatchingEngine @deadline(5.ms)
   }
 }
 
@@ -108,7 +114,10 @@ process MatchingEngine {
 
 spec ExchangeSafety {
   require new_order.notional >= 0.0
-  require path_timeout_sum <= 400.ms
+  // END-TO-END bound: processing AND queue hand-off. This is only provable
+  // because every send declares a bounded back-pressure policy; with the
+  // default @block the compiler rejects the claim as unprovable.
+  require path_latency <= 400.ms
 
   hold notional_at_risk >= 0.0
 

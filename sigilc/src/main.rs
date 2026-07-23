@@ -338,6 +338,108 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Back-pressure: three policies, each with its latency and loss
+    /// characteristics enforced rather than documented.
+    #[test]
+    fn backpressure_policies() {
+        use sigilc::{run_checks, AssuranceLevel};
+
+        let base = r#"
+schema M { id: String }
+transform work(m: M) -> M {}
+transform skip(m: M) -> M { m }
+process Src {
+  state sent: Int = 0
+  on m: M {
+    let ok = m ~> work @timeout(20.ms) @recover(with: skip)
+    sent := sent + 1
+    send ok to Sink POLICY
+  }
+}
+process Sink {
+  state got: Int = 0
+  on m: M { got := got + 1 }
+}
+spec S {
+  REQUIRE
+  hold Sink.got <= Src.sent
+}
+"#;
+        let build = |policy: &str, req: &str| {
+            let src = base.replace("POLICY", policy).replace("REQUIRE", req);
+            let program = parse(&src).expect("parse");
+            let irs = lower(&program).expect("lower");
+            (program.clone(), irs.clone(), run_checks(&program, &irs, AssuranceLevel::System))
+        };
+
+        // @block is the default and needs no annotation.
+        let (_, _, r) = build("", "require path_timeout_sum <= 100.ms");
+        assert!(r.is_ok(), "block is the default and must still work");
+
+        // A latency claim is only provable with bounded policies.
+        let (_, _, r) = build("@block", "require path_latency <= 100.ms");
+        let e = format!("{:#}", r.err().expect("block cannot back a latency bound"));
+        assert!(e.contains("END-TO-END") && e.contains("unbounded time") && e.contains("@deadline"), "got: {e}");
+
+        let (_, _, r) = build("@shed", "require path_latency <= 100.ms");
+        assert!(r.is_ok(), "shed is O(1) and bounded");
+
+        let (_, _, r) = build("@deadline(5.ms)", "require path_latency <= 100.ms");
+        let outcome = r.expect("deadline is bounded");
+        // 20ms stage + 5ms hand-off.
+        assert_eq!(outcome.level2.as_ref().unwrap().path_latency_ms, 25);
+
+        // The deadline is charged: 30 + 90 = 120 > 100.
+        let (program, irs, _) = build("@deadline(90.ms)", "require path_latency <= 100.ms");
+        let _ = (&program, &irs);
+        let src = base
+            .replace("POLICY", "@deadline(90.ms)")
+            .replace("REQUIRE", "require path_latency <= 100.ms")
+            .replace("@timeout(20.ms)", "@timeout(30.ms)");
+        let program = parse(&src).unwrap();
+        let irs = lower(&program).unwrap();
+        let e = format!(
+            "{:#}",
+            run_checks(&program, &irs, AssuranceLevel::System).err().expect("over budget")
+        );
+        assert!(e.contains("path_latency is 120ms"), "got: {e}");
+
+        // Every policy preserves the Level-4 invariant: shedding only ever
+        // DECREASES the downstream count.
+        for policy in ["@block", "@shed", "@deadline(5.ms)"] {
+            let src = base.replace("POLICY", policy).replace("REQUIRE", "");
+            let program = parse(&src).expect("parse");
+            let irs = lower(&program).expect("lower");
+            let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+                .unwrap_or_else(|e| panic!("{policy} must keep the invariant provable: {e:#}"));
+            assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 1);
+        }
+
+        // Codegen uses the runtime helpers, and lossy policies are counted.
+        let src = base.replace("POLICY", "@shed").replace("REQUIRE", "");
+        let program = parse(&src).unwrap();
+        let irs = lower(&program).unwrap();
+        let rust = emit(&program, &irs);
+        assert!(rust.contains("sigil_rt::backpressure::shed("));
+        assert!(rust.contains("self.__shed += 1"), "shed must be counted");
+        assert!(rust.contains("note_shed"));
+        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+
+        let src = base.replace("POLICY", "@deadline(7.ms)").replace("REQUIRE", "");
+        let program = parse(&src).unwrap();
+        let irs = lower(&program).unwrap();
+        let rust = emit(&program, &irs);
+        assert!(rust.contains("sigil_rt::backpressure::deadline(") && rust.contains(", 7)"));
+
+        // The negative proof programs.
+        let p = parse(include_str!("../../examples/proofs/latency_unbounded_block.sigil")).unwrap();
+        let i = lower(&p).unwrap();
+        assert!(run_checks(&p, &i, AssuranceLevel::Contracts).is_err());
+        let p = parse(include_str!("../../examples/proofs/latency_budget_overflow.sigil")).unwrap();
+        let i = lower(&p).unwrap();
+        assert!(run_checks(&p, &i, AssuranceLevel::Contracts).is_err());
+    }
+
     /// Multi-handler processes: type-directed dispatch, per-handler proof
     /// obligations, per-handler latency budgets, and the four ways to get it
     /// wrong.
@@ -374,9 +476,11 @@ mod integration {
         assert!(rust.contains("pub enum RiskEngineMsg"));
         assert!(rust.contains("NewOrder(NewOrder)") && rust.contains("Cancel(Cancel)"));
         assert!(rust.contains("send_new_order") && rust.contains("send_cancel"));
-        // Each send picks the right variant.
-        assert!(rust.contains("by_key(&ok.account).send_new_order"));
-        assert!(rust.contains("by_key(&ok.account).send_cancel"));
+        // Each send routes by key AND wraps in the correct dispatch variant.
+        assert!(rust.contains("out.by_key(&ok.account).raw(), RiskEngineMsg::NewOrder(ok)"));
+        assert!(rust.contains("out.by_key(&ok.account).raw(), RiskEngineMsg::Cancel(ok)"));
+        assert!(rust.contains("out.round_robin().raw(), MatchingEngineMsg::NewOrder"));
+        assert!(rust.contains("out.round_robin().raw(), MatchingEngineMsg::Cancel"));
         assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
 
         // The demo exercises EVERY handler of the entry process.
@@ -726,7 +830,7 @@ process Right {
         let src = include_str!("../../examples/concurrent/orderflow/orderflow.sigil");
         let (rust, _, _) = compile_source(src);
         assert!(rust.contains("by_key(&ok.id)"), "hash routing missing");
-        assert!(rust.contains("round_robin().send"), "round-robin missing");
+        assert!(rust.contains("round_robin().raw()"), "round-robin missing");
         assert!(rust.contains("for h in out.shards()"), "broadcast missing");
         assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
     }
