@@ -96,9 +96,22 @@ pub struct OnHandler {
 pub enum Stmt {
     Let { name: String, expr: Expr, span: Span },
     Assign { name: String, expr: Expr, span: Span },
-    /// `send <expr> to <Process>` — typed message to another process's actor.
-    Send { target: String, expr: Expr, span: Span },
+    /// `send <expr> to <Process> [by <key>|broadcast]` — typed, routed message
+    /// to another process's shard fleet.
+    Send { target: String, expr: Expr, route: Route, span: Span },
     Expr { expr: Expr, span: Span },
+}
+
+/// Shard-routing policy for a `send`.
+#[derive(Debug, Clone, Default)]
+pub enum Route {
+    /// Even distribution across shards (default).
+    #[default]
+    RoundRobin,
+    /// Hash the key expression: same key → same shard (ordering/state affinity).
+    ByKey(Expr),
+    /// Deliver a clone to every shard.
+    Broadcast,
 }
 
 #[derive(Debug, Clone)]
@@ -319,7 +332,19 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
             let mut inner = pair.into_inner();
             let expr = parse_expr(inner.next().unwrap())?;
             let target = inner.next().unwrap().as_str().to_string();
-            Ok(Stmt::Send { target, expr, span })
+            let mut route = Route::RoundRobin;
+            if let Some(rc) = inner.next() {
+                let rc_inner = rc.into_inner().next().unwrap();
+                route = match rc_inner.as_rule() {
+                    Rule::by_route => {
+                        let key = parse_expr(rc_inner.into_inner().next().unwrap())?;
+                        Route::ByKey(key)
+                    }
+                    Rule::broadcast_kw => Route::Broadcast,
+                    other => bail!("unexpected route clause: {:?}", other),
+                };
+            }
+            Ok(Stmt::Send { target, expr, route, span })
         }
         Rule::expr_stmt => {
             let inner = pair.into_inner().next().unwrap();

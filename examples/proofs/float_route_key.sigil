@@ -1,0 +1,15 @@
+// MUST FAIL: Float routing keys are not a stable shard function.
+schema Order { id: String, amount: Float }
+process A {
+  state n: Int = 0
+  on o: Order {
+    n := n + 1
+    send o to B by o.amount
+  }
+}
+process B {
+  state t: Int = 0
+  on o: Order {
+    t := t + 1
+  }
+}

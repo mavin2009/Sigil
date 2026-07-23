@@ -9,7 +9,7 @@
 //!     rejected until an explicit async-boundary construct exists)
 
 use crate::analysis::types::{infer_program, type_name};
-use crate::frontend::ast::{Expr, Program, Stmt};
+use crate::frontend::ast::{Expr, Program, Route, Stmt};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,9 +50,43 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
     for process in &program.processes {
         for handler in &process.handlers {
             for stmt in &handler.body {
-                let Stmt::Send { target, expr, .. } = stmt else {
+                let Stmt::Send { target, expr, route, .. } = stmt else {
                     continue;
                 };
+                if let Route::ByKey(key) = route {
+                    // Resolve the key's type when statically known; Float keys
+                    // are rejected — hashing floats is nondeterministic
+                    // production folklore for a reason.
+                    let key_ty: Option<String> = match key {
+                        Expr::FieldAccess { base, field, .. } => {
+                            let base_ty = if base == &handler.msg_name {
+                                Some(type_name(&handler.msg_ty))
+                            } else {
+                                env.get(base).cloned()
+                            };
+                            base_ty.and_then(|bt| {
+                                program.schemas.iter().find(|sc| sc.name == bt).and_then(
+                                    |sc| {
+                                        sc.fields
+                                            .iter()
+                                            .find(|(f, _)| f == field)
+                                            .map(|(_, ty)| type_name(ty))
+                                    },
+                                )
+                            })
+                        }
+                        Expr::Ident { name, .. } => env.get(name).cloned(),
+                        _ => None,
+                    };
+                    if key_ty.as_deref() == Some("Float") {
+                        bail!(
+                            "topology violation in process '{}': `send ... to {target} by <key>` \
+                             uses a Float key — float hashing is not a stable shard function; \
+                             route by a String, Int, UUID, or Bool field instead",
+                            process.name
+                        );
+                    }
+                }
                 if !process_names.contains(target.as_str()) {
                     bail!(
                         "topology violation in process '{}': send target '{target}' \

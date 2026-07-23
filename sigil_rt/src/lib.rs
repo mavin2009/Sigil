@@ -23,6 +23,40 @@ pub struct ActorStats {
     pub dropped: u64,
 }
 
+/// Shard router for typed actor outboxes. Lives inside a single actor's
+/// task-local state, so round-robin needs no atomics and hashing no locks.
+pub struct Router<H> {
+    shards: Vec<H>,
+    rr: usize,
+}
+
+impl<H> Router<H> {
+    pub fn new(shards: Vec<H>) -> Self {
+        Self { shards, rr: 0 }
+    }
+
+    /// Even distribution: successive calls walk the shard ring.
+    pub fn round_robin(&mut self) -> &H {
+        let h = &self.shards[self.rr % self.shards.len()];
+        self.rr = self.rr.wrapping_add(1);
+        h
+    }
+
+    /// Key affinity: identical keys always land on the same shard, so
+    /// per-key ordering and shard-local state remain coherent.
+    pub fn by_key<K: std::hash::Hash + ?Sized>(&self, key: &K) -> &H {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().build_hasher();
+        key.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
+    }
+
+    /// Every shard, for broadcast delivery.
+    pub fn shards(&self) -> &[H] {
+        &self.shards
+    }
+}
+
 /// Deterministic-seed fault injection for external residual stages.
 ///
 /// Disabled by default (zero latency, zero faults). Configure via env:

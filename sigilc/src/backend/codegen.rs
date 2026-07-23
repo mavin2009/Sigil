@@ -177,7 +177,7 @@ fn emit_process(process: &Process) -> String {
             t.to_lowercase()
         ));
         s.push_str(&format!(
-            "    pub {}_out: Option<{t}Handle>,\n",
+            "    pub {}_out: Option<sigil_rt::Router<{t}Handle>>,\n",
             t.to_lowercase()
         ));
     }
@@ -198,7 +198,7 @@ fn emit_process(process: &Process) -> String {
     s.push_str("        }\n    }\n\n");
     for t in &targets {
         s.push_str(&format!(
-            "    pub fn connect_{}(&mut self, h: {t}Handle) {{\n        self.{}_out = Some(h);\n    }}\n\n",
+            "    pub fn connect_{}(&mut self, shards: Vec<{t}Handle>) {{\n        self.{}_out = Some(sigil_rt::Router::new(shards));\n    }}\n\n",
             t.to_lowercase(),
             t.to_lowercase()
         ));
@@ -362,15 +362,37 @@ fn emit_stmt(stmt: &Stmt, indent: &str, states: &[String], msg: &str) -> String 
                 emit_expr(expr, states, msg)
             )
         }
-        Stmt::Send { target, expr, .. } => {
+        Stmt::Send { target, expr, route, .. } => {
             let target_lc = target.to_lowercase();
-            format!(
-                "{indent}match &self.{target_lc}_out {{\n\
-                 {indent}    Some(out) => out.send({}).await?,\n\
-                 {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
-                 {indent}}}\n",
-                emit_expr(expr, states, msg)
-            )
+            let value = emit_expr(expr, states, msg);
+            match route {
+                crate::frontend::ast::Route::RoundRobin => format!(
+                    "{indent}match self.{target_lc}_out.as_mut() {{\n\
+                     {indent}    Some(out) => out.round_robin().send({value}).await?,\n\
+                     {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
+                     {indent}}}\n"
+                ),
+                crate::frontend::ast::Route::ByKey(key) => {
+                    let key_src = emit_expr(key, states, msg);
+                    format!(
+                        "{indent}match self.{target_lc}_out.as_ref() {{\n\
+                         {indent}    Some(out) => out.by_key(&{key_src}).send({value}).await?,\n\
+                         {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
+                         {indent}}}\n"
+                    )
+                }
+                crate::frontend::ast::Route::Broadcast => format!(
+                    "{indent}match self.{target_lc}_out.as_ref() {{\n\
+                     {indent}    Some(out) => {{\n\
+                     {indent}        let __b = {value};\n\
+                     {indent}        for h in out.shards() {{\n\
+                     {indent}            h.send(__b.clone()).await?;\n\
+                     {indent}        }}\n\
+                     {indent}    }}\n\
+                     {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
+                     {indent}}}\n"
+                ),
+            }
         }
         Stmt::Expr { expr, .. } => {
             format!("{indent}let _ = {};\n", emit_expr(expr, states, msg))
@@ -715,7 +737,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
                 let tlc = e.to.to_lowercase();
                 let _ = write!(
                     out,
-                    "        inst.connect_{tlc}({tlc}_handles[_i % {tlc}_handles.len()].clone());\n"
+                    "        inst.connect_{tlc}({tlc}_handles.clone());\n"
                 );
             }
         }

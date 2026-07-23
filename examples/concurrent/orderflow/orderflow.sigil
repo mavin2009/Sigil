@@ -1,9 +1,12 @@
-// Three-stage order flow: Gateway -> Risk -> Settlement.
+// Four-stage order flow: Gateway -> Risk -> Settlement -> Audit.
 //
 // The compiler derives the topology from `send` statements, verifies every
 // edge's message type, proves the graph acyclic, wires the actor outboxes,
-// and stages the shutdown. Each stage is a fleet of shared-nothing actors
-// with total failure-path coverage and pure recovery transforms.
+// and stages the shutdown. Three routing policies:
+//   by <key>   — hash affinity: same order id always lands on the same Risk
+//                shard, so per-order processing stays coherent
+//   (default)  — round-robin even distribution into Settlement
+//   broadcast  — every Audit shard mirrors every settled order
 
 schema Order {
   id: String,
@@ -27,7 +30,7 @@ process Gateway {
   on order: Order {
     let ok = order ~> validate @recover(with: quarantine)
     admitted := admitted + ok.units
-    send ok to Risk
+    send ok to Risk by ok.id
   }
 }
 
@@ -49,6 +52,15 @@ process Settlement {
     let done = order ~> post @recover(with: refund)
     posted := posted + done.units
     total_amount := total_amount + done.amount
+    send done to Audit broadcast
+  }
+}
+
+process Audit {
+  state mirrored: Int = 0
+
+  on order: Order {
+    mirrored := mirrored + order.units
   }
 }
 

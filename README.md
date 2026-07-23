@@ -14,7 +14,7 @@ These failure modes are rejected or unrepresentable at the default safety level:
 - External stages with no declared failure path (must carry `@recover` or an explicit `@error` acknowledgment)
 - State writes to non-local slots
 - Pipeline stages whose types disagree with declared transform signatures
-- `send` to undeclared processes, type-mismatched topology edges, and cyclic process graphs
+- `send` to undeclared processes, type-mismatched topology edges, cyclic process graphs, and Float shard-routing keys
 
 Residual risk outside the model (external transforms, OS, scheduler) is always reported explicitly.
 

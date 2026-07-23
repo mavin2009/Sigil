@@ -321,6 +321,22 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Routing: Float keys rejected; the three policies emit distinct code.
+    #[test]
+    fn routing_policies() {
+        let bad = include_str!("../../examples/proofs/float_route_key.sigil");
+        let program = parse(bad).expect("parse");
+        let err = sigilc::derive_topology(&program).expect_err("Float key must be rejected");
+        assert!(format!("{err}").contains("Float key"));
+
+        let src = include_str!("../../examples/concurrent/orderflow/orderflow.sigil");
+        let (rust, _, _) = compile_source(src);
+        assert!(rust.contains("by_key(&ok.id)"), "hash routing missing");
+        assert!(rust.contains("round_robin().send"), "round-robin missing");
+        assert!(rust.contains("for h in out.shards()"), "broadcast missing");
+        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+    }
+
     /// Multi-process topology: compiler wires outboxes, types the edges,
     /// and the generated demo stages the shutdown.
     #[test]
@@ -328,8 +344,8 @@ mod integration {
         let src = include_str!("../../examples/concurrent/orderflow/orderflow.sigil");
         let (rust, risk, _) = compile_source(src);
         // Outboxes + wiring
-        assert!(rust.contains("risk_out: Option<RiskHandle>"));
-        assert!(rust.contains("settlement_out: Option<SettlementHandle>"));
+        assert!(rust.contains("risk_out: Option<sigil_rt::Router<RiskHandle>>"));
+        assert!(rust.contains("settlement_out: Option<sigil_rt::Router<SettlementHandle>>"));
         assert!(rust.contains("pub fn connect_risk"));
         // Cascade shutdown: outboxes released when the actor drains
         assert!(rust.contains("self.risk_out = None"));
