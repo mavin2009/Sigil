@@ -1,6 +1,5 @@
-// Circuit breaker style process.
-// Local open/closed state, recovered fetch path, causal pipeline.
-// Timeout without recover is rejected at Level-1; residual risk is limited to externals.
+// Service call with circuit-style recovery and local status state.
+// On timeout, open_circuit recovers; last_status and failures are process-local.
 
 schema Request {
   id: String,
@@ -11,6 +10,11 @@ schema Response {
   id: String,
   status: String
 }
+
+transform validate(r: Request) -> Request {}
+transform call_service(r: Request) -> Response {}
+transform open_circuit(r: Request) -> Response {}
+transform record(r: Response) -> Response {}
 
 process CircuitBreaker {
   state failures: Int = 0

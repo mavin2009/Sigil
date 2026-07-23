@@ -1,6 +1,5 @@
-// Multi-stage telemetry ingest.
-// Validate → decompress (timed) → extract metrics → store.
-// Unhandled timeout is rejected at Level-1; recover path is explicit.
+// Telemetry ingest: validate → timed decompress → extract metrics → store.
+// extract uses Metrics fields so type propagation targets Metrics.
 
 schema Telemetry {
   id: String,
@@ -11,6 +10,12 @@ schema Metrics {
   id: String,
   value: Float
 }
+
+transform validate(t: Telemetry) -> Telemetry {}
+transform decompress(t: Telemetry) -> Telemetry {}
+transform empty(t: Telemetry) -> Telemetry {}
+transform extract(t: Telemetry) -> Metrics {}
+transform store(m: Metrics) -> Metrics {}
 
 process Ingest {
   state last: String = "00000000-0000-0000-0000-000000000000"

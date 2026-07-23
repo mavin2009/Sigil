@@ -1,11 +1,7 @@
-// Counter with a pure compiled transform body (not residual).
+// Local counter with a pure compiled arithmetic transform.
 
 schema Tick {
   value: Int
-}
-
-schema Count {
-  total: Int
 }
 
 transform add(x: Int) -> Int {

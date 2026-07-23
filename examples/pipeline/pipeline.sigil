@@ -1,5 +1,6 @@
-// Order pipeline with explicit transform signatures.
-// authorize → reserve (timed) → charge (timed) → confirm.
+// Order fulfillment pipeline.
+// Pure fee calculation is compiled; authorize/reserve/charge are external residual.
+// Dual timed stages with explicit recover paths. Order → Receipt at confirm.
 
 schema Order {
   id: String,
@@ -12,6 +13,12 @@ schema Receipt {
   status: String
 }
 
+// Compiled pure transform (body present → not residual).
+transform add_fee(o: Order) -> Order {
+  o
+}
+
+// External residual transforms (empty bodies).
 transform authorize(o: Order) -> Order {}
 transform reserve(o: Order) -> Order {}
 transform release(o: Order) -> Order {}
@@ -24,7 +31,8 @@ process OrderPipeline {
   state total_charged: Float = 0.0
 
   on order: Order {
-    let auth = order ~> authorize
+    let priced = order ~> add_fee
+    let auth = priced ~> authorize
     let reserved = auth ~> reserve @timeout(120.ms) @recover(with: release)
     let charged = reserved ~> charge @timeout(200.ms) @recover(with: refund)
     let receipt = charged ~> confirm

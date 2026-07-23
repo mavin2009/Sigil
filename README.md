@@ -43,13 +43,15 @@ examples/
 
 ## Examples
 
+Each example lives in its own subdirectory with a `.sigil` program and a short factual README.
+
 | Directory | Focus |
 |-----------|--------|
 | `examples/ingest/` | validate → timed decompress → extract → store |
 | `examples/counter/` | pure `transform add(x: Int) -> Int { x + 1 }` |
 | `examples/resilient/` | compiled `normalize` + residual `enrich` / `store` |
 | `examples/circuit/` | timeout + recover + local status state |
-| `examples/pipeline/` | dual timed stages, `Order → Receipt` signatures |
+| `examples/pipeline/` | pure `add_fee` + dual timed residual stages, `Order → Receipt` |
 
 ## Compiler Pipeline
 
