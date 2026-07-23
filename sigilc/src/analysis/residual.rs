@@ -18,7 +18,12 @@ fn type_name(ty: &Type) -> String {
 }
 
 /// Build the residual risk report using IR analysis and declared transform signatures.
-pub fn residual_risk_report(program: &Program, ir: &GraphIR, level2: Option<&Level2Report>) -> String {
+pub fn residual_risk_report(
+    program: &Program,
+    ir: &GraphIR,
+    level2: Option<&Level2Report>,
+    level1_enforced: bool,
+) -> String {
     let mut declared = Vec::new();
     let mut external = Vec::new();
     let mut compiled = Vec::new();
@@ -128,14 +133,22 @@ pub fn residual_risk_report(program: &Program, ir: &GraphIR, level2: Option<&Lev
         None => "- (level2 not run)".into(),
     };
 
+    let l1_section = if level1_enforced {
+        "## Level-1 Guarantees Enforced\n\
+         - No shared mutable state\n\
+         - No null values\n\
+         - Every @timeout is paired with an explicit @recover (verified)\n\
+         - StateWrite only to local process slots (verified)"
+    } else {
+        "## Level-1 Guarantees: NOT ENFORCED\n\
+         - Level-1 checks were skipped for this build (sketch mode)\n\
+         - No safety properties below are verified; treat all as residual risk"
+    };
+
     format!(
         r#"# Residual Risk Report
 
-## Level-1 Guarantees Enforced
-- No shared mutable state
-- No null values
-- Every @timeout is paired with an explicit @recover (verified)
-- StateWrite only to local process slots (verified)
+{l1_section}
 
 ## Analysis Summary
 - Process: `{process}`
@@ -200,5 +213,6 @@ pub fn residual_risk_report_ir(ir: &GraphIR) -> String {
         },
         ir,
         None,
+        true,
     )
 }

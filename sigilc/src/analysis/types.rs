@@ -249,7 +249,7 @@ mod tests {
     fn pipeline_propagates_order_and_receipt() {
         let src = include_str!("../../../examples/pipeline/pipeline.sigil");
         let prog = parse(src).expect("parse");
-        assert_eq!(prog.transforms.len(), 6, "expected explicit transform decls");
+        assert_eq!(prog.transforms.len(), 7, "expected explicit transform decls");
         let (env, transforms) = infer_program(&prog);
         assert_eq!(env.get("order").map(String::as_str), Some("Order"));
         assert_eq!(

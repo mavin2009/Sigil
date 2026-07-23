@@ -6,23 +6,41 @@ use std::fs;
 use std::path::PathBuf;
 
 use sigilc::{
-    check_transform_signatures, emit, emit_cargo_toml, emit_demo_main, level1_check, level2_check,
-    lower, parse, relative_sigil_rt_path, residual_risk_report,
+    emit, emit_cargo_toml, emit_demo_main, level_banner, lower, parse, relative_sigil_rt_path,
+    residual_risk_report, run_checks, AssuranceLevel,
 };
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: sigilc <file.sigil> [out_dir] [--emit-main]");
+        eprintln!(
+            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--level 0|1|2]\n\
+             \n\
+             Assurance levels:\n\
+             \x20 0 | sketch     exploratory; no safety checks, everything residual\n\
+             \x20 1 | safe       default; extinct-by-design + signature checks\n\
+             \x20 2 | contracts  spec obligations (require / hold / extinct)"
+        );
         std::process::exit(1);
     }
 
     let mut input: Option<PathBuf> = None;
     let mut out = PathBuf::from("generated");
     let mut emit_main_flag = false;
-    for arg in args.iter().skip(1) {
+    let mut level = AssuranceLevel::default();
+    let mut args_iter = args.iter().skip(1).peekable();
+    while let Some(arg) = args_iter.next() {
         if arg == "--emit-main" {
             emit_main_flag = true;
+        } else if let Some(v) = arg.strip_prefix("--level=") {
+            level = AssuranceLevel::from_arg(v)
+                .with_context(|| format!("invalid assurance level '{v}' (expected 0, 1, or 2)"))?;
+        } else if arg == "--level" {
+            let v = args_iter
+                .next()
+                .context("--level requires a value (0, 1, or 2)")?;
+            level = AssuranceLevel::from_arg(v)
+                .with_context(|| format!("invalid assurance level '{v}' (expected 0, 1, or 2)"))?;
         } else if input.is_none() {
             input = Some(PathBuf::from(arg));
         } else if !arg.starts_with("--") {
@@ -47,12 +65,16 @@ fn main() -> Result<()> {
     );
 
     let graph = lower(&program).context("lowering to Graph IR")?;
-    level1_check(&graph).context("Level-1 checks")?;
-    check_transform_signatures(&program).context("transform signature checks")?;
-    let l2 = level2_check(&program, &graph).context("Level-2 checks")?;
-    println!("Level-1 and Level-2 checks passed.");
-    if l2.path_timeout_sum_ms > 0 {
-        println!("path_timeout_sum = {}ms", l2.path_timeout_sum_ms);
+    let outcome = run_checks(&program, &graph, level)
+        .with_context(|| format!("checks at {}", level.name()))?;
+    println!("Assurance: {} — checks passed.", level.name());
+    for note in &outcome.notes {
+        println!("[note] {note}");
+    }
+    if let Some(l2) = &outcome.level2 {
+        if l2.path_timeout_sum_ms > 0 {
+            println!("path_timeout_sum = {}ms", l2.path_timeout_sum_ms);
+        }
     }
 
     fs::create_dir_all(out.join("src"))?;
@@ -83,7 +105,13 @@ fn main() -> Result<()> {
         rt_path
     );
 
-    let risk = residual_risk_report(&program, &graph, Some(&l2));
+    let base_risk = residual_risk_report(
+        &program,
+        &graph,
+        outcome.level2.as_ref(),
+        level >= AssuranceLevel::Safe,
+    );
+    let risk = format!("{}{}", level_banner(&outcome), base_risk);
     fs::write(out.join("RESIDUAL_RISK.md"), &risk)?;
     println!("[risk]    Wrote {}", out.join("RESIDUAL_RISK.md").display());
 
@@ -109,7 +137,7 @@ mod integration {
         check_transform_signatures(&program).expect("signatures");
         let l2 = level2_check(&program, &graph).expect("level2");
         let rust = emit(&program, &graph);
-        let risk = residual_risk_report(&program, &graph, Some(&l2));
+        let risk = residual_risk_report(&program, &graph, Some(&l2), true);
         (rust, risk, graph)
     }
 

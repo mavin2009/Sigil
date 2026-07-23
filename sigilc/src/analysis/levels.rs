@@ -1,0 +1,215 @@
+//! Stratified assurance levels.
+//!
+//! Level 0 — Sketch:    exploratory; parse + lower only, everything is residual.
+//! Level 1 — Safe:      default; extinct-by-design checks + signature agreement.
+//! Level 2 — Contracts: spec obligations (require / hold / extinct) on top of L1.
+//!
+//! Higher levels include everything below them. Contagion is explicit, not
+//! automatic: skipping a level never fails the build silently — every skipped
+//! guarantee is surfaced in the residual-risk report.
+
+use crate::analysis::check::{check_transform_signatures, level1_check};
+use crate::analysis::ir::GraphIR;
+use crate::analysis::level2::{level2_check, Level2Report};
+use crate::frontend::ast::Program;
+use anyhow::Result;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AssuranceLevel {
+    /// Level 0 — exploratory sketch. Parses and lowers; no safety checks run.
+    Sketch = 0,
+    /// Level 1 — safe default. Extinct-by-design checks + transform signatures.
+    Safe = 1,
+    /// Level 2 — contracts. Spec obligations checked on a Level-1-legal graph.
+    Contracts = 2,
+}
+
+impl AssuranceLevel {
+    pub fn from_arg(s: &str) -> Option<Self> {
+        match s.trim() {
+            "0" | "sketch" => Some(Self::Sketch),
+            "1" | "safe" => Some(Self::Safe),
+            "2" | "contracts" => Some(Self::Contracts),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Sketch => "Level 0 (sketch)",
+            Self::Safe => "Level 1 (safe)",
+            Self::Contracts => "Level 2 (contracts)",
+        }
+    }
+}
+
+impl Default for AssuranceLevel {
+    fn default() -> Self {
+        Self::Safe
+    }
+}
+
+/// Result of running checks at a chosen assurance level.
+#[derive(Debug)]
+pub struct CheckOutcome {
+    pub level: AssuranceLevel,
+    /// Present only when Level-2 checks actually ran.
+    pub level2: Option<Level2Report>,
+    /// Guarantees that were NOT established at this level.
+    pub skipped: Vec<String>,
+    /// Human-readable notes (e.g. specs parsed but unchecked).
+    pub notes: Vec<String>,
+}
+
+/// Run all checks appropriate for `level`. Failing a check at or below the
+/// chosen level fails the build; guarantees above the chosen level are
+/// recorded as skipped so the residual report can surface them.
+pub fn run_checks(program: &Program, ir: &GraphIR, level: AssuranceLevel) -> Result<CheckOutcome> {
+    let mut skipped = Vec::new();
+    let mut notes = Vec::new();
+    let mut level2 = None;
+
+    if level >= AssuranceLevel::Safe {
+        level1_check(ir)?;
+        check_transform_signatures(program)?;
+    } else {
+        skipped.push("shared-mutability / local-state discipline (Level-1 not run)".into());
+        skipped.push("@timeout ↔ @recover pairing (Level-1 not run)".into());
+        skipped.push("pipeline ↔ transform signature agreement (not checked)".into());
+        notes.push(
+            "SKETCH MODE: no safety guarantees are established. \
+             Do not deploy artifacts built at Level 0."
+                .into(),
+        );
+    }
+
+    if level >= AssuranceLevel::Contracts {
+        level2 = Some(level2_check(program, ir)?);
+    } else if !program.specs.is_empty() {
+        skipped.push("spec obligations (require / hold / extinct) — not checked".into());
+        notes.push(format!(
+            "{} spec(s) parsed but NOT checked at {} — rerun with --level 2",
+            program.specs.len(),
+            level.name()
+        ));
+    }
+
+    Ok(CheckOutcome {
+        level,
+        level2,
+        skipped,
+        notes,
+    })
+}
+
+/// Markdown section describing the assurance level of this build, for
+/// inclusion at the top of RESIDUAL_RISK.md.
+pub fn level_banner(outcome: &CheckOutcome) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Assurance Level: {}\n\n",
+        outcome.level.name()
+    ));
+    if outcome.skipped.is_empty() {
+        out.push_str("All guarantees available at this level were established.\n\n");
+    } else {
+        out.push_str("**Guarantees NOT established by this build:**\n\n");
+        for s in &outcome.skipped {
+            out.push_str(&format!("- {s}\n"));
+        }
+        out.push('\n');
+    }
+    for n in &outcome.notes {
+        out.push_str(&format!("> ⚠ {n}\n\n"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::ir::lower;
+    use crate::frontend::ast::parse;
+
+    /// A program that must fail Level-1 (unhandled @timeout)…
+    const L1_VIOLATION: &str = r#"
+schema M { v: Int }
+transform slow(m: M) -> M {}
+process P {
+  state last: Int = 0
+  on m: M {
+    let out = m ~> slow @timeout(50.ms)
+    last := out.v
+  }
+}
+"#;
+
+    #[test]
+    fn sketch_mode_accepts_l1_violations_but_reports_them() {
+        let program = parse(L1_VIOLATION).expect("parse");
+        let ir = lower(&program).expect("lower");
+        let outcome =
+            run_checks(&program, &ir, AssuranceLevel::Sketch).expect("sketch must not reject");
+        assert!(outcome.level2.is_none());
+        assert!(
+            outcome.skipped.iter().any(|s| s.contains("@timeout")),
+            "sketch build must surface skipped timeout pairing"
+        );
+        let banner = level_banner(&outcome);
+        assert!(banner.contains("Level 0"));
+        assert!(banner.contains("NOT established"));
+    }
+
+    #[test]
+    fn safe_level_still_rejects_l1_violations() {
+        let program = parse(L1_VIOLATION).expect("parse");
+        let ir = lower(&program).expect("lower");
+        let err = run_checks(&program, &ir, AssuranceLevel::Safe)
+            .expect_err("level 1 must reject unhandled timeout");
+        assert!(format!("{err}").contains("Level-1"));
+    }
+
+    #[test]
+    fn specs_are_skipped_below_contracts_level_with_note() {
+        let src = r#"
+schema M { v: Int }
+process P {
+  state total: Float = 0.0
+  on m: M {
+    total := total + 1.0
+  }
+}
+spec S {
+  hold total >= 0.0
+}
+"#;
+        let program = parse(src).expect("parse");
+        let ir = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &ir, AssuranceLevel::Safe).expect("l1 ok");
+        assert!(outcome.level2.is_none());
+        assert!(outcome
+            .notes
+            .iter()
+            .any(|n| n.contains("NOT checked") && n.contains("--level 2")));
+
+        let outcome2 =
+            run_checks(&program, &ir, AssuranceLevel::Contracts).expect("l2 ok");
+        assert!(outcome2.level2.is_some());
+        assert!(outcome2.skipped.is_empty());
+    }
+
+    #[test]
+    fn level_arg_parsing() {
+        assert_eq!(AssuranceLevel::from_arg("0"), Some(AssuranceLevel::Sketch));
+        assert_eq!(
+            AssuranceLevel::from_arg("sketch"),
+            Some(AssuranceLevel::Sketch)
+        );
+        assert_eq!(AssuranceLevel::from_arg("1"), Some(AssuranceLevel::Safe));
+        assert_eq!(
+            AssuranceLevel::from_arg("contracts"),
+            Some(AssuranceLevel::Contracts)
+        );
+        assert_eq!(AssuranceLevel::from_arg("9"), None);
+    }
+}
