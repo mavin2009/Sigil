@@ -1,0 +1,65 @@
+// Level-4 SYSTEM invariant: settlement never counts an order the gateway
+// didn't admit — proven structurally across the topology.
+//
+//   hold Settlement.posted <= Gateway.admitted
+//
+// The proof needs no fairness or liveness assumptions:
+//   BASE      0 <= 0
+//   COUNTING  each process adds exactly +1 per message (literal deltas)
+//   ORDERING  Gateway increments `admitted` BEFORE sending — a message can
+//             never reach Settlement uncounted, even mid-shutdown
+//   FLOW      every path into Settlement passes through Gateway with static
+//             multiplicity 1 (no broadcast on the path)
+// Every failure mode the language admits (timeouts, @error drops, guard
+// rejections, staged shutdown) only DECREASES Settlement's count.
+
+schema Order {
+  id: String,
+  amount: Float
+}
+
+transform validate(o: Order) -> Order {}
+transform score(o: Order) -> Order {}
+transform post(o: Order) -> Order {}
+transform quarantine(o: Order) -> Order { o }
+transform waive(o: Order) -> Order { o }
+transform refund(o: Order) -> Order { o }
+
+process Gateway {
+  state admitted: Int = 0
+
+  on order: Order {
+    let ok = order ~> validate @recover(with: quarantine)
+    admitted := admitted + 1
+    send ok to Risk by ok.id
+  }
+}
+
+process Risk {
+  state scored: Int = 0
+
+  on order: Order {
+    let s = order ~> score @timeout(60.ms) @retry(2) @recover(with: waive)
+    scored := scored + 1
+    send s to Settlement
+  }
+}
+
+process Settlement {
+  state posted: Int = 0
+  state total_amount: Float = 0.0
+
+  on order: Order {
+    let done = order ~> post @recover(with: refund)
+    posted := posted + 1
+    total_amount := total_amount + order.amount
+  }
+}
+
+spec Conservation {
+  require order.amount >= 0.0
+  require path_timeout_sum <= 200.ms
+  hold total_amount >= 0.0
+  hold Settlement.posted <= Gateway.admitted
+  hold Risk.scored <= Gateway.admitted
+}

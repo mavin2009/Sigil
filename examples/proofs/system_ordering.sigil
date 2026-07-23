@@ -1,0 +1,19 @@
+// MUST FAIL --level 4: Gateway counts AFTER sending — a message can reach
+// Settlement without being counted (e.g. handler cut short mid-shutdown).
+schema Order { id: String }
+process Gateway {
+  state admitted: Int = 0
+  on order: Order {
+    send order to Settlement
+    admitted := admitted + 1
+  }
+}
+process Settlement {
+  state posted: Int = 0
+  on order: Order {
+    posted := posted + 1
+  }
+}
+spec Broken {
+  hold Settlement.posted <= Gateway.admitted
+}

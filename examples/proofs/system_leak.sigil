@@ -1,0 +1,26 @@
+// MUST FAIL --level 4: Settlement is also fed by a second entry that never
+// passes through Gateway — its count includes orders Gateway never saw.
+schema Order { id: String }
+process Gateway {
+  state admitted: Int = 0
+  on order: Order {
+    admitted := admitted + 1
+    send order to Settlement
+  }
+}
+process Backdoor {
+  state injected: Int = 0
+  on order: Order {
+    injected := injected + 1
+    send order to Settlement
+  }
+}
+process Settlement {
+  state posted: Int = 0
+  on order: Order {
+    posted := posted + 1
+  }
+}
+spec Broken {
+  hold Settlement.posted <= Gateway.admitted
+}

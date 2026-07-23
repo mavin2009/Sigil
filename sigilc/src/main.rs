@@ -14,13 +14,14 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--level 0|1|2|3]\n\
+            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--level 0|1|2|3|4]\n\
              \n\
              Assurance levels:\n\
              \x20 0 | sketch     exploratory; no safety checks, everything residual\n\
              \x20 1 | safe       default; extinct-by-design + signature checks\n\
              \x20 2 | contracts  spec obligations (require / hold / extinct)\n\
-             \x20 3 | proofs     inductive hold proofs with runtime-guarded assumptions"
+             \x20 3 | proofs     inductive hold proofs with runtime-guarded assumptions\n\
+             \x20 4 | system     cross-process invariants proven over the topology"
         );
         std::process::exit(1);
     }
@@ -35,13 +36,13 @@ fn main() -> Result<()> {
             emit_main_flag = true;
         } else if let Some(v) = arg.strip_prefix("--level=") {
             level = AssuranceLevel::from_arg(v)
-                .with_context(|| format!("invalid assurance level '{v}' (expected 0-3)"))?;
+                .with_context(|| format!("invalid assurance level '{v}' (expected 0-4)"))?;
         } else if arg == "--level" {
             let v = args_iter
                 .next()
                 .context("--level requires a value (0, 1, or 2)")?;
             level = AssuranceLevel::from_arg(v)
-                .with_context(|| format!("invalid assurance level '{v}' (expected 0-3)"))?;
+                .with_context(|| format!("invalid assurance level '{v}' (expected 0-4)"))?;
         } else if input.is_none() {
             input = Some(PathBuf::from(arg));
         } else if !arg.starts_with("--") {
@@ -324,6 +325,56 @@ mod integration {
         // Untimed @recover emits a match on the stage result with a recovery note.
         assert!(rust.contains("note_recovery(\"validate\")"), "untimed recover path missing");
         assert!(rust.contains("note_recovery(\"post\")"));
+    }
+
+    /// Level 4: system invariants proven structurally over the topology,
+    /// with each proof obligation (ordering, flow, broadcast, gap) having a
+    /// negative proof program.
+    #[test]
+    fn level4_system_invariants() {
+        use sigilc::{level4_prove, run_checks, AssuranceLevel};
+
+        // Flagship passes all four levels; both system holds proven.
+        let src = include_str!("../../examples/level4/conservation.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+            .expect("conservation must pass Level 4");
+        let l4 = outcome.level4.expect("level4 ran");
+        assert_eq!(l4.proven.len(), 2, "both system holds proven");
+        assert!(outcome.level3.is_some(), "Level 4 includes Level 3");
+
+        // Each obligation fails for its own reason.
+        let fails = |src: &str, needle: &str| {
+            let program = parse(src).expect("parse");
+            let err = level4_prove(&program).expect_err("must fail");
+            let msg = format!("{err}");
+            assert!(msg.contains(needle), "expected '{needle}', got: {msg}");
+        };
+        fails(
+            include_str!("../../examples/proofs/system_ordering.sigil"),
+            "ORDERING fails",
+        );
+        fails(
+            include_str!("../../examples/proofs/system_leak.sigil"),
+            "FLOW fails",
+        );
+        fails(
+            include_str!("../../examples/proofs/system_broadcast.sigil"),
+            "broadcast",
+        );
+
+        // GAP: Settlement counting +2 per message breaks the bound.
+        let gap = src.replace("posted := posted + 1", "posted := posted + 2");
+        let program = parse(&gap).expect("parse");
+        let err = level4_prove(&program).expect_err("gap must fail");
+        assert!(format!("{err}").contains("GAP fails"));
+
+        // The system proofs still hold at lower levels' semantics: the same
+        // program builds at level 2 with holds residual.
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        run_checks(&program, &irs, AssuranceLevel::Contracts).expect("residual at L2");
     }
 
     /// Level 3: holds are proven inductively; assumptions are runtime guards

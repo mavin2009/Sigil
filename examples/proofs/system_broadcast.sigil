@@ -1,0 +1,19 @@
+// MUST FAIL --level 4: a broadcast edge multiplies by the runtime shard
+// count — there is no static bound.
+schema Order { id: String }
+process Gateway {
+  state admitted: Int = 0
+  on order: Order {
+    admitted := admitted + 1
+    send order to Settlement broadcast
+  }
+}
+process Settlement {
+  state posted: Int = 0
+  on order: Order {
+    posted := posted + 1
+  }
+}
+spec Broken {
+  hold Settlement.posted <= Gateway.admitted
+}

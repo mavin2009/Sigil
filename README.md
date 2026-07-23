@@ -31,6 +31,7 @@ Residual risk outside the model (external transforms, OS, scheduler) is always r
 | `--level 1` / `safe` (default) | extinct-by-design | Level-1 checks, transform signatures, failure paths, topology |
 | `--level 2` / `contracts` | spec obligations | `require` / `hold` / `extinct` on a Level-1-legal graph |
 | `--level 3` / `proofs` | inductive proofs | every `hold` proven (base + inductive step over all reachable updates); undischargeable holds fail the build |
+| `--level 4` / `system` | system proofs | cross-process invariants (`hold Settlement.posted <= Gateway.admitted`) proven structurally over the topology |
 
 A Level-0 build never claims unverified properties: the residual report leads
 with everything that was NOT established.
@@ -70,6 +71,31 @@ Values that flow through external transforms are never assumed bounded —
 they are unbounded by construction, and the prover says so. See
 `examples/level3/proven_ledger.sigil` (passes) and
 `examples/proofs/hold_not_inductive.sigil` (must fail).
+
+Level 3 also proves **relational holds** within a process (`hold refunded <=
+charged`) by a per-handler delta argument — sound at handler boundaries
+precisely because actors are shared-nothing: no interleaving is observable
+mid-handler. Simple `let` bindings carry their guarded intervals.
+
+## Level 4: System Invariants over the Topology
+
+`hold Settlement.posted <= Gateway.admitted` is proven from four structural
+obligations, each with a negative proof program:
+
+| Obligation | Meaning | Must-fail proof |
+| ---------- | ------- | --------------- |
+| BASE | `init(lo) <= init(hi)` | — |
+| ORDERING | the upstream counter updates **before** the send, so a message can never reach downstream uncounted, even mid-shutdown | `system_ordering.sigil` |
+| FLOW | every path into the downstream process passes through the upstream one; a second entry breaks the count | `system_leak.sigil` |
+| MULT | send multiplicity along the path is a static constant; broadcast multiplies by the runtime shard count and is rejected | `system_broadcast.sigil` |
+| GAP | `mult × max(downstream delta) <= min(upstream delta)` | (tested: `+2` counter) |
+
+The proof needs **no fairness or liveness assumptions**: every failure mode
+the language admits — timeouts, `@error` drops, guard rejections, staged
+shutdown — only decreases the downstream count. This is the payoff of the
+actor model plus mandatory failure paths. See
+`examples/level4/conservation.sigil`; under 15% fault injection the runtime
+witness holds with `posted = scored = admitted` exactly.
 
 ## Fault Injection (proving the failure paths)
 
@@ -430,4 +456,4 @@ Negative programs live under `examples/proofs/`.
 
 ## Status
 
-v0.4 — Level 3 shipped: built-in inductive prover for hold invariants (interval domain, no SMT dependency), runtime-guarded proof assumptions, actionable proof failures. Soundness-hardened: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.
+v0.5 — Level 4 shipped: cross-process system invariants proven structurally over the topology (ordering / flow / multiplicity / gap obligations, each with a negative proof). Level 3 completed: relational holds via per-handler deltas, let-binding interval tracking. Level 3: built-in inductive prover for hold invariants (interval domain, no SMT dependency), runtime-guarded proof assumptions, actionable proof failures. Soundness-hardened: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.

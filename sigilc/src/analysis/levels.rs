@@ -26,6 +26,9 @@ pub enum AssuranceLevel {
     /// Level 3 — proofs. hold invariants proven inductively; assumptions are
     /// runtime-guarded input preconditions. Undischargeable holds fail.
     Proofs = 3,
+    /// Level 4 — system. Cross-process invariants proven structurally from
+    /// the topology (ordering + multiplicity + reachability).
+    System = 4,
 }
 
 impl AssuranceLevel {
@@ -35,6 +38,7 @@ impl AssuranceLevel {
             "1" | "safe" => Some(Self::Safe),
             "2" | "contracts" => Some(Self::Contracts),
             "3" | "proofs" => Some(Self::Proofs),
+            "4" | "system" => Some(Self::System),
             _ => None,
         }
     }
@@ -45,6 +49,7 @@ impl AssuranceLevel {
             Self::Safe => "Level 1 (safe)",
             Self::Contracts => "Level 2 (contracts)",
             Self::Proofs => "Level 3 (proofs)",
+            Self::System => "Level 4 (system)",
         }
     }
 }
@@ -63,6 +68,8 @@ pub struct CheckOutcome {
     pub level2: Option<Level2Report>,
     /// Present only when Level-3 proofs actually ran.
     pub level3: Option<crate::analysis::level3::Level3Report>,
+    /// Present only when Level-4 system proofs actually ran.
+    pub level4: Option<crate::analysis::level4::Level4Report>,
     /// Guarantees that were NOT established at this level.
     pub skipped: Vec<String>,
     /// Human-readable notes (e.g. specs parsed but unchecked).
@@ -77,6 +84,7 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
     let mut notes = Vec::new();
     let mut level2 = None;
     let mut level3 = None;
+    let mut level4 = None;
 
     if level >= AssuranceLevel::Safe {
         for ir in irs {
@@ -116,7 +124,15 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
             notes.push(format!("PROVEN: {p}"));
         }
         level3 = Some(l3);
-    } else {
+    }
+    if level >= AssuranceLevel::System {
+        let l4 = crate::analysis::level4::level4_prove(program)?;
+        for p in &l4.proven {
+            notes.push(format!("PROVEN (system): {p}"));
+        }
+        level4 = Some(l4);
+    }
+    if level < AssuranceLevel::Proofs {
         let has_holds = program.specs.iter().any(|sp| {
             sp.items.iter().any(|i| matches!(i, crate::frontend::ast::SpecItem::Hold { .. }))
         });
@@ -132,6 +148,7 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
         level,
         level2,
         level3,
+        level4,
         skipped,
         notes,
     })
@@ -153,6 +170,15 @@ pub fn level_banner(outcome: &CheckOutcome) -> String {
             out.push_str(&format!("- {s}\n"));
         }
         out.push('\n');
+    }
+    if let Some(l4) = &outcome.level4 {
+        if !l4.proven.is_empty() {
+            out.push_str("**Proven SYSTEM invariants (Level 4, structural over the topology):**\n\n");
+            for p in &l4.proven {
+                out.push_str(&format!("- {p}\n"));
+            }
+            out.push('\n');
+        }
     }
     if let Some(l3) = &outcome.level3 {
         if !l3.proven.is_empty() {

@@ -122,6 +122,10 @@ pub struct Level3Report {
     pub residual: Vec<String>,
 }
 
+pub(crate) fn lit_value_pub(l: &Literal) -> Option<f64> {
+    lit_value(l)
+}
+
 fn lit_value(l: &Literal) -> Option<f64> {
     match l {
         Literal::Int(i) => Some(*i as f64),
@@ -180,6 +184,7 @@ pub fn level3_prove(program: &Program) -> Result<Level3Report> {
 
     // Held-state predicates (the inductive hypotheses).
     let mut holds: BTreeMap<String, (Pred, String)> = BTreeMap::new();
+    let mut relational: Vec<(String, BinOp, String, String)> = Vec::new();
     for spec in &program.specs {
         for item in &spec.items {
             let SpecItem::Hold { expr, span } = item else { continue };
@@ -197,9 +202,27 @@ pub fn level3_prove(program: &Program) -> Result<Level3Report> {
                 ));
                 continue;
             };
+            if let (Expr::FieldAccess { base: lb, .. }, Expr::FieldAccess { base: rb, .. }) =
+                (lhs.as_ref(), rhs.as_ref())
+            {
+                let is_proc = |n: &str| program.processes.iter().any(|p| p.name == n);
+                if is_proc(lb) && is_proc(rb) {
+                    // System invariant across processes: proven at Level 4.
+                    report.residual.push(format!(
+                        "spec `{}` hold spans processes — proven at Level 4 (--level 4)",
+                        spec.name
+                    ));
+                    continue;
+                }
+            }
+            if let Expr::Ident { name: rhs_state, .. } = rhs.as_ref() {
+                // Relational hold within a process: proven separately.
+                relational.push((name.clone(), op.clone(), rhs_state.clone(), spec.name.clone()));
+                continue;
+            }
             let Some(pred) = cmp_pred(op, rhs) else {
                 report.residual.push(format!(
-                    "spec `{}` hold `{name}` — bound must be a numeric literal",
+                    "spec `{}` hold `{name}` — bound must be a numeric literal or a state name",
                     spec.name
                 ));
                 continue;
@@ -213,6 +236,15 @@ pub fn level3_prove(program: &Program) -> Result<Level3Report> {
         report.proven.push(format!(
             "hold `{state} {}` (spec `{spec_name}`): init satisfies; every reachable update re-establishes it",
             pred.describe()
+        ));
+    }
+    for (a, op, b, spec_name) in &relational {
+        prove_relational(program, a, op, b, spec_name, &holds, &preconds)?;
+        let op_s = match op { BinOp::Le => "<=", BinOp::Lt => "<", BinOp::Ge => ">=", BinOp::Gt => ">", _ => "?" };
+        report.proven.push(format!(
+            "hold `{a} {op_s} {b}` (spec `{spec_name}`): init ordering + per-handler delta argument \
+             (sound at handler boundaries because actors are shared-nothing: no interleaving \
+             is observable mid-handler)"
         ));
     }
     Ok(report)
@@ -259,15 +291,26 @@ fn prove_one(
         ),
     }
 
-    // INDUCTIVE: every assignment in the owner process
+    // INDUCTIVE: every assignment in the owner process, evaluated in
+    // statement order with a let-binding environment so simple bindings
+    // (`let x = payment.units`) keep their guarded intervals.
     for handler in &owner.handlers {
+        let mut lets: BTreeMap<String, Interval> = BTreeMap::new();
         for stmt in &handler.body {
+            if let Stmt::Let { name, expr, .. } = stmt {
+                let mut scratch = Vec::new();
+                let v = eval_interval(
+                    expr, owner, &handler.msg_name, holds, preconds, &lets, &mut scratch,
+                );
+                lets.insert(name.clone(), v);
+                continue;
+            }
             let Stmt::Assign { name, expr, .. } = stmt else { continue };
             if name != state {
                 continue;
             }
             let mut why = Vec::new();
-            let v = eval_interval(expr, owner, &handler.msg_name, holds, preconds, &mut why);
+            let v = eval_interval(expr, owner, &handler.msg_name, holds, preconds, &lets, &mut why);
             if !pred.admits(v) {
                 let hints = if why.is_empty() {
                     String::new()
@@ -292,12 +335,153 @@ fn prove_one(
     Ok(())
 }
 
-fn eval_interval(
+/// Per-handler net delta of a state, in the self-additive fragment:
+///   unassigned            → delta = [0, 0]
+///   x := x + e (once)     → delta = interval(e)
+///   x := x - e (once)     → delta = -interval(e)
+/// Anything else → None (outside the fragment).
+pub(crate) fn handler_delta(
+    state: &str,
+    handler: &crate::frontend::ast::OnHandler,
+    owner: &Process,
+    holds: &BTreeMap<String, (Pred, String)>,
+    preconds: &[InputPrecondition],
+    lets: &BTreeMap<String, Interval>,
+    why: &mut Vec<String>,
+) -> Option<Interval> {
+    let mut delta: Option<Interval> = None;
+    for stmt in &handler.body {
+        let Stmt::Assign { name, expr, .. } = stmt else { continue };
+        if name != state {
+            continue;
+        }
+        if delta.is_some() {
+            why.push(format!("state `{state}` assigned more than once in a handler"));
+            return None;
+        }
+        match expr {
+            Expr::Binary { op, lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::Ident { name: n, .. } if n == state) =>
+            {
+                let e = eval_interval(rhs, owner, &handler.msg_name, holds, preconds, lets, why);
+                delta = match op {
+                    BinOp::Add => Some(e),
+                    BinOp::Sub => Some(Interval::point(0.0).sub(e)),
+                    _ => {
+                        why.push(format!("`{state}` update is not additive"));
+                        return None;
+                    }
+                };
+            }
+            _ => {
+                why.push(format!("`{state}` update is not of the form `{state} := {state} ± e`"));
+                return None;
+            }
+        }
+    }
+    Some(delta.unwrap_or(Interval::point(0.0)))
+}
+
+/// Prove `a <op> b` for two states of the same process:
+///   BASE:      init_a <op> init_b (literals)
+///   INDUCTIVE: in every handler, interval(delta_b − delta_a) keeps the gap
+///              (≥ 0 for `a <= b`, etc.). Induction at handler boundaries is
+///              sound because process state is shared-nothing: handlers run
+///              to completion with no observable interleaving.
+fn prove_relational(
+    program: &Program,
+    a: &str,
+    op: &BinOp,
+    b: &str,
+    spec_name: &str,
+    holds: &BTreeMap<String, (Pred, String)>,
+    preconds: &[InputPrecondition],
+) -> Result<()> {
+    let owner = program
+        .processes
+        .iter()
+        .find(|p| p.states.iter().any(|s| s.name == a))
+        .ok_or_else(|| anyhow::anyhow!(
+            "Level-3 violation in spec '{spec_name}': hold refers to unknown state '{a}'"
+        ))?;
+    if !owner.states.iter().any(|s| s.name == b) {
+        bail!(
+            "Level-3 violation in spec '{spec_name}': relational hold `{a} .. {b}` spans \
+             processes — same-process only at Level 3 (cross-process relations are Level 4)"
+        );
+    }
+    let lit_init = |st: &str| -> Result<f64> {
+        let d = owner.states.iter().find(|s| s.name == st).unwrap();
+        match &d.init {
+            Expr::Literal { value, .. } => lit_value(value).ok_or_else(|| anyhow::anyhow!(
+                "Level-3 violation in spec '{spec_name}': `{st}` init not numeric"
+            )),
+            _ => bail!("Level-3 violation in spec '{spec_name}': `{st}` init not a literal"),
+        }
+    };
+    let (ia, ib) = (lit_init(a)?, lit_init(b)?);
+    let base_ok = match op {
+        BinOp::Le => ia <= ib,
+        BinOp::Lt => ia < ib,
+        BinOp::Ge => ia >= ib,
+        BinOp::Gt => ia > ib,
+        _ => bail!("Level-3 violation in spec '{spec_name}': unsupported relational op"),
+    };
+    if !base_ok {
+        bail!(
+            "Level-3 violation in spec '{spec_name}': BASE CASE fails — inits {a}={ia}, {b}={ib}"
+        );
+    }
+
+    for handler in &owner.handlers {
+        // Track lets for this handler (same as scalar proofs).
+        let mut lets: BTreeMap<String, Interval> = BTreeMap::new();
+        for stmt in &handler.body {
+            if let Stmt::Let { name, expr, .. } = stmt {
+                let mut scratch = Vec::new();
+                let v = eval_interval(expr, owner, &handler.msg_name, holds, preconds, &lets, &mut scratch);
+                lets.insert(name.clone(), v);
+            }
+        }
+        let mut why = Vec::new();
+        let da = handler_delta(a, handler, owner, holds, preconds, &lets, &mut why);
+        let db = handler_delta(b, handler, owner, holds, preconds, &lets, &mut why);
+        let (Some(da), Some(db)) = (da, db) else {
+            bail!(
+                "Level-3 violation in spec '{spec_name}': relational hold `{a}` vs `{b}` — \
+                 handler in '{}' leaves the additive fragment: {}",
+                owner.name,
+                why.join("; ")
+            );
+        };
+        // Gap change: (b + db) - (a + da) - (b - a) = db - da
+        let gap = db.sub(da);
+        let ok = match op {
+            BinOp::Le | BinOp::Lt => gap.lo >= 0.0,
+            BinOp::Ge | BinOp::Gt => gap.hi <= 0.0,
+            _ => false,
+        };
+        if !ok {
+            let hints = if why.is_empty() { String::new() } else { format!("\n  unbounded because: {}", why.join("; ")) };
+            bail!(
+                "Level-3 violation in spec '{spec_name}': INDUCTIVE STEP fails — in process \
+                 '{}', per-message deltas allow d({b})−d({a}) in [{}, {}], which can shrink \
+                 the `{a}` vs `{b}` gap{hints}\n  fix: guard the inputs so every message \
+                 changes `{b}` at least as much as `{a}`",
+                owner.name, gap.lo, gap.hi
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn eval_interval(
     expr: &Expr,
     owner: &Process,
     msg_name: &str,
     holds: &BTreeMap<String, (Pred, String)>,
     preconds: &[InputPrecondition],
+    lets: &BTreeMap<String, Interval>,
     why: &mut Vec<String>,
 ) -> Interval {
     match expr {
@@ -305,13 +489,15 @@ fn eval_interval(
             .map(Interval::point)
             .unwrap_or(Interval::TOP),
         Expr::Ident { name, .. } => {
-            if let Some((p, _)) = holds.get(name) {
+            if let Some(v) = lets.get(name) {
+                *v // tracked let binding
+            } else if let Some((p, _)) = holds.get(name) {
                 p.region() // inductive hypothesis
             } else if owner.states.iter().any(|s| s.name == *name) {
                 why.push(format!("state `{name}` has no hold of its own"));
                 Interval::TOP
             } else {
-                why.push(format!("`{name}` is a local binding (flows through transforms)"));
+                why.push(format!("`{name}` is an untracked binding (flows through transforms)"));
                 Interval::TOP
             }
         }
@@ -344,8 +530,8 @@ fn eval_interval(
             }
         }
         Expr::Binary { op, lhs, rhs, .. } => {
-            let l = eval_interval(lhs, owner, msg_name, holds, preconds, why);
-            let r = eval_interval(rhs, owner, msg_name, holds, preconds, why);
+            let l = eval_interval(lhs, owner, msg_name, holds, preconds, lets, why);
+            let r = eval_interval(rhs, owner, msg_name, holds, preconds, lets, why);
             match op {
                 BinOp::Add => l.add(r),
                 BinOp::Sub => l.sub(r),
@@ -442,6 +628,73 @@ spec Safe {
         let src = PROVABLE.replace("state total: Float = 0.0", "state total: Float = -1.0");
         let program = parse(&src).expect("parse");
         let err = level3_prove(&program).expect_err("init violates the hold");
+        assert!(format!("{err}").contains("BASE CASE fails"));
+    }
+
+    #[test]
+    fn let_bindings_keep_guarded_intervals() {
+        let src = r#"
+schema Payment { id: String, amount: Float }
+process P {
+  state total: Float = 0.0
+  on payment: Payment {
+    let amt = payment.amount
+    let doubled = amt + amt
+    total := total + doubled
+  }
+}
+spec S {
+  require payment.amount >= 0.0
+  hold total >= 0.0
+}
+"#;
+        let program = parse(src).expect("parse");
+        let report = level3_prove(&program).expect("bindings must carry guards");
+        assert_eq!(report.proven.len(), 1);
+    }
+
+    const RELATIONAL: &str = r#"
+schema Tx { id: String, charge: Float, refund: Float }
+process Book {
+  state charged: Float = 0.0
+  state refunded: Float = 0.0
+  on tx: Tx {
+    charged := charged + tx.charge
+    refunded := refunded + tx.refund
+  }
+}
+spec Rel {
+  require tx.charge >= 0.0
+  require tx.refund >= 0.0
+  require tx.refund <= 0.0
+  hold refunded <= charged
+}
+"#;
+
+    #[test]
+    fn relational_hold_proves_when_gap_cannot_shrink() {
+        // refund guarded to exactly 0 → delta(charged) − delta(refunded) ≥ 0.
+        let program = parse(RELATIONAL).expect("parse");
+        let report = level3_prove(&program).expect("gap cannot shrink");
+        assert!(report.proven.iter().any(|p| p.contains("refunded <= charged")));
+    }
+
+    #[test]
+    fn relational_hold_fails_when_gap_can_shrink() {
+        // Remove the upper guard: refund can exceed charge → gap can shrink.
+        let src = RELATIONAL.replace("  require tx.refund <= 0.0
+", "");
+        let program = parse(&src).expect("parse");
+        let err = level3_prove(&program).expect_err("gap can shrink");
+        let msg = format!("{err}");
+        assert!(msg.contains("INDUCTIVE STEP fails") && msg.contains("gap"), "got: {msg}");
+    }
+
+    #[test]
+    fn relational_hold_fails_bad_init() {
+        let src = RELATIONAL.replace("state refunded: Float = 0.0", "state refunded: Float = 1.0");
+        let program = parse(&src).expect("parse");
+        let err = level3_prove(&program).expect_err("init ordering violated");
         assert!(format!("{err}").contains("BASE CASE fails"));
     }
 
