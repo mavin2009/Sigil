@@ -10,7 +10,7 @@ process Counter {
   state total: Int = 0
 
   on tick: Tick {
-    let next = tick ~> increment
+    let next = total + tick.value
     total := next
   }
 }

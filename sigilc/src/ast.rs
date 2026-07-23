@@ -1,5 +1,5 @@
 
-//! AST for Sigil — pest-driven structured representation
+//! AST for Sigil — pest-driven structured representation with arithmetic
 
 use anyhow::{anyhow, bail, Result};
 use pest::Parser;
@@ -61,6 +61,12 @@ pub enum Expr {
     Literal(Literal),
     Pipeline { base: Box<Expr>, steps: Vec<PipeStep> },
     Call { name: String, args: Vec<Expr> },
+    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
+}
+
+#[derive(Debug, Clone)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
 }
 
 #[derive(Debug, Clone)]
@@ -194,16 +200,48 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
             let inner = pair.into_inner().next().unwrap();
             parse_stmt(inner)
         }
-        Rule::expr | Rule::pipeline => Ok(Stmt::Expr(parse_expr(pair)?)),
+        Rule::expr | Rule::sum | Rule::product | Rule::pipeline => Ok(Stmt::Expr(parse_expr(pair)?)),
         other => bail!("unexpected stmt rule: {:?}", other),
     }
 }
 
 fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     match pair.as_rule() {
-        Rule::expr | Rule::pipeline => {
+        Rule::expr => {
+            let inner = pair.into_inner().next().unwrap();
+            parse_expr(inner)
+        }
+        Rule::sum => {
             let mut inner = pair.into_inner();
-            let first = inner.next().ok_or_else(|| anyhow!("empty expr"))?;
+            let mut left = parse_expr(inner.next().unwrap())?;
+            while let Some(op_pair) = inner.next() {
+                let op = match op_pair.as_str() {
+                    "+" => BinOp::Add,
+                    "-" => BinOp::Sub,
+                    _ => bail!("bad sum op"),
+                };
+                let right = parse_expr(inner.next().unwrap())?;
+                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+            }
+            Ok(left)
+        }
+        Rule::product => {
+            let mut inner = pair.into_inner();
+            let mut left = parse_expr(inner.next().unwrap())?;
+            while let Some(op_pair) = inner.next() {
+                let op = match op_pair.as_str() {
+                    "*" => BinOp::Mul,
+                    "/" => BinOp::Div,
+                    _ => bail!("bad product op"),
+                };
+                let right = parse_expr(inner.next().unwrap())?;
+                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+            }
+            Ok(left)
+        }
+        Rule::pipeline => {
+            let mut inner = pair.into_inner();
+            let first = inner.next().ok_or_else(|| anyhow!("empty pipeline"))?;
             let base = parse_atom(first)?;
             let mut steps = vec![];
             for tail in inner {
@@ -252,7 +290,7 @@ fn parse_atom(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             let inner = pair.into_inner().next().unwrap();
             parse_atom(inner)
         }
-        Rule::expr | Rule::pipeline => parse_expr(pair),
+        Rule::expr | Rule::sum | Rule::product | Rule::pipeline => parse_expr(pair),
         other => bail!("unexpected atom rule: {:?}", other),
     }
 }
@@ -312,24 +350,12 @@ mod tests {
         assert_eq!(p.states[0].name, "last");
         assert_eq!(p.handlers.len(), 1);
         assert_eq!(p.handlers[0].msg_name, "packet");
-        // body should have several statements
         assert!(p.handlers[0].body.len() >= 3);
     }
 
     #[test]
     fn parse_counter_example() {
-        let src = r#"
-schema Tick {
-  value: Int
-}
-process Counter {
-  state total: Int = 0
-  on tick: Tick {
-    let next = tick ~> increment
-    total := next
-  }
-}
-"#;
+        let src = include_str!("../../examples/counter.sigil");
         let prog = parse(src).expect("should parse counter");
         assert_eq!(prog.processes.len(), 1);
         assert_eq!(prog.processes[0].name, "Counter");
@@ -337,4 +363,20 @@ process Counter {
         assert_eq!(prog.processes[0].handlers.len(), 1);
     }
 
+    #[test]
+    fn parse_binary_arithmetic() {
+        let src = r#"
+schema S { x: Int }
+process P {
+  state s: Int = 0
+  on m: S {
+    let y = s + m.x * 2
+    s := y
+  }
+}
+"#;
+        let prog = parse(src).expect("should parse arithmetic");
+        assert_eq!(prog.processes.len(), 1);
+        // Just ensure it parses without error; deeper structure check optional
+    }
 }

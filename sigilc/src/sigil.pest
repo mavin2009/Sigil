@@ -1,5 +1,5 @@
 
-// Sigil grammar
+// Sigil grammar with basic arithmetic
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
@@ -36,7 +36,13 @@ let_stmt = { "let" ~ ident ~ "=" ~ expr }
 assign_stmt = { ident ~ ":=" ~ expr }
 expr_stmt = { expr }
 
-expr = { pipeline }
+// Expressions with basic arithmetic + pipelines
+expr = { sum }
+sum = { product ~ (sum_op ~ product)* }
+sum_op = { "+" | "-" }
+product = { pipeline ~ (product_op ~ pipeline)* }
+product_op = { "*" | "/" }
+
 pipeline = { atom ~ (pipe_tail)* }
 pipe_tail = { "~>" ~ atom ~ tag* }
 

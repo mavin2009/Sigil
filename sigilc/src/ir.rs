@@ -126,6 +126,10 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
             }
         }
         Expr::FieldAccess { .. } | Expr::Literal(_) => prev,
+        Expr::Binary { lhs, rhs, .. } => {
+            let _ = lower_expr(lhs, prev, ir);
+            lower_expr(rhs, prev, ir)
+        },
     }
 }
 
