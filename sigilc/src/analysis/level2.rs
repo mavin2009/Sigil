@@ -454,6 +454,10 @@ fn check_expr_steps(expr: &Expr, process: &str) -> Result<()> {
 /// inflates the budget of every multi-handler process and would reject
 /// programs that comfortably meet their SLO.) Within a handler the timed
 /// stages are sequential, so they add, each charged `(1 + retries) × timeout`.
+pub fn process_worst_case_ms_pub(process: &crate::frontend::ast::Process) -> u64 {
+    process_worst_case_ms(process)
+}
+
 fn process_worst_case_ms(process: &crate::frontend::ast::Process) -> u64 {
     process
         .handlers

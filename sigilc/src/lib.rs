@@ -15,4 +15,4 @@ pub use analysis::{
     run_checks, AssuranceLevel, CheckOutcome, GraphIR, Level2Report, derive_topology, Topology,
 };
 pub use diagnostics::{line_col, render as render_diagnostic};
-pub use backend::{emit, emit_cargo_toml, emit_demo_main, relative_sigil_rt_path};
+pub use backend::{to_dot, to_mermaid, emit, emit_cargo_toml, emit_demo_main, relative_sigil_rt_path};

@@ -14,7 +14,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--level 0|1|2|3|4]\n\
+            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--emit-graph] [--level 0|1|2|3|4]\n\
              \n\
              Assurance levels:\n\
              \x20 0 | sketch     exploratory; no safety checks, everything residual\n\
@@ -29,11 +29,14 @@ fn main() -> Result<()> {
     let mut input: Option<PathBuf> = None;
     let mut out = PathBuf::from("generated");
     let mut emit_main_flag = false;
+    let mut emit_graph_flag = false;
     let mut level = AssuranceLevel::default();
     let mut args_iter = args.iter().skip(1).peekable();
     while let Some(arg) = args_iter.next() {
         if arg == "--emit-main" {
             emit_main_flag = true;
+        } else if arg == "--emit-graph" {
+            emit_graph_flag = true;
         } else if let Some(v) = arg.strip_prefix("--level=") {
             level = AssuranceLevel::from_arg(v)
                 .with_context(|| format!("invalid assurance level '{v}' (expected 0-4)"))?;
@@ -117,6 +120,22 @@ fn main() -> Result<()> {
         out.join("Cargo.toml").display(),
         rt_path
     );
+
+    if emit_graph_flag {
+        // Exported from the SAME topology the provers consumed, so the
+        // picture cannot drift from the analysis.
+        match sigilc::derive_topology(&program) {
+            Ok(topo) => {
+                let mermaid = sigilc::to_mermaid(&program, &topo);
+                fs::write(out.join("topology.mmd"), &mermaid)?;
+                println!("[graph]   Wrote {}", out.join("topology.mmd").display());
+                let dot = sigilc::to_dot(&program, &topo);
+                fs::write(out.join("topology.dot"), &dot)?;
+                println!("[graph]   Wrote {}", out.join("topology.dot").display());
+            }
+            Err(e) => eprintln!("[graph]   skipped (topology not derivable): {e}"),
+        }
+    }
 
     let base_risk = residual_risk_report(
         &program,

@@ -18,6 +18,11 @@ pub struct TopologyEdge {
     pub from: String,
     pub to: String,
     pub msg_type: String,
+    /// Message name of the SOURCE handler that performs this send. An edge
+    /// is produced by one specific handler, and its routing, back-pressure
+    /// and guard are that handler's — attributing them to the process as a
+    /// whole silently mixes up multi-handler processes.
+    pub from_handler: String,
     /// Message name of the destination handler this edge dispatches to.
     /// With multi-handler processes the target is resolved BY TYPE, so
     /// codegen knows exactly which variant to construct.
@@ -233,10 +238,14 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
                 }
 
                 if !edges.iter().any(|e| {
-                    e.from == process.name && e.to == *target && e.to_handler == dest_handler.msg_name
+                    e.from == process.name
+                        && e.to == *target
+                        && e.from_handler == handler.msg_name
+                        && e.to_handler == dest_handler.msg_name
                 }) {
                     edges.push(TopologyEdge {
                         from: process.name.clone(),
+                        from_handler: handler.msg_name.clone(),
                         to: target.clone(),
                         msg_type: expected,
                         to_handler: dest_handler.msg_name.clone(),

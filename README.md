@@ -116,6 +116,9 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 | **[Language Reference](docs/LANGUAGE.md)** | complete surface syntax and semantics |
 | **[Assurance Levels](docs/ASSURANCE.md)** | what each level proves, the proof obligations, and all 25 must-fail programs |
 | **[Runtime & Generated Code](docs/RUNTIME.md)** | the actor model, topology wiring, `sigil_rt`, fault injection, tuning |
+| **[Production](docs/PRODUCTION.md)** | wiring external transforms, capacity tuning, shutdown, observability, measured performance, CI |
+| **[Residual Risk Process](docs/RESIDUAL_RISK_PROCESS.md)** | turning `RESIDUAL_RISK.md` into a review gate, with control mappings and a PR template |
+| **[Versioning & Proof Stability](docs/VERSIONING.md)** | what a proof is allowed to stop meaning, and the supply-chain story |
 
 ## Examples
 
@@ -168,9 +171,26 @@ docs/             language reference, assurance levels, runtime, rationale
 cargo test
 ```
 
-80 tests: parser, per-level checks, both provers, topology and routing,
+83 tests: parser, per-level checks, both provers, topology and routing,
 codegen shape, and end-to-end compilation of every example. Every rule has a
 program in `examples/proofs/` asserted to fail *for the right reason*.
+
+## Production readiness
+
+Honest status, because this is the question that matters:
+
+| Area | State |
+| ---- | ----- |
+| Compiler correctness | 83 unit tests, 27 must-fail programs, 3 end-to-end chaos regressions, a fuzzer, and a harness where generated demos assert their own proofs. Four real defects found and fixed this way — including one unsound proof. |
+| Residual risk process | Documented with a review gate, control mappings and a PR template |
+| Integration | Documented; generated crates are ordinary Rust with no build script |
+| Observability | Optional `tracing` spans, `ActorStats`, `--emit-graph` topology export |
+| Performance | Characterized on one component, single vCPU — shape, not a benchmark |
+| Language freeze | **Not frozen.** Pre-1.0, see [VERSIONING.md](docs/VERSIONING.md) |
+| Production case study | **None.** Nobody has run this in production. |
+
+The last row is not a formality. Everything else here is evidence from
+testing; that row is the evidence that does not yet exist.
 
 ## Status
 

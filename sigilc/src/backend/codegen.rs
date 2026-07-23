@@ -48,6 +48,11 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     out.push_str("//   - no null values\n");
     out.push_str("//   - every @timeout has an explicit @recover path\n\n");
 
+    out.push_str("// Observability is OPT-IN: build with `--features tracing` to get a\n");
+    out.push_str("// span per handler invocation. The default build pulls in no extra\n");
+    out.push_str("// dependency, because a generated crate should not force one on a\n");
+    out.push_str("// codebase that has already chosen its stack.\n");
+    out.push_str("#[cfg(feature = \"tracing\")]\nuse tracing::instrument;\n\n");
     out.push_str("use std::time::Duration;\n");
     out.push_str("use tokio::time::timeout;\n");
     out.push_str("use sigil_rt::Result;\n\n");
@@ -483,6 +488,12 @@ fn emit_handler(
     let msg_ty = rust_type(&handler.msg_ty);
     let method = format!("on_{}", handler.msg_name);
     let mut s = String::new();
+    // The span carries the process and message type, which is what an
+    // on-call engineer needs to correlate a trace with the topology graph.
+    s.push_str(&format!(
+        "    #[cfg_attr(feature = \"tracing\", instrument(skip_all, fields(msg = \"{}\")))]\n",
+        handler.msg_name
+    ));
     s.push_str(&format!(
         "    pub async fn {method}(&mut self, {}: {msg_ty}) -> Result<()> {{\n",
         handler.msg_name
@@ -1559,7 +1570,7 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
         ""
     };
     format!(
-        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
+        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\ntracing = {{ version = \"0.1\", optional = true }}\n\n[features]\ndefault = []\n# Emits a tracing span per handler invocation. Off by default so the\n# generated crate adds no dependency you did not ask for.\ntracing = [\"dep:tracing\"]\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
     )
 }
 
