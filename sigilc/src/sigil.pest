@@ -1,11 +1,11 @@
-// Sigil v1 grammar (pest)
+
+// Sigil grammar
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 
 ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-// Top level
 file = { SOI ~ (schema_def | process_def | transform_def | spec_def)* ~ EOI }
 
 schema_def = { "schema" ~ ident ~ "{" ~ fields? ~ "}" }
@@ -36,9 +36,7 @@ let_stmt = { "let" ~ ident ~ "=" ~ expr }
 assign_stmt = { ident ~ ":=" ~ expr }
 expr_stmt = { expr }
 
-// Expressions - simplified for v1 (pipeline focused)
 expr = { pipeline }
-
 pipeline = { atom ~ (pipe_tail)* }
 pipe_tail = { "~>" ~ atom ~ tag* }
 
@@ -52,10 +50,13 @@ atom = {
     if_expr
   | schema_lit
   | call
+  | field_access
   | literal
   | ident
   | "(" ~ expr ~ ")"
 }
+
+field_access = { ident ~ "." ~ ident }
 
 schema_lit = { ident ~ "{" ~ field_init ~ ("," ~ field_init)* ~ ","? ~ "}" }
 field_init = { ident ~ ":" ~ expr }
