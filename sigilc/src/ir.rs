@@ -113,8 +113,10 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
             idx
         }
         Expr::Ident(name) => {
-            // Treat as a call if it looks like a transform
-            if !["packet", "v", "d", "m", "last"].contains(&name.as_str()) {
+            // Only treat as external transform if it is not a known local / intermediate / state name
+            let locals = ["packet", "v", "d", "m", "last", "last_ok", "event", "validated",
+                          "processed", "stored", "enriched", "next", "tick", "total", "s", "y"];
+            if !locals.contains(&name.as_str()) {
                 let idx = ir.nodes.len();
                 ir.nodes.push(Node::Call { name: name.clone() });
                 ir.external_calls.push(name.clone());
