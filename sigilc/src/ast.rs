@@ -238,6 +238,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             parse_expr(inner)
         }
         Rule::sum => {
+            let span = Span::from_pest(pair.as_span());
             let mut inner = pair.into_inner();
             let mut left = parse_expr(inner.next().unwrap())?;
             while let Some(op_pair) = inner.next() {
@@ -247,11 +248,12 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                     _ => bail!("bad sum op"),
                 };
                 let right = parse_expr(inner.next().unwrap())?;
-                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span: Span { start: 0, end: 0 } };
+                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span };
             }
             Ok(left)
         }
         Rule::product => {
+            let span = Span::from_pest(pair.as_span());
             let mut inner = pair.into_inner();
             let mut left = parse_expr(inner.next().unwrap())?;
             while let Some(op_pair) = inner.next() {
@@ -261,11 +263,12 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                     _ => bail!("bad product op"),
                 };
                 let right = parse_expr(inner.next().unwrap())?;
-                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span: Span { start: 0, end: 0 } };
+                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span };
             }
             Ok(left)
         }
         Rule::pipeline => {
+            let span = Span::from_pest(pair.as_span());
             let mut inner = pair.into_inner();
             let first = inner.next().ok_or_else(|| anyhow!("empty pipeline"))?;
             let base = parse_atom(first)?;
@@ -286,7 +289,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             if steps.is_empty() {
                 Ok(base)
             } else {
-                Ok(Expr::Pipeline { base: Box::new(base), steps, span: Span { start: 0, end: 0 } })
+                Ok(Expr::Pipeline { base: Box::new(base), steps, span })
             }
         }
         _ => parse_atom(pair),
@@ -430,13 +433,13 @@ process P {
         for handler in &process.handlers {
             for stmt in &handler.body {
                 if let Stmt::Let { expr: Expr::Binary { span, .. }, .. } = stmt {
-                    // span field exists; for now we accept placeholder or real
-                    let _ = span;
+                    assert!(span.is_valid(), "Binary span should be valid (start < end)");
+                    assert!(span.end - span.start > 1, "Binary span should cover more than one character");
                     found_binary = true;
                 }
             }
         }
-        assert!(found_binary, "expected a Binary expression with span field");
+        assert!(found_binary, "expected a Binary expression with a valid span");
     }
 
     #[test]
