@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn parse_ingest_example() {
-        let src = include_str!("../../../examples/ingest.sigil");
+        let src = include_str!("../../../examples/ingest/ingest.sigil");
         let prog = parse(src).expect("should parse ingest.sigil");
         assert_eq!(prog.schemas.len(), 2);
         assert_eq!(prog.processes.len(), 1);
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn parse_counter_example() {
-        let src = include_str!("../../../examples/counter.sigil");
+        let src = include_str!("../../../examples/counter/counter.sigil");
         let prog = parse(src).expect("should parse counter");
         assert_eq!(prog.processes.len(), 1);
         assert_eq!(prog.processes[0].name, "Counter");
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn key_nodes_have_valid_spans() {
-        let src = include_str!("../../../examples/ingest.sigil");
+        let src = include_str!("../../../examples/ingest/ingest.sigil");
         let prog = parse(src).expect("parse");
         assert!(!prog.schemas.is_empty());
         assert!(prog.schemas[0].span.is_valid(), "schema should have a valid span");
@@ -487,7 +487,7 @@ process P {
 
     #[test]
     fn parse_circuit_example() {
-        let src = include_str!("../../../examples/circuit.sigil");
+        let src = include_str!("../../../examples/circuit/circuit.sigil");
         let prog = parse(src).expect("should parse circuit.sigil");
         assert_eq!(prog.processes.len(), 1);
         assert_eq!(prog.processes[0].name, "CircuitBreaker");
@@ -498,7 +498,7 @@ process P {
 
     #[test]
     fn parse_resilient_example() {
-        let src = include_str!("../../../examples/resilient.sigil");
+        let src = include_str!("../../../examples/resilient/resilient.sigil");
         let prog = parse(src).expect("should parse resilient.sigil");
         assert_eq!(prog.processes.len(), 1);
         assert_eq!(prog.processes[0].name, "ResilientProcessor");
@@ -527,7 +527,7 @@ process P {
 
     #[test]
     fn call_and_timeout_have_valid_spans() {
-        let src = include_str!("../../../examples/resilient.sigil");
+        let src = include_str!("../../../examples/resilient/resilient.sigil");
         let prog = parse(src).expect("parse resilient");
         let process = &prog.processes[0];
         let mut found_timeout = false;
@@ -574,7 +574,7 @@ process P {
 
     #[test]
     fn parse_pipeline_example() {
-        let src = include_str!("../../../examples/pipeline.sigil");
+        let src = include_str!("../../../examples/pipeline/pipeline.sigil");
         let prog = parse(src).expect("should parse pipeline.sigil");
         assert_eq!(prog.processes[0].name, "OrderPipeline");
         assert_eq!(prog.processes[0].states.len(), 2);

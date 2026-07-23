@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn accepts_matching_transform_pipeline() {
-        let src = include_str!("../../../examples/pipeline.sigil");
+        let src = include_str!("../../../examples/pipeline/pipeline.sigil");
         let prog = parse(src).expect("parse");
         assert!(check_transform_signatures(&prog).is_ok());
     }

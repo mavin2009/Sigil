@@ -79,7 +79,7 @@ mod integration {
 
     #[test]
     fn compile_ingest_example() {
-        let source = include_str!("../../examples/ingest.sigil");
+        let source = include_str!("../../examples/ingest/ingest.sigil");
         let (rust, risk, graph) = compile_source(source);
         assert!(risk.contains("Level-1"));
         assert!(graph.has_timeout());
@@ -91,7 +91,7 @@ mod integration {
 
     #[test]
     fn compile_resilient_example() {
-        let source = include_str!("../../examples/resilient.sigil");
+        let source = include_str!("../../examples/resilient/resilient.sigil");
         let (rust, risk, graph) = compile_source(source);
         assert!(graph.has_timeout());
         assert!(graph.has_recover());
@@ -113,7 +113,7 @@ mod integration {
 
     #[test]
     fn compile_circuit_example() {
-        let source = include_str!("../../examples/circuit.sigil");
+        let source = include_str!("../../examples/circuit/circuit.sigil");
         let (rust, risk, graph) = compile_source(source);
         assert!(graph.has_timeout());
         assert!(graph.has_recover());
@@ -123,7 +123,7 @@ mod integration {
 
     #[test]
     fn compile_pipeline_example() {
-        let source = include_str!("../../examples/pipeline.sigil");
+        let source = include_str!("../../examples/pipeline/pipeline.sigil");
         let (rust, risk, graph) = compile_source(source);
         assert_eq!(graph.process_name, "OrderPipeline");
         assert!(graph.has_timeout());
@@ -161,7 +161,7 @@ mod integration {
 
     #[test]
     fn compile_counter_example() {
-        let source = include_str!("../../examples/counter.sigil");
+        let source = include_str!("../../examples/counter/counter.sigil");
         let (rust, risk, graph) = compile_source(source);
         assert!(!graph.has_timeout() || graph.has_recover());
         assert!(risk.contains("Level-1"));
@@ -191,7 +191,7 @@ mod gen_project {
 
     #[test]
     fn generate_pipeline_crate_on_disk() {
-        let source = include_str!("../../examples/pipeline.sigil");
+        let source = include_str!("../../examples/pipeline/pipeline.sigil");
         let program = parse(source).expect("parse");
         let graph = lower(&program).expect("lower");
         level1_check(&graph).expect("level1");

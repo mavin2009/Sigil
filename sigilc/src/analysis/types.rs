@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn pipeline_propagates_order_and_receipt() {
-        let src = include_str!("../../../examples/pipeline.sigil");
+        let src = include_str!("../../../examples/pipeline/pipeline.sigil");
         let prog = parse(src).expect("parse");
         assert_eq!(prog.transforms.len(), 6, "expected explicit transform decls");
         let (env, transforms) = infer_program(&prog);
@@ -290,7 +290,7 @@ process P {
 
     #[test]
     fn ingest_extract_prefers_metrics() {
-        let src = include_str!("../../../examples/ingest.sigil");
+        let src = include_str!("../../../examples/ingest/ingest.sigil");
         let prog = parse(src).expect("parse");
         let (env, transforms) = infer_program(&prog);
         assert_eq!(
