@@ -104,5 +104,5 @@ External / assumed transforms:
 - Network or hardware latency beyond modeled timeouts is residual.
 
 Mitigations: runtime monitors, higher assurance levels on critical transforms, or explicit modeling of additional failure modes.
-"#, ir.process_name, ir.has_timeout, ir.has_recover, ir.local_states, calls_list)
+"#, ir.process_name, ir.has_timeout(), ir.has_recover(), ir.local_states, calls_list)
 }
