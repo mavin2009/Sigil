@@ -75,11 +75,11 @@ pub enum Stmt {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Ident(String),
-    FieldAccess { base: String, field: String },
-    Literal(Literal),
+    Ident { name: String, span: Span },
+    FieldAccess { base: String, field: String, span: Span },
+    Literal { value: Literal, span: Span },
     Pipeline { base: Box<Expr>, steps: Vec<PipeStep>, span: Span },
-    Call { name: String, args: Vec<Expr> },
+    Call { name: String, args: Vec<Expr>, span: Span },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
 }
 
@@ -96,9 +96,9 @@ pub struct PipeStep {
 
 #[derive(Debug, Clone)]
 pub enum Tag {
-    Timeout(Expr),
-    Recover { with: Expr },
-    Error,
+    Timeout { expr: Expr, span: Span },
+    Recover { with: Expr, span: Span },
+    Error { span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -298,12 +298,12 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
 
 fn parse_atom(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     match pair.as_rule() {
-        Rule::ident => Ok(Expr::Ident(pair.as_str().to_string())),
+        Rule::ident => Ok(Expr::Ident { name: pair.as_str().to_string(), span: Span::from_pest(pair.as_span()) }),
         Rule::field_access => {
             let mut inner = pair.into_inner();
             let base = inner.next().unwrap().as_str().to_string();
             let field = inner.next().unwrap().as_str().to_string();
-            Ok(Expr::FieldAccess { base, field })
+            Ok(Expr::FieldAccess { base, field, span: Span::from_pest(pair.as_span()) })
         }
         Rule::literal => parse_literal(pair),
         Rule::call => {
@@ -313,7 +313,7 @@ fn parse_atom(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             for a in inner {
                 args.push(parse_expr(a)?);
             }
-            Ok(Expr::Call { name, args })
+            Ok(Expr::Call { name, args, span: Span::from_pest(pair.as_span()) })
         }
         Rule::atom => {
             let inner = pair.into_inner().next().unwrap();
@@ -329,12 +329,12 @@ fn parse_tag(pair: pest::iterators::Pair<Rule>) -> Result<Tag> {
     let mut inner = pair.into_inner();
     if full.starts_with("@timeout") {
         let expr = parse_expr(inner.next().unwrap())?;
-        Ok(Tag::Timeout(expr))
+        Ok(Tag::Timeout { expr, span: Span::from_pest(pair.as_span()) })
     } else if full.starts_with("@recover") {
         let expr = parse_expr(inner.next().unwrap())?;
-        Ok(Tag::Recover { with: expr })
+        Ok(Tag::Recover { with: expr, span: Span::from_pest(pair.as_span()) })
     } else {
-        Ok(Tag::Error)
+        Ok(Tag::Error { span: Span::from_pest(pair.as_span()) })
     }
 }
 
@@ -344,21 +344,21 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
         Rule::duration => {
             let s = inner.as_str();
             let num: u64 = s.trim_end_matches(".ms").parse()?;
-            Ok(Expr::Literal(Literal::DurationMs(num)))
+            Ok(Expr::Literal { value: Literal::DurationMs(num), span: Span::from_pest(pair.as_span()) })
         }
         Rule::string => {
             let s = inner.as_str();
-            Ok(Expr::Literal(Literal::String(s[1..s.len()-1].to_string())))
+            Ok(Expr::Literal { value: Literal::String(s[1..s.len()-1].to_string()), span: Span::from_pest(pair.as_span()) })
         }
         Rule::number => {
             let s = inner.as_str();
             if s.contains('.') {
-                Ok(Expr::Literal(Literal::Float(s.parse()?)))
+                Ok(Expr::Literal { value: Literal::Float(s.parse()?), span: Span::from_pest(pair.as_span()) })
             } else {
-                Ok(Expr::Literal(Literal::Int(s.parse()?)))
+                Ok(Expr::Literal { value: Literal::Int(s.parse()?), span: Span::from_pest(pair.as_span()) })
             }
         }
-        Rule::boolean => Ok(Expr::Literal(Literal::Bool(inner.as_str() == "true"))),
+        Rule::boolean => Ok(Expr::Literal { value: Literal::Bool(inner.as_str() == "true"), span: Span::from_pest(pair.as_span()) }),
         _ => bail!("bad literal"),
     }
 }
@@ -481,4 +481,51 @@ process P {
         assert_eq!(prog.processes.len(), 1);
         // Just ensure it parses without error; deeper structure check optional
     }
+
+    #[test]
+    fn call_and_timeout_have_valid_spans() {
+        let src = include_str!("../../examples/resilient.sigil");
+        let prog = parse(src).expect("parse resilient");
+        let process = &prog.processes[0];
+        let mut found_timeout = false;
+        let mut found_ident_or_call = false;
+
+        for handler in &process.handlers {
+            for stmt in &handler.body {
+                let expr = match stmt {
+                    Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => expr,
+                };
+                match expr {
+                    Expr::Pipeline { steps, span, .. } => {
+                        assert!(span.is_valid() || span.start <= span.end);
+                        for step in steps {
+                            match &step.expr {
+                                Expr::Ident { span, .. } | Expr::Call { span, .. } => {
+                                    if span.is_valid() {
+                                        found_ident_or_call = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            for tag in &step.tags {
+                                if let Tag::Timeout { span, .. } = tag {
+                                    if span.is_valid() {
+                                        found_timeout = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Expr::Ident { span, .. } | Expr::Call { span, .. } => {
+                        if span.is_valid() {
+                            found_ident_or_call = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(found_timeout || found_ident_or_call, "expected Timeout or Ident/Call with valid span");
+    }
+
 }

@@ -101,7 +101,7 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
             }
             current
         }
-        Expr::Call { name, args: _ } => {
+        Expr::Call { name, args: _, .. } => {
             let idx = ir.nodes.len();
             ir.nodes.push(Node::Call { name: name.clone() });
             ir.external_calls.push(name.clone());
@@ -112,7 +112,7 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
             });
             idx
         }
-        Expr::Ident(name) => {
+        Expr::Ident { name, .. } => {
             // Only treat as external transform if it is not a known local / intermediate / state name
             let locals = ["packet", "v", "d", "m", "last", "last_ok", "event", "validated",
                           "processed", "stored", "enriched", "next", "tick", "total", "s", "y"];
@@ -130,7 +130,7 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
                 prev
             }
         }
-        Expr::FieldAccess { .. } | Expr::Literal(_) => prev,
+        Expr::FieldAccess { .. } | Expr::Literal { .. } => prev,
         Expr::Binary { lhs, rhs, .. } => {
             let _ = lower_expr(lhs, prev, ir);
             lower_expr(rhs, prev, ir)
@@ -142,9 +142,9 @@ fn lower_pipe_step(step: &crate::ast::PipeStep, prev: usize, ir: &mut GraphIR) -
     let mut current = lower_expr(&step.expr, prev, ir);
     for tag in &step.tags {
         match tag {
-            Tag::Timeout(expr) => {
+            Tag::Timeout { expr, .. } => {
                 let ms = match expr {
-                    Expr::Literal(Literal::DurationMs(m)) => *m,
+                    Expr::Literal { value: Literal::DurationMs(m), .. } => *m,
                     _ => 0,
                 };
                 let idx = ir.nodes.len();
@@ -156,9 +156,9 @@ fn lower_pipe_step(step: &crate::ast::PipeStep, prev: usize, ir: &mut GraphIR) -
                 });
                 current = idx;
             }
-            Tag::Recover { with } => {
+            Tag::Recover { with, .. } => {
                 let fallback = match with {
-                    Expr::Ident(s) => s.clone(),
+                    Expr::Ident { name: s, .. } => s.clone(),
                     _ => "fallback".into(),
                 };
                 let idx = ir.nodes.len();
@@ -170,7 +170,7 @@ fn lower_pipe_step(step: &crate::ast::PipeStep, prev: usize, ir: &mut GraphIR) -
                 });
                 current = idx;
             }
-            Tag::Error => {
+            Tag::Error { .. } => {
                 // mark error effect on the previous edge if possible
             }
         }
