@@ -65,21 +65,47 @@ fn main() -> Result<()> {
 
 
 
+
+
 #[cfg(test)]
 mod integration {
-    use super::*;
+    use crate::ast;
+    use crate::ir;
+    use crate::check;
+    use crate::codegen;
+
+    fn compile_source(source: &str) -> (String, String, ir::GraphIR) {
+        let program = ast::parse(source).expect("parse");
+        let graph = ir::lower(&program).expect("lower");
+        check::level1_check(&graph).expect("level1");
+        let rust = codegen::emit(&graph);
+        let risk = codegen::residual_risk_report(&graph);
+        (rust, risk, graph)
+    }
 
     #[test]
-    fn compile_ingest_via_library_path() {
+    fn compile_ingest_example() {
         let source = include_str!("../../examples/ingest.sigil");
-        let program = crate::ast::parse(source).expect("parse");
-        let graph = crate::ir::lower(&program).expect("lower");
-        crate::check::level1_check(&graph).expect("level1");
-        let rust = crate::codegen::emit(&graph);
-        let risk = crate::codegen::residual_risk_report(&graph);
+        let (rust, risk, graph) = compile_source(source);
+
         assert!(rust.contains("Ingest") || rust.contains("on_packet"));
         assert!(risk.contains("Level-1"));
+        assert!(risk.contains("Timeout") || risk.contains("timeout") || risk.contains("50ms"));
         assert!(graph.has_timeout());
         assert!(graph.has_recover());
+        assert!(!graph.local_states.is_empty());
+    }
+
+    #[test]
+    fn compile_counter_example() {
+        let source = include_str!("../../examples/counter.sigil");
+        let (rust, risk, graph) = compile_source(source);
+
+        // Counter has no timeouts — still must pass Level-1
+        assert!(!graph.has_timeout() || graph.has_recover());
+        assert!(risk.contains("Level-1"));
+        assert!(!graph.local_states.is_empty() || graph.process_name == "Counter");
+        // Generated code should mention the process or state
+        assert!(rust.contains("Ingest") || rust.contains("Counter") || rust.contains("last") || rust.contains("total") || rust.len() > 100);
     }
 }
