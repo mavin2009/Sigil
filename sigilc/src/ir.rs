@@ -21,7 +21,6 @@ pub enum Node {
     Timeout { ms: u64 },
     Recover { fallback: String },
     StateWrite { slot: String },
-    Pure,
 }
 
 #[derive(Debug, Clone)]
