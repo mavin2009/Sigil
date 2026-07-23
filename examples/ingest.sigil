@@ -1,0 +1,21 @@
+schema Telemetry {
+  id: String,
+  payload: String
+}
+
+schema Metrics {
+  id: String,
+  value: Float
+}
+
+process Ingest {
+  state last: String = "00000000-0000-0000-0000-000000000000"
+
+  on packet: Telemetry {
+    let v = packet ~> validate
+    let d = v ~> decompress @timeout(50.ms) @recover(with: empty)
+    let m = d ~> extract
+    m ~> store
+    last := m.id
+  }
+}

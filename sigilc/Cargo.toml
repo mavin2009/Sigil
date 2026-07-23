@@ -1,0 +1,18 @@
+[package]
+name = "sigilc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Compiler for the Sigil language — fault-tolerant systems by construction"
+license.workspace = true
+
+[[bin]]
+name = "sigilc"
+path = "src/main.rs"
+
+[dependencies]
+pest = "2.7"
+pest_derive = "2.7"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"

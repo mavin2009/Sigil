@@ -1,0 +1,71 @@
+// Sigil v1 grammar (pest)
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+
+ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Top level
+file = { SOI ~ (schema_def | process_def | transform_def | spec_def)* ~ EOI }
+
+schema_def = { "schema" ~ ident ~ "{" ~ fields? ~ "}" }
+fields = { field ~ ("," ~ field)* ~ ","? }
+field = { ident ~ ":" ~ type_ }
+
+type_ = { "Int" | "Float" | "String" | "Bool" | "UUID" | "Bytes" | "Duration" | ident }
+
+process_def = { "process" ~ ident ~ "{" ~ process_body ~ "}" }
+process_body = { (state_decl | on_handler)* }
+
+state_decl = { "state" ~ ident ~ ":" ~ type_ ~ "=" ~ expr }
+on_handler = { "on" ~ ident ~ ":" ~ type_ ~ "{" ~ stmt* ~ "}" }
+
+transform_def = { 
+    "transform" ~ ident ~ "(" ~ ident ~ ":" ~ type_ ~ ")" ~ "->" ~ type_ 
+    ~ "{" ~ stmt* ~ "}" 
+}
+
+spec_def = { "spec" ~ ident ~ "{" ~ spec_item* ~ "}" }
+spec_item = { extinct_clause | require_clause | hold_clause }
+extinct_clause = { "extinct" ~ "[" ~ ident ~ ("," ~ ident)* ~ "]" }
+require_clause = { "require" ~ expr }
+hold_clause = { "hold" ~ expr }
+
+stmt = { let_stmt | assign_stmt | expr_stmt }
+let_stmt = { "let" ~ ident ~ "=" ~ expr }
+assign_stmt = { ident ~ ":=" ~ expr }
+expr_stmt = { expr }
+
+// Expressions - simplified for v1 (pipeline focused)
+expr = { pipeline }
+
+pipeline = { atom ~ (pipe_tail)* }
+pipe_tail = { "~>" ~ atom ~ tag* }
+
+tag = { 
+    "@timeout" ~ "(" ~ expr ~ ")" 
+  | "@recover" ~ "(" ~ "with" ~ ":" ~ expr ~ ")" 
+  | "@error" 
+}
+
+atom = { 
+    if_expr
+  | schema_lit
+  | call
+  | literal
+  | ident
+  | "(" ~ expr ~ ")"
+}
+
+schema_lit = { ident ~ "{" ~ field_init ~ ("," ~ field_init)* ~ ","? ~ "}" }
+field_init = { ident ~ ":" ~ expr }
+
+call = { ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+
+if_expr = { "if" ~ expr ~ "{" ~ expr ~ "}" ~ "else" ~ "{" ~ expr ~ "}" }
+
+literal = { duration | string | number | boolean }
+duration = @{ ASCII_DIGIT+ ~ ".ms" }
+string = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+boolean = { "true" | "false" }
