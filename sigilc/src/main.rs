@@ -1,13 +1,11 @@
-
-//! Sigilc — compiler for the Sigil language.
-//! Parses Sigil, lowers to Graph IR, runs Level-1 checks, emits ownership-safe Rust.
+//! Sigilc CLI — compile a .sigil file to an ownership-safe Rust crate.
 
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use sigilc::{parse, lower, level1_check, emit, residual_risk_report};
+use sigilc::{emit, emit_cargo_toml, level1_check, lower, parse, residual_risk_report};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -39,41 +37,35 @@ fn main() -> Result<()> {
     level1_check(&graph).context("Level-1 checks")?;
     println!("Level-1 checks passed.");
 
-    fs::create_dir_all(&out)?;
-    let rust = emit(&program, &graph);
-    let risk = residual_risk_report(&graph);
+    fs::create_dir_all(out.join("src"))?;
 
-    let rust_path = out.join("src").join("lib.rs");
-    fs::create_dir_all(rust_path.parent().unwrap())?;
+    let rust = emit(&program, &graph);
+    let rust_path = out.join("src/lib.rs");
     fs::write(&rust_path, &rust)?;
     println!("[codegen] Wrote {}", rust_path.display());
 
+    let pkg_name = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("sigil_out")
+        .replace('-', "_");
+    fs::write(out.join("Cargo.toml"), emit_cargo_toml(&pkg_name))?;
+    println!("[codegen] Wrote {}", out.join("Cargo.toml").display());
+
+    let risk = residual_risk_report(&graph);
     let risk_path = out.join("RESIDUAL_RISK.md");
     fs::write(&risk_path, &risk)?;
     println!("[risk]    Wrote {}", risk_path.display());
 
-    // Minimal Cargo.toml for the generated crate
-    let cargo_toml = format!(
-        r#"[package]
-name = "sigil_generated"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tokio = {{ version = "1", features = ["time", "rt", "macros"] }}
-"#
-    );
-    fs::write(out.join("Cargo.toml"), cargo_toml)?;
-
-    println!("Generated project is ready in {}", out.display());
+    println!("Generated crate is ready in {}", out.display());
     Ok(())
 }
 
 #[cfg(test)]
 mod integration {
-    use sigilc::{parse, lower, level1_check, emit, residual_risk_report};
+    use sigilc::{emit, level1_check, lower, parse, residual_risk_report, GraphIR};
 
-    fn compile_source(source: &str) -> (String, String, sigilc::GraphIR) {
+    fn compile_source(source: &str) -> (String, String, GraphIR) {
         let program = parse(source).expect("parse");
         let graph = lower(&program).expect("lower");
         level1_check(&graph).expect("level1");
@@ -87,8 +79,11 @@ mod integration {
         let source = include_str!("../../examples/ingest.sigil");
         let (rust, risk, graph) = compile_source(source);
         assert!(risk.contains("Level-1"));
-        assert!(graph.has_timeout() || !graph.has_timeout());
-        assert!(rust.len() > 50);
+        assert!(graph.has_timeout());
+        assert!(graph.has_recover());
+        assert!(rust.contains("pub struct Ingest"));
+        assert!(rust.contains("on_packet"));
+        assert!(rust.contains("from_millis(50)") || rust.contains("50"));
     }
 
     #[test]
@@ -98,7 +93,9 @@ mod integration {
         assert!(graph.has_timeout());
         assert!(graph.has_recover());
         assert!(risk.contains("Level-1"));
-        assert!(rust.len() > 50);
+        assert!(rust.contains("ResilientProcessor"));
+        assert!(rust.contains("on_event"));
+        assert!(rust.contains("from_millis(80)") || rust.contains("80"));
     }
 
     #[test]
@@ -108,6 +105,35 @@ mod integration {
         assert!(graph.has_timeout());
         assert!(graph.has_recover());
         assert!(risk.contains("Level-1"));
-        assert!(rust.len() > 50);
+        assert!(rust.contains("CircuitBreaker"));
+    }
+
+    #[test]
+    fn compile_pipeline_example() {
+        let source = include_str!("../../examples/pipeline.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert_eq!(graph.process_name, "OrderPipeline");
+        assert!(graph.has_timeout());
+        assert!(graph.has_recover());
+        assert!(risk.contains("Level-1"));
+        assert!(rust.contains("pub struct OrderPipeline"));
+        assert!(rust.contains("on_order"));
+        // Dual timed stages
+        assert!(rust.contains("from_millis(120)"));
+        assert!(rust.contains("from_millis(200)"));
+        assert!(rust.contains("reserve") && rust.contains("charge"));
+        // Schema-typed external stubs
+        assert!(rust.contains("fn authorize(input: Order)"));
+        assert!(rust.contains("pub total_charged"));
+        assert!(rust.contains("Process: OrderPipeline"));
+    }
+
+    #[test]
+    fn compile_counter_example() {
+        let source = include_str!("../../examples/counter.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert!(!graph.has_timeout() || graph.has_recover());
+        assert!(risk.contains("Level-1"));
+        assert!(rust.contains("Counter") || rust.contains("total"));
     }
 }

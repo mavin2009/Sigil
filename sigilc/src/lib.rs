@@ -1,4 +1,3 @@
-
 //! Sigilc — compiler library for the Sigil language.
 //!
 //! Pipeline: parse → lower → level1_check → residual_risk_report → emit
@@ -9,4 +8,4 @@ pub mod backend;
 
 pub use frontend::{parse, Program, Span};
 pub use analysis::{lower, level1_check, residual_risk_report, GraphIR};
-pub use backend::emit;
+pub use backend::{emit, emit_cargo_toml};
