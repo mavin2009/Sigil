@@ -145,10 +145,22 @@ pub fn residual_risk_report(
          - No safety properties below are verified; treat all as residual risk"
     };
 
+    let topology_section = match crate::analysis::topology::derive_topology(program) {
+        Ok(t) if t.is_pipeline() => {
+            let mut lines = vec!["## Process Topology (verified)".to_string()];
+            for e in &t.edges {
+                lines.push(format!("- `{}` → `{}` carrying `{}` (typed, acyclic, bounded channel)", e.from, e.to, e.msg_type));
+            }
+            lines.push("- Residual: channel capacity/backpressure tuning is a runtime concern".into());
+            lines.join("\n") + "\n\n"
+        }
+        _ => String::new(),
+    };
+
     format!(
         r#"# Residual Risk Report
 
-{l1_section}
+{topology_section}{l1_section}
 
 ## Analysis Summary
 - Process: `{process}`

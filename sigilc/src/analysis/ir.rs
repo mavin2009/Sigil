@@ -22,6 +22,8 @@ pub enum Node {
     Timeout { ms: u64, span: Option<crate::frontend::ast::Span> },
     Recover { fallback: String, span: Option<crate::frontend::ast::Span> },
     StateWrite { slot: String },
+    /// Typed message to another process's actor.
+    Send { target: String },
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,17 @@ pub fn lower(program: &Program) -> Result<GraphIR> {
                 match stmt {
                     Stmt::Let { name: _, expr, .. } | Stmt::Expr { expr, .. } => {
                         prev = lower_expr(expr, prev, &mut ir);
+                    }
+                    Stmt::Send { target, expr, .. } => {
+                        let expr_idx = lower_expr(expr, prev, &mut ir);
+                        let send_idx = ir.nodes.len();
+                        ir.nodes.push(Node::Send { target: target.clone() });
+                        ir.edges.push(Edge {
+                            from: expr_idx,
+                            to: send_idx,
+                            effects: EffectSet::default(),
+                        });
+                        prev = send_idx;
                     }
                     Stmt::Assign { name, expr, .. } => {
                         let expr_idx = lower_expr(expr, prev, &mut ir);

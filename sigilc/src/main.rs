@@ -290,6 +290,7 @@ mod integration {
             include_str!("../../examples/level2/slo_and_hold.sigil"),
             include_str!("../../examples/runnable/counter/counter.sigil"),
             include_str!("../../examples/concurrent/ledger/ledger.sigil"),
+            include_str!("../../examples/concurrent/orderflow/orderflow.sigil"),
         ];
         for (i, src) in files.iter().enumerate() {
             let (rust, risk, _) = compile_source(src);
@@ -318,6 +319,31 @@ mod integration {
         // Untimed @recover emits a match on the stage result with a recovery note.
         assert!(rust.contains("note_recovery(\"validate\")"), "untimed recover path missing");
         assert!(rust.contains("note_recovery(\"post\")"));
+    }
+
+    /// Multi-process topology: compiler wires outboxes, types the edges,
+    /// and the generated demo stages the shutdown.
+    #[test]
+    fn topology_codegen_wires_stages() {
+        let src = include_str!("../../examples/concurrent/orderflow/orderflow.sigil");
+        let (rust, risk, _) = compile_source(src);
+        // Outboxes + wiring
+        assert!(rust.contains("risk_out: Option<RiskHandle>"));
+        assert!(rust.contains("settlement_out: Option<SettlementHandle>"));
+        assert!(rust.contains("pub fn connect_risk"));
+        // Cascade shutdown: outboxes released when the actor drains
+        assert!(rust.contains("self.risk_out = None"));
+        assert!(rust.contains("self.settlement_out = None"));
+        // Still lock-free
+        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        // Residual report knows the verified topology
+        assert!(risk.contains("`Gateway` → `Risk`"), "topology missing from residual report");
+
+        let program = parse(src).unwrap();
+        let main_rs = sigilc::emit_demo_main(&program);
+        assert!(main_rs.contains("inst.connect_risk"));
+        assert!(main_rs.contains("inst.connect_settlement"));
+        assert!(main_rs.contains("entry-stage message conservation"));
     }
 
     /// Every process must compile to a shared-nothing actor: state moves into

@@ -111,6 +111,9 @@ fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
             Stmt::Assign { .. } => {
                 body_src.push_str("    /* unsupported assign in transform */\n");
             }
+            Stmt::Send { .. } => {
+                body_src.push_str("    /* send is only legal in process handlers */\n");
+            }
         }
     }
     if !body_src.contains("return Ok") {
@@ -142,14 +145,41 @@ fn emit_schema(schema: &Schema) -> String {
     s
 }
 
+
+/// Processes this process sends to, in declaration order (deduped).
+fn process_send_targets(process: &Process) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    for handler in &process.handlers {
+        for stmt in &handler.body {
+            if let Stmt::Send { target, .. } = stmt {
+                if !targets.contains(target) {
+                    targets.push(target.clone());
+                }
+            }
+        }
+    }
+    targets
+}
+
 fn emit_process(process: &Process) -> String {
     let states: Vec<String> = process.states.iter().map(|s| s.name.clone()).collect();
     let mut s = String::new();
 
+    let targets = process_send_targets(process);
     s.push_str(&format!("pub struct {} {{\n", process.name));
     for st in &process.states {
         // Public so integration tests / callers can observe local state.
         s.push_str(&format!("    pub {}: {},\n", st.name, rust_type(&st.ty)));
+    }
+    for t in &targets {
+        s.push_str(&format!(
+            "    /// Outbox to the {t} actor. Wire with connect_{}() before spawn.\n",
+            t.to_lowercase()
+        ));
+        s.push_str(&format!(
+            "    pub {}_out: Option<{t}Handle>,\n",
+            t.to_lowercase()
+        ));
     }
     s.push_str("}\n\n");
 
@@ -162,7 +192,17 @@ fn emit_process(process: &Process) -> String {
             emit_expr(&st.init, &[], "")
         ));
     }
+    for t in &targets {
+        s.push_str(&format!("            {}_out: None,\n", t.to_lowercase()));
+    }
     s.push_str("        }\n    }\n\n");
+    for t in &targets {
+        s.push_str(&format!(
+            "    pub fn connect_{}(&mut self, h: {t}Handle) {{\n        self.{}_out = Some(h);\n    }}\n\n",
+            t.to_lowercase(),
+            t.to_lowercase()
+        ));
+    }
 
     for handler in &process.handlers {
         s.push_str(&emit_handler(handler, &states));
@@ -189,6 +229,10 @@ fn emit_actor(process: &Process) -> String {
     let p = &process.name;
     let mut s = String::new();
 
+    let drop_outboxes: String = process_send_targets(process)
+        .iter()
+        .map(|t| format!("            self.{}_out = None; // release downstream channel\n", t.to_lowercase()))
+        .collect();
     if process.handlers.len() == 1 {
         let h = &process.handlers[0];
         let msg_ty = rust_type(&h.msg_ty);
@@ -222,6 +266,7 @@ fn emit_actor(process: &Process) -> String {
              \x20                   Err(_) => stats.dropped += 1, // residual stage failed with no recover path\n\
              \x20               }}\n\
              \x20           }}\n\
+{drop_outboxes}\
              \x20           (self, stats)\n\
              \x20       }});\n\
              \x20       ({p}Handle {{ tx }}, join)\n\
@@ -267,7 +312,7 @@ fn emit_actor(process: &Process) -> String {
         ));
     }
     s.push_str(&format!(
-        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n            (self, stats)\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
+        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n{drop_outboxes}            (self, stats)\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
     ));
     s
 }
@@ -314,6 +359,16 @@ fn emit_stmt(stmt: &Stmt, indent: &str, states: &[String], msg: &str) -> String 
         Stmt::Assign { name, expr, .. } => {
             format!(
                 "{indent}self.{name} = {};\n",
+                emit_expr(expr, states, msg)
+            )
+        }
+        Stmt::Send { target, expr, .. } => {
+            let target_lc = target.to_lowercase();
+            format!(
+                "{indent}match &self.{target_lc}_out {{\n\
+                 {indent}    Some(out) => out.send({}).await?,\n\
+                 {indent}    None => return Err(sigil_rt::SigilError::Transform(\"outbox to {target} not connected\".into())),\n\
+                 {indent}}}\n",
                 emit_expr(expr, states, msg)
             )
         }
@@ -517,7 +572,9 @@ fn collect_externals(program: &Program) -> BTreeSet<String> {
                         walk_externals(expr, &mut set);
                         locals.insert(name.clone());
                     }
-                    Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                    Stmt::Assign { expr, .. }
+                    | Stmt::Send { expr, .. }
+                    | Stmt::Expr { expr, .. } => {
                         walk_externals(expr, &mut set);
                     }
                 }
@@ -587,6 +644,136 @@ fn emit_smoke_test(program: &Program) -> String {
     s
 }
 
+
+/// Multi-stage demo: spawn each process as a shard fleet in reverse
+/// topological order, wire outboxes, feed the entry stage from concurrent
+/// producers, then shut down stage by stage and print per-stage accounting.
+fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topology) -> String {
+    use std::fmt::Write as _;
+    let entry_name = topo
+        .order
+        .first()
+        .cloned()
+        .unwrap_or_else(|| program.processes[0].name.clone());
+    let entry = program
+        .processes
+        .iter()
+        .find(|p| p.name == entry_name)
+        .expect("entry process exists");
+    let entry_handler = entry.handlers.first().expect("entry handler");
+    let msg_ty = rust_type(&entry_handler.msg_ty);
+
+    // Message field synthesis (same policy as the fleet demo).
+    let mut field_init = String::new();
+    if let Type::Named(name) = &entry_handler.msg_ty {
+        if let Some(schema) = program.schemas.iter().find(|sc| sc.name == *name) {
+            for (fname, fty) in &schema.fields {
+                match fty {
+                    Type::Int => { let _ = writeln!(field_init, "                msg.{fname} = 1;"); }
+                    Type::Float => { let _ = writeln!(field_init, "                msg.{fname} = 1.0;"); }
+                    Type::String => { let _ = writeln!(field_init, "                msg.{fname} = format!(\"m-{{prod}}-{{i}}\");"); }
+                    Type::Bool => { let _ = writeln!(field_init, "                msg.{fname} = true;"); }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let edge_list = topo
+        .edges
+        .iter()
+        .map(|e| format!("{} -> {} [{}]", e.from, e.to, e.msg_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = String::new();
+    let _ = write!(out, "// AUTO-GENERATED by sigilc — multi-stage topology demo\n");
+    let _ = write!(out, "//\n// Topology: {edge_list}\n");
+    let _ = write!(out, "// Each stage is a fleet of shared-nothing actors; the compiler wired the\n");
+    let _ = write!(out, "// outboxes, verified message types along every edge, proved the graph\n");
+    let _ = write!(out, "// acyclic, and staged the shutdown so no message is ever lost in a closed\n// channel. No locks anywhere.\n\n");
+    out.push_str("use sigil_gen::*;\nuse std::time::Instant;\n\n");
+    out.push_str("#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() {\n");
+    out.push_str("    fn env_usize(key: &str, default: usize) -> usize {\n        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)\n    }\n");
+    out.push_str("    let shards: usize = env_usize(\"SIGIL_DEMO_SHARDS\", 8);\n");
+    out.push_str("    let producers: usize = env_usize(\"SIGIL_DEMO_PRODUCERS\", 64);\n");
+    out.push_str("    let msgs_per_producer: usize = env_usize(\"SIGIL_DEMO_MSGS\", 250);\n");
+    out.push_str("    let total = producers * msgs_per_producer;\n\n");
+
+    // Spawn sinks first so upstream stages can be wired to live handles.
+    for pname in topo.order.iter().rev() {
+        let lc = pname.to_lowercase();
+        let _ = write!(out, "    // stage: {pname}\n");
+        let _ = write!(out, "    let mut {lc}_handles = Vec::new();\n    let mut {lc}_joins = Vec::new();\n");
+        let _ = write!(out, "    for _i in 0..shards {{\n");
+        let targets = topo.targets_of(pname);
+        if targets.is_empty() {
+            let _ = write!(out, "        let inst = {pname}::new();\n");
+        } else {
+            let _ = write!(out, "        let mut inst = {pname}::new();\n");
+            for e in &targets {
+                let tlc = e.to.to_lowercase();
+                let _ = write!(
+                    out,
+                    "        inst.connect_{tlc}({tlc}_handles[_i % {tlc}_handles.len()].clone());\n"
+                );
+            }
+        }
+        let _ = write!(out, "        let (h, j) = inst.spawn(1024);\n        {lc}_handles.push(h);\n        {lc}_joins.push(j);\n    }}\n\n");
+    }
+
+    let entry_lc = entry_name.to_lowercase();
+    let _ = write!(out, "    let t0 = Instant::now();\n");
+    let _ = write!(out, "    let mut producer_tasks = Vec::new();\n");
+    let _ = write!(out, "    for prod in 0..producers {{\n        let hs = {entry_lc}_handles.clone();\n        producer_tasks.push(tokio::spawn(async move {{\n            for i in 0..msgs_per_producer {{\n                let mut msg = {msg_ty}::default();\n{field_init}                let shard = (prod + i) % hs.len();\n                if hs[shard].send(msg).await.is_err() {{\n                    break;\n                }}\n            }}\n        }}));\n    }}\n    for t in producer_tasks {{\n        let _ = t.await;\n    }}\n\n");
+
+    let _ = write!(out, "    println!(\"=== topology demo: {edge_list} ===\");\n");
+    out.push_str("    println!(\"{} shards/stage, {} producers, {} messages, {} worker threads\", shards, producers, total, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));\n");
+
+    // Shut down and report stage by stage in topological order.
+    for pname in &topo.order {
+        let lc = pname.to_lowercase();
+        let process = program.processes.iter().find(|p| &p.name == pname).unwrap();
+        let mut shard_fmt = String::new();
+        let mut shard_args = String::new();
+        let mut agg_decl = String::new();
+        let mut agg_add = String::new();
+        let mut agg_print = String::new();
+        for st in &process.states {
+            match st.ty {
+                Type::Int => {
+                    let _ = write!(agg_decl, "    let mut {lc}_agg_{}: i64 = 0;\n", st.name);
+                    let _ = write!(agg_add, "        {lc}_agg_{} += st.{};\n", st.name, st.name);
+                    let _ = write!(agg_print, "    println!(\"[{pname}] aggregate {} = {{}}\", {lc}_agg_{});\n", st.name, st.name);
+                    let _ = write!(shard_fmt, " {}={{}}", st.name);
+                    let _ = write!(shard_args, ", st.{}", st.name);
+                }
+                Type::Float => {
+                    let _ = write!(agg_decl, "    let mut {lc}_agg_{}: f64 = 0.0;\n", st.name);
+                    let _ = write!(agg_add, "        {lc}_agg_{} += st.{};\n", st.name, st.name);
+                    let _ = write!(agg_print, "    println!(\"[{pname}] aggregate {} = {{:.1}}\", {lc}_agg_{});\n", st.name, st.name);
+                    let _ = write!(shard_fmt, " {}={{:.1}}", st.name);
+                    let _ = write!(shard_args, ", st.{}", st.name);
+                }
+                _ => {}
+            }
+        }
+        let _ = write!(out, "\n    // ---- stage shutdown: {pname} ----\n");
+        let _ = write!(out, "    drop({lc}_handles);\n");
+        let _ = write!(out, "{agg_decl}");
+        let _ = write!(out, "    let mut {lc}_handled: u64 = 0;\n    let mut {lc}_dropped: u64 = 0;\n");
+        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = j.await.expect(\"actor task panicked\");\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n    }}\n");
+        let _ = write!(out, "{agg_print}");
+        let _ = write!(out, "    println!(\"[{pname}] handled + dropped = {{}} + {{}} = {{}}\", {lc}_handled, {lc}_dropped, {lc}_handled + {lc}_dropped);\n");
+    }
+
+    let _ = write!(out, "\n    assert_eq!({entry_lc}_handled + {entry_lc}_dropped, total as u64, \"entry-stage message conservation violated\");\n");
+    let _ = write!(out, "    println!(\"expected messages   = {{total}}\");\n");
+    let _ = write!(out, "    println!(\"elapsed = {{:?}} (locks used: 0)\", t0.elapsed());\n");
+    let _ = write!(out, "    println!(\"{{}}\", sigil_rt::chaos::report());\n}}\n");
+    out
+}
+
 pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool) -> String {
     let bin_section = if with_main {
         "\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n"
@@ -605,6 +792,11 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
 pub fn emit_demo_main(program: &Program) -> String {
     if program.processes.is_empty() {
         return "fn main() {\n    println!(\"no process\");\n}\n".into();
+    }
+    if let Ok(topo) = crate::analysis::topology::derive_topology(program) {
+        if topo.is_pipeline() {
+            return emit_topology_main(program, &topo);
+        }
     }
     let process = &program.processes[0];
     let p = &process.name;

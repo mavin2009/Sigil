@@ -83,6 +83,17 @@ pub fn check_transform_signatures(program: &Program) -> Result<()> {
 
             for stmt in &handler.body {
                 match stmt {
+                    Stmt::Send { expr, span, .. } => {
+                        check_expr_signatures(
+                            expr,
+                            &local_env,
+                            &declared,
+                            &process.name,
+                            span.start,
+                            span.end,
+                        )?;
+                        continue;
+                    }
                     Stmt::Let { name, expr, span } => {
                         check_expr_signatures(
                             expr,
@@ -359,7 +370,10 @@ pub fn check_failure_paths(program: &Program) -> Result<()> {
         for handler in &process.handlers {
             for stmt in &handler.body {
                 let expr = match stmt {
-                    Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => expr,
+                    Stmt::Let { expr, .. }
+                    | Stmt::Assign { expr, .. }
+                    | Stmt::Send { expr, .. }
+                    | Stmt::Expr { expr, .. } => expr,
                 };
                 walk_failure_paths(expr, &pure, &process.name, &mut fallible_fallbacks)?;
             }

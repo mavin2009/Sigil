@@ -101,12 +101,12 @@ fn discharge_hold(
         }
     };
 
-    let process = match program.processes.first() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
-    let state_decl = process.states.iter().find(|s| s.name == state_name);
+    // A hold may target state in ANY process (multi-process topologies).
+    let owner = program
+        .processes
+        .iter()
+        .find(|p| p.states.iter().any(|s| s.name == state_name));
+    let state_decl = owner.and_then(|p| p.states.iter().find(|s| s.name == state_name));
     let state_decl = match state_decl {
         Some(s) => s,
         None => {
@@ -154,13 +154,14 @@ fn discharge_hold(
     // All assignments to state must be pure
     let mut pure_ok = true;
     let mut uses_msg_fields = false;
-    for handler in &process.handlers {
+    let owner = owner.expect("state owner exists when state_decl matched");
+    for handler in &owner.handlers {
         for stmt in &handler.body {
             if let Stmt::Assign { name, expr: rhs, .. } = stmt {
-                if name != &state_name {
+                if *name != state_name {
                     continue;
                 }
-                match classify_rhs(rhs, pure_transforms, &process.states) {
+                match classify_rhs(rhs, pure_transforms, &owner.states) {
                     RhsKind::Pure => {}
                     RhsKind::PureWithMsgFields => uses_msg_fields = true,
                     RhsKind::Impure => pure_ok = false,
@@ -350,7 +351,10 @@ fn check_per_step_recovery(program: &Program) -> Result<()> {
         for handler in &process.handlers {
             for stmt in &handler.body {
                 let expr = match stmt {
-                    Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                    Stmt::Let { expr, .. }
+                    | Stmt::Assign { expr, .. }
+                    | Stmt::Send { expr, .. }
+                    | Stmt::Expr { expr, .. } => {
                         expr
                     }
                 };

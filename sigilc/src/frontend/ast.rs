@@ -96,6 +96,8 @@ pub struct OnHandler {
 pub enum Stmt {
     Let { name: String, expr: Expr, span: Span },
     Assign { name: String, expr: Expr, span: Span },
+    /// `send <expr> to <Process>` — typed message to another process's actor.
+    Send { target: String, expr: Expr, span: Span },
     Expr { expr: Expr, span: Span },
 }
 
@@ -312,6 +314,12 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
             let name = inner.next().unwrap().as_str().to_string();
             let expr = parse_expr(inner.next().unwrap())?;
             Ok(Stmt::Assign { name, expr, span })
+        }
+        Rule::send_stmt => {
+            let mut inner = pair.into_inner();
+            let expr = parse_expr(inner.next().unwrap())?;
+            let target = inner.next().unwrap().as_str().to_string();
+            Ok(Stmt::Send { target, expr, span })
         }
         Rule::expr_stmt => {
             let inner = pair.into_inner().next().unwrap();
@@ -621,7 +629,10 @@ process P {
         for handler in &process.handlers {
             for stmt in &handler.body {
                 let expr = match stmt {
-                    Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => expr,
+                    Stmt::Let { expr, .. }
+                    | Stmt::Assign { expr, .. }
+                    | Stmt::Send { expr, .. }
+                    | Stmt::Expr { expr, .. } => expr,
                 };
                 match expr {
                     Expr::Pipeline { steps, span, .. } => {

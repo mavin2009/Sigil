@@ -77,6 +77,9 @@ fn infer_process(
 
         for stmt in &handler.body {
             match stmt {
+                Stmt::Send { expr, .. } => {
+                    let _ = infer_expr_type(expr, env, &msg_ty, schema_fields, None, transforms);
+                }
                 Stmt::Let { name, expr, .. } => {
                     let out_ty = infer_expr_type(
                         expr,
@@ -98,7 +101,10 @@ fn infer_process(
 
 fn collect_field_uses(stmt: &Stmt, uses: &mut BTreeMap<String, BTreeSet<String>>) {
     let expr = match stmt {
-        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => expr,
+        Stmt::Let { expr, .. }
+        | Stmt::Assign { expr, .. }
+        | Stmt::Send { expr, .. }
+        | Stmt::Expr { expr, .. } => expr,
     };
     walk_field_uses(expr, uses);
 }

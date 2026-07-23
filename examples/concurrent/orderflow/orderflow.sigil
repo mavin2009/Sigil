@@ -1,0 +1,59 @@
+// Three-stage order flow: Gateway -> Risk -> Settlement.
+//
+// The compiler derives the topology from `send` statements, verifies every
+// edge's message type, proves the graph acyclic, wires the actor outboxes,
+// and stages the shutdown. Each stage is a fleet of shared-nothing actors
+// with total failure-path coverage and pure recovery transforms.
+
+schema Order {
+  id: String,
+  amount: Float,
+  units: Int
+}
+
+// External residual stages.
+transform validate(o: Order) -> Order {}
+transform score(o: Order) -> Order {}
+transform post(o: Order) -> Order {}
+
+// Pure recovery paths — compiled, infallible, un-slowable.
+transform quarantine(o: Order) -> Order { o }
+transform waive(o: Order) -> Order { o }
+transform refund(o: Order) -> Order { o }
+
+process Gateway {
+  state admitted: Int = 0
+
+  on order: Order {
+    let ok = order ~> validate @recover(with: quarantine)
+    admitted := admitted + ok.units
+    send ok to Risk
+  }
+}
+
+process Risk {
+  state scored: Int = 0
+
+  on order: Order {
+    let s = order ~> score @timeout(60.ms) @recover(with: waive)
+    scored := scored + s.units
+    send s to Settlement
+  }
+}
+
+process Settlement {
+  state posted: Int = 0
+  state total_amount: Float = 0.0
+
+  on order: Order {
+    let done = order ~> post @recover(with: refund)
+    posted := posted + done.units
+    total_amount := total_amount + done.amount
+  }
+}
+
+spec Flow {
+  require path_timeout_sum <= 200.ms
+  hold total_amount >= 0.0
+  extinct [null]
+}
