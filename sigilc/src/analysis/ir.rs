@@ -2,13 +2,13 @@
 //! Graph IR for Sigil
 //! Real dataflow graph with nodes and effect-tagged edges.
 
-use crate::ast::{Program, Expr, Stmt, Tag, Literal};
+use crate::frontend::ast::{Program, Expr, Stmt, Tag, Literal};
 use anyhow::Result;
 
 #[derive(Debug, Clone)]
 pub struct GraphIR {
     pub process_name: String,
-    pub process_span: Option<crate::ast::Span>,
+    pub process_span: Option<crate::frontend::ast::Span>,
     pub local_states: Vec<String>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -19,8 +19,8 @@ pub struct GraphIR {
 pub enum Node {
     Input { name: String },
     Call { name: String },
-    Timeout { ms: u64, span: Option<crate::ast::Span> },
-    Recover { fallback: String, span: Option<crate::ast::Span> },
+    Timeout { ms: u64, span: Option<crate::frontend::ast::Span> },
+    Recover { fallback: String, span: Option<crate::frontend::ast::Span> },
     StateWrite { slot: String },
 }
 
@@ -138,7 +138,7 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
     }
 }
 
-fn lower_pipe_step(step: &crate::ast::PipeStep, prev: usize, ir: &mut GraphIR) -> usize {
+fn lower_pipe_step(step: &crate::frontend::ast::PipeStep, prev: usize, ir: &mut GraphIR) -> usize {
     let mut current = lower_expr(&step.expr, prev, ir);
     for tag in &step.tags {
         match tag {

@@ -1,7 +1,7 @@
 
 //! Level-1 extinct-by-design checks on the Graph IR.
 
-use crate::ir::{GraphIR, Node};
+use crate::analysis::ir::{GraphIR, Node};
 use anyhow::{bail, Result};
 
 pub fn level1_check(ir: &GraphIR) -> Result<()> {
@@ -42,7 +42,7 @@ pub fn level1_check(ir: &GraphIR) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{GraphIR, Node};
+    use crate::analysis::ir::{GraphIR, Node};
 
     #[test]
     fn accepts_handled_timeout() {

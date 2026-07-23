@@ -6,6 +6,10 @@ authors.workspace = true
 description = "Compiler for the Sigil language — fault-tolerant systems by construction"
 license.workspace = true
 
+[lib]
+name = "sigilc"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sigilc"
 path = "src/main.rs"
