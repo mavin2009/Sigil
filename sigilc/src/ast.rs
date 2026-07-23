@@ -5,15 +5,24 @@ use anyhow::{anyhow, bail, Result};
 use pest::Parser;
 use pest_derive::Parser;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Parser)]
+#[grammar = "sigil.pest"]
+pub struct SigilParser;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
 }
 
-#[derive(Parser)]
-#[grammar = "sigil.pest"]
-pub struct SigilParser;
+impl Span {
+    pub fn from_pest(span: pest::Span<'_>) -> Self {
+        Self { start: span.start(), end: span.end() }
+    }
+    pub fn is_valid(&self) -> bool {
+        self.start < self.end
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -25,6 +34,7 @@ pub struct Program {
 pub struct Schema {
     pub name: String,
     pub fields: Vec<(String, Type)>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +47,7 @@ pub struct Process {
     pub name: String,
     pub states: Vec<StateDecl>,
     pub handlers: Vec<OnHandler>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +131,7 @@ pub fn parse(source: &str) -> Result<Program> {
 }
 
 fn parse_schema(pair: pest::iterators::Pair<Rule>) -> Result<Schema> {
+    let span = Span::from_pest(pair.as_span());
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
     let mut fields = vec![];
@@ -133,7 +145,7 @@ fn parse_schema(pair: pest::iterators::Pair<Rule>) -> Result<Schema> {
             }
         }
     }
-    Ok(Schema { name, fields })
+    Ok(Schema { name, fields, span })
 }
 
 fn parse_type(pair: pest::iterators::Pair<Rule>) -> Result<Type> {
@@ -150,6 +162,7 @@ fn parse_type(pair: pest::iterators::Pair<Rule>) -> Result<Type> {
 }
 
 fn parse_process(pair: pest::iterators::Pair<Rule>) -> Result<Process> {
+    let span = Span::from_pest(pair.as_span());
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
     let body = inner.next().unwrap();
@@ -162,7 +175,7 @@ fn parse_process(pair: pest::iterators::Pair<Rule>) -> Result<Process> {
             _ => {}
         }
     }
-    Ok(Process { name, states, handlers })
+    Ok(Process { name, states, handlers, span })
 }
 
 fn parse_state(pair: pest::iterators::Pair<Rule>) -> Result<StateDecl> {
@@ -367,6 +380,17 @@ mod tests {
         assert_eq!(prog.processes[0].name, "Counter");
         assert_eq!(prog.processes[0].states.len(), 1);
         assert_eq!(prog.processes[0].handlers.len(), 1);
+    }
+
+    #[test]
+    fn key_nodes_have_valid_spans() {
+        let src = include_str!("../../examples/ingest.sigil");
+        let prog = parse(src).expect("parse");
+        assert!(!prog.schemas.is_empty());
+        assert!(prog.schemas[0].span.is_valid(), "schema should have a valid span");
+        assert!(!prog.processes.is_empty());
+        assert!(prog.processes[0].span.is_valid(), "process should have a valid span");
+        assert!(prog.processes[0].span.start < prog.processes[0].span.end);
     }
 
     #[test]
