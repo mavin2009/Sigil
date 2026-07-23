@@ -358,6 +358,14 @@ process P {
 /// need no tag. Recovery fallbacks SHOULD be pure transforms — a fallible
 /// fallback reintroduces exactly the loss it was meant to prevent.
 pub fn check_failure_paths(program: &Program) -> Result<()> {
+    fallible_fallbacks(program).map(|_| ())
+}
+
+/// Recovery targets that are themselves external (and so can fail or hang).
+/// A fallible fallback reintroduces exactly the loss it exists to prevent;
+/// it is reported as residual risk always, and rejected at Level 3+ where
+/// proofs are being claimed.
+pub fn fallible_fallbacks(program: &Program) -> Result<Vec<String>> {
     use std::collections::BTreeSet;
 
     let pure: BTreeSet<&str> = program
@@ -382,7 +390,9 @@ pub fn check_failure_paths(program: &Program) -> Result<()> {
             }
         }
     }
-    Ok(())
+    fallible_fallbacks.sort();
+    fallible_fallbacks.dedup();
+    Ok(fallible_fallbacks)
 }
 
 fn walk_failure_paths(
@@ -395,6 +405,7 @@ fn walk_failure_paths(
         Expr::Pipeline { base, steps, .. } => {
             walk_failure_paths(base, pure, process, fallible_fallbacks)?;
             for step in steps {
+                let step_span = step_span_of(step);
                 let target = match &step.expr {
                     Expr::Ident { name, .. } => Some(name.as_str()),
                     Expr::Call { name, .. } => Some(name.as_str()),
@@ -408,25 +419,31 @@ fn walk_failure_paths(
                     let n_error = step.tags.iter().filter(|t| matches!(t, Tag::Error { .. })).count();
                     if n_timeout > 1 || n_recover > 1 || n_retry > 1 || n_error > 1 {
                         bail!(
-                            "Level-1 violation in process '{process}': stage '{name}' \
-                             repeats an effect tag — at most one @timeout, @recover, \
-                             @retry, and @error per step"
+                            "Level-1 violation in process '{process}' at bytes {}..{}: \
+                             stage '{name}' repeats an effect tag — at most one @timeout, \
+                             @recover, @retry, and @error per step",
+                            step_span.start,
+                            step_span.end
                         );
                     }
                     if n_recover == 1 && n_error == 1 {
                         bail!(
-                            "Level-1 violation in process '{process}': stage '{name}' \
-                             declares both @recover and @error — a step either recovers \
-                             or acknowledges the drop, not both"
+                            "Level-1 violation in process '{process}' at bytes {}..{}: \
+                             stage '{name}' declares both @recover and @error — a step \
+                             either recovers or acknowledges the drop, not both",
+                            step_span.start,
+                            step_span.end
                         );
                     }
                     let has_recover = n_recover == 1;
                     let has_error = n_error == 1;
                     if n_timeout == 1 && !has_recover && !has_error {
                         bail!(
-                            "Level-1 violation in process '{process}': timed stage '{name}' \
-                             has no failure path on the same step — add @recover(with: f) \
-                             or acknowledge the drop with @error"
+                            "Level-1 violation in process '{process}' at bytes {}..{}: \
+                             timed stage '{name}' has no failure path on the same step — \
+                             add @recover(with: f) or acknowledge the drop with @error",
+                            step_span.start,
+                            step_span.end
                         );
                     }
                     if let Some(retry) = step.tags.iter().find_map(|t| match t {
@@ -435,9 +452,12 @@ fn walk_failure_paths(
                     }) {
                         if !has_recover && !has_error {
                             bail!(
-                                "Level-1 violation in process '{process}': stage '{name}' \
-                                 declares @retry without a terminal failure path — retries \
-                                 delay failure, they do not handle it; add @recover or @error"
+                                "Level-1 violation in process '{process}' at bytes {}..{}: \
+                                 stage '{name}' declares @retry without a terminal failure \
+                                 path — retries delay failure, they do not handle it; add \
+                                 @recover or @error",
+                                step_span.start,
+                                step_span.end
                             );
                         }
                         match retry {
@@ -453,9 +473,12 @@ fn walk_failure_paths(
                     }
                     if is_external && !has_recover && !has_error {
                         bail!(
-                            "Level-1 violation in process '{process}': external stage '{name}' \
-                             has no failure path — add @recover(with: <pure transform>) or \
-                             acknowledge the drop explicitly with @error"
+                            "Level-1 violation in process '{process}' at bytes {}..{}: \
+                             external stage '{name}' has no failure path — add \
+                             @recover(with: <pure transform>) or acknowledge the drop \
+                             explicitly with @error",
+                            step_span.start,
+                            step_span.end
                         );
                     }
                     // Advisory: fallible fallback (external recover target)
@@ -490,6 +513,18 @@ fn walk_failure_paths(
         Expr::Ident { .. } | Expr::Literal { .. } | Expr::FieldAccess { .. } => {}
     }
     Ok(())
+}
+
+/// Best-effort span for a pipeline step: the step's own expression span.
+fn step_span_of(step: &crate::frontend::ast::PipeStep) -> crate::frontend::ast::Span {
+    match &step.expr {
+        Expr::Ident { span, .. }
+        | Expr::Call { span, .. }
+        | Expr::FieldAccess { span, .. }
+        | Expr::Literal { span, .. }
+        | Expr::Pipeline { span, .. }
+        | Expr::Binary { span, .. } => *span,
+    }
 }
 
 /// Pure transforms are the language's infallibility anchor: their bodies may

@@ -610,9 +610,31 @@ fn emit_pipeline(
             let fallback = recover.clone().unwrap_or_else(|| transform.clone());
             // Bounded re-attempts, then the recover path. Worst case
             // (1 + retries) x timeout is what Level-2 charges the budget.
-            current = format!(
-                "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ __attempt += 1; sigil_rt::chaos::note_retry(\"{transform}\"); }} _ => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
-            );
+            current = if multiline {
+                format!(
+                    "{{\n\
+{indent}    let __in = {current};\n\
+{indent}    let mut __attempt: u64 = 0;\n\
+{indent}    loop {{\n\
+{indent}        match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{\n\
+{indent}            Ok(Ok(v)) => break v,\n\
+{indent}            _ if __attempt < {retries} => {{\n\
+{indent}                __attempt += 1;\n\
+{indent}                sigil_rt::chaos::note_retry(\"{transform}\");\n\
+{indent}            }}\n\
+{indent}            _ => {{\n\
+{indent}                sigil_rt::chaos::note_recovery(\"{transform}\");\n\
+{indent}                break {fallback}(__in).await?;\n\
+{indent}            }}\n\
+{indent}        }}\n\
+{indent}    }}\n\
+{indent}}}"
+                )
+            } else {
+                format!(
+                    "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ __attempt += 1; sigil_rt::chaos::note_retry(\"{transform}\"); }} _ => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
+                )
+            };
         } else if let Some(ms) = timeout_ms {
             let fallback = recover.unwrap_or_else(|| transform.clone());
             if multiline {

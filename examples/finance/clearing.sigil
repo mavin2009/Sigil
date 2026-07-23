@@ -1,0 +1,113 @@
+// ============================================================================
+// CLEARING & SETTLEMENT — a payment clearing house component.
+//
+// Four stages, each a fleet of shared-nothing actors, wired and proven by the
+// compiler:
+//
+//     Ingest ──by id──> RiskGate ──> Clearing ──> Settlement
+//
+// PROVEN AT --level 4 (system):
+//   Settlement.settled <= Ingest.admitted   no settlement without intake
+//   Clearing.netted    <= Ingest.admitted   no netting without intake
+//   RiskGate.passed    <= Ingest.admitted   no risk pass without intake
+//
+// PROVEN AT --level 3 (per process, inductive):
+//   settled_value >= 0.0                    the book never goes negative
+//   exposure      >= 0.0
+//
+// GUARANTEED BY CONSTRUCTION (Level 1):
+//   no data races (state is task-local; spawn moves it into an isolated task)
+//   no shared mutable accumulators — zero Mutex/Arc/atomics in generated code
+//   every external stage has a declared failure path
+//   every @timeout has a bounded, budgeted recovery path
+//
+// PROVEN AT --level 2 (contracts):
+//   worst-case latency along the longest topology path <= 400ms
+//   (actual: 60 + 100 + 80 + 140 = 380ms, each stage charged (1+retries)xtimeout)
+//
+// RESIDUAL (reported, never hidden): the external transforms themselves
+// (authorization, ledger I/O, wire settlement), the OS, and the scheduler.
+// ============================================================================
+
+schema Payment {
+  id: String,
+  account: String,
+  amount: Float,
+  units: Int
+}
+
+// ---- External residual stages: real I/O lives behind these ----
+transform validate(p: Payment) -> Payment {}
+transform check_limit(p: Payment) -> Payment {}
+transform net_position(p: Payment) -> Payment {}
+transform post_ledger(p: Payment) -> Payment {}
+
+// ---- Pure recovery paths: compiled, infallible, un-slowable ----
+// A fallible fallback would reintroduce exactly the loss it exists to prevent.
+transform reject(p: Payment) -> Payment { p }
+transform hold_for_review(p: Payment) -> Payment { p }
+transform defer_netting(p: Payment) -> Payment { p }
+transform reverse(p: Payment) -> Payment { p }
+
+process Ingest {
+  state admitted: Int = 0
+
+  on payment: Payment {
+    let ok = payment ~> validate @timeout(30.ms) @retry(1) @recover(with: reject)
+    admitted := admitted + 1
+    send ok to RiskGate by ok.account
+  }
+}
+
+process RiskGate {
+  state passed: Int = 0
+  state exposure: Float = 0.0
+
+  on payment: Payment {
+    let checked = payment ~> check_limit @timeout(50.ms) @retry(1) @recover(with: hold_for_review)
+    passed := passed + 1
+    exposure := exposure + payment.amount
+    send checked to Clearing
+  }
+}
+
+process Clearing {
+  state netted: Int = 0
+
+  on payment: Payment {
+    let net = payment ~> net_position @timeout(40.ms) @retry(1) @recover(with: defer_netting)
+    netted := netted + 1
+    send net to Settlement
+  }
+}
+
+process Settlement {
+  state settled: Int = 0
+  state settled_value: Float = 0.0
+
+  on payment: Payment {
+    let posted = payment ~> post_ledger @timeout(70.ms) @retry(1) @recover(with: reverse)
+    settled := settled + 1
+    settled_value := settled_value + payment.amount
+  }
+}
+
+spec ClearingHouse {
+  // Input contract — compiled into runtime guards at every handler entry.
+  require payment.amount >= 0.0
+
+  // Latency budget: worst case along the longest path through the topology,
+  // charging (1 + retries) x timeout per stage.
+  require path_timeout_sum <= 400.ms
+
+  // Per-process invariants, proven inductively.
+  hold settled_value >= 0.0
+  hold exposure >= 0.0
+
+  // System invariants, proven structurally over the topology.
+  hold Settlement.settled <= Ingest.admitted
+  hold Clearing.netted <= Ingest.admitted
+  hold RiskGate.passed <= Ingest.admitted
+
+  extinct [null]
+}

@@ -8,7 +8,7 @@
 //! automatic: skipping a level never fails the build silently — every skipped
 //! guarantee is surfaced in the residual-risk report.
 
-use crate::analysis::check::{check_failure_paths, check_transform_purity, check_transform_signatures, level1_check};
+use crate::analysis::check::{check_failure_paths, check_transform_purity, check_transform_signatures, fallible_fallbacks, level1_check};
 use crate::analysis::ir::GraphIR;
 use crate::analysis::level2::{level2_check, Level2Report};
 use crate::analysis::topology::derive_topology;
@@ -119,6 +119,16 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
     }
 
     if level >= AssuranceLevel::Proofs {
+        // Proofs assume recovery paths cannot fail; enforce that here.
+        let ff = fallible_fallbacks(program)?;
+        if !ff.is_empty() {
+            anyhow::bail!(
+                "Level-3 requires infallible recovery: {} used as a @recover target but \
+                 declared external (empty body). A fallback that can fail or hang \
+                 reintroduces the loss it exists to prevent — give it a pure body.",
+                ff.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+            );
+        }
         let l3 = crate::analysis::level3::level3_prove(program)?;
         for p in &l3.proven {
             notes.push(format!("PROVEN: {p}"));
@@ -133,6 +143,18 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
         level4 = Some(l4);
     }
     if level < AssuranceLevel::Proofs {
+        // Below Level 3 a fallible recovery path is reported, not rejected.
+        let ff = fallible_fallbacks(program).unwrap_or_default();
+        if !ff.is_empty() {
+            notes.push(format!(
+                "fallible recovery paths (external @recover targets): {} — these can fail \
+                 or hang; Level 3 rejects them",
+                ff.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+            ));
+            skipped.push(
+                "infallible-recovery guarantee (some @recover targets are external)".into(),
+            );
+        }
         let has_holds = program.specs.iter().any(|sp| {
             sp.items.iter().any(|i| matches!(i, crate::frontend::ast::SpecItem::Hold { .. }))
         });

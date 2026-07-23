@@ -67,8 +67,19 @@ fn main() -> Result<()> {
     );
 
     let graph = lower(&program).context("lowering to Graph IR")?;
-    let outcome = run_checks(&program, &graph, level)
-        .with_context(|| format!("checks at {}", level.name()))?;
+    let outcome = match run_checks(&program, &graph, level) {
+        Ok(o) => o,
+        Err(e) => {
+            // Byte spans are for machines; show the person a source position.
+            let rendered = sigilc::render_diagnostic(
+                &format!("{e:#}"),
+                &source,
+                &input.display().to_string(),
+            );
+            eprintln!("\nerror[{}]: {rendered}", level.name());
+            std::process::exit(1);
+        }
+    };
     println!("Assurance: {} — checks passed.", level.name());
     for note in &outcome.notes {
         println!("[note] {note}");
@@ -325,6 +336,68 @@ mod integration {
         // Untimed @recover emits a match on the stage result with a recovery note.
         assert!(rust.contains("note_recovery(\"validate\")"), "untimed recover path missing");
         assert!(rust.contains("note_recovery(\"post\")"));
+    }
+
+    /// The finance component: five proofs, a budget, and zero-loss codegen.
+    #[test]
+    fn finance_clearing_component() {
+        use sigilc::{run_checks, AssuranceLevel};
+        let src = include_str!("../../examples/finance/clearing.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+            .expect("clearing must pass Level 4");
+        assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 3, "3 system holds");
+        assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 2, "2 scalar holds");
+        assert_eq!(
+            outcome.level2.as_ref().unwrap().path_timeout_sum_ms,
+            380,
+            "longest-path budget"
+        );
+        let rust = emit(&program, &irs);
+        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+        // The float accumulator that would need Arc<Mutex<f64>> by hand.
+        assert!(rust.contains("pub settled_value: f64"));
+    }
+
+    /// The security component: audit-before-serve is PROVEN, and the two
+    /// review-passing mistakes that would break it are compile errors.
+    #[test]
+    fn security_vault_component() {
+        use sigilc::{level4_prove, run_checks, AssuranceLevel};
+        let src = include_str!("../../examples/security/vault.sigil");
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
+            .expect("vault must pass Level 4");
+        let proven = &outcome.level4.as_ref().unwrap().proven;
+        assert_eq!(proven.len(), 3, "the defense-in-depth chain");
+        assert!(proven.iter().any(|p| p.contains("Vault.served <= Audit.recorded")));
+
+        // Mistake 1: audit AFTER the send (passes code review, fails the build).
+        let after = src.replace(
+            "    recorded := recorded + 1
+    send logged to Vault",
+            "    send logged to Vault
+    recorded := recorded + 1",
+        );
+        let program = parse(&after).expect("parse");
+        let err = level4_prove(&program).expect_err("audit-after-send must fail");
+        assert!(format!("{err}").contains("ORDERING fails"));
+
+        // Mistake 2: a deny path that can itself fail or hang.
+        let open = src.replace(
+            "transform deny_unauthorized(r: Request) -> Request { r }",
+            "transform deny_unauthorized(r: Request) -> Request {}",
+        );
+        let program = parse(&open).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let err = run_checks(&program, &irs, AssuranceLevel::Proofs)
+            .expect_err("fallible deny must fail at Level 3+");
+        assert!(format!("{err}").contains("infallible recovery"));
+        // ...but it is a reported residual, not an error, at Level 1.
+        let outcome = run_checks(&program, &irs, AssuranceLevel::Safe).expect("L1 ok");
+        assert!(outcome.notes.iter().any(|n| n.contains("fallible recovery")));
     }
 
     /// Level 4: system invariants proven structurally over the topology,
