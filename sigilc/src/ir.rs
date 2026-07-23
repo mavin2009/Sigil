@@ -94,7 +94,7 @@ pub fn lower(program: &Program) -> Result<GraphIR> {
 
 fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
     match expr {
-        Expr::Pipeline { base, steps } => {
+        Expr::Pipeline { base, steps, .. } => {
             let mut current = lower_expr(base, prev, ir);
             for step in steps {
                 current = lower_pipe_step(step, current, ir);

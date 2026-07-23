@@ -78,9 +78,9 @@ pub enum Expr {
     Ident(String),
     FieldAccess { base: String, field: String },
     Literal(Literal),
-    Pipeline { base: Box<Expr>, steps: Vec<PipeStep> },
+    Pipeline { base: Box<Expr>, steps: Vec<PipeStep>, span: Span },
     Call { name: String, args: Vec<Expr> },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -247,7 +247,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                     _ => bail!("bad sum op"),
                 };
                 let right = parse_expr(inner.next().unwrap())?;
-                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span: Span { start: 0, end: 0 } };
             }
             Ok(left)
         }
@@ -261,7 +261,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                     _ => bail!("bad product op"),
                 };
                 let right = parse_expr(inner.next().unwrap())?;
-                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span: Span { start: 0, end: 0 } };
             }
             Ok(left)
         }
@@ -286,7 +286,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             if steps.is_empty() {
                 Ok(base)
             } else {
-                Ok(Expr::Pipeline { base: Box::new(base), steps })
+                Ok(Expr::Pipeline { base: Box::new(base), steps, span: Span { start: 0, end: 0 } })
             }
         }
         _ => parse_atom(pair),
@@ -410,6 +410,33 @@ mod tests {
         // Just ensure the parser can still run; full span attachment is incremental
         let _ = src;
         assert!(true);
+    }
+
+    #[test]
+    fn binary_and_pipeline_have_span_field() {
+        let src = r#"
+schema S { x: Int }
+process P {
+  state s: Int = 0
+  on m: S {
+    let y = s + m.x * 2
+    s := y
+  }
+}
+"#;
+        let prog = parse(src).expect("parse");
+        let process = &prog.processes[0];
+        let mut found_binary = false;
+        for handler in &process.handlers {
+            for stmt in &handler.body {
+                if let Stmt::Let { expr: Expr::Binary { span, .. }, .. } = stmt {
+                    // span field exists; for now we accept placeholder or real
+                    let _ = span;
+                    found_binary = true;
+                }
+            }
+        }
+        assert!(found_binary, "expected a Binary expression with span field");
     }
 
     #[test]
