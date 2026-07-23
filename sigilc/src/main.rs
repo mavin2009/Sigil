@@ -59,3 +59,27 @@ fn main() -> Result<()> {
     println!("Generated project is ready in {}", out.display());
     Ok(())
 }
+
+
+
+
+
+
+#[cfg(test)]
+mod integration {
+    use super::*;
+
+    #[test]
+    fn compile_ingest_via_library_path() {
+        let source = include_str!("../../examples/ingest.sigil");
+        let program = crate::ast::parse(source).expect("parse");
+        let graph = crate::ir::lower(&program).expect("lower");
+        crate::check::level1_check(&graph).expect("level1");
+        let rust = crate::codegen::emit(&graph);
+        let risk = crate::codegen::residual_risk_report(&graph);
+        assert!(rust.contains("Ingest") || rust.contains("on_packet"));
+        assert!(risk.contains("Level-1"));
+        assert!(graph.has_timeout());
+        assert!(graph.has_recover());
+    }
+}
