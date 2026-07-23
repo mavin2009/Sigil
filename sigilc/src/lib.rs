@@ -8,5 +8,5 @@ pub mod analysis;
 pub mod backend;
 
 pub use frontend::{parse, Program, Span};
-pub use analysis::{lower, level1_check, GraphIR};
-pub use backend::{emit, residual_risk_report};
+pub use analysis::{lower, level1_check, residual_risk_report, GraphIR};
+pub use backend::emit;
