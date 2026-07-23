@@ -1,8 +1,8 @@
 //! Level-2 checks: temporal / path obligations on a Level-1-legal graph.
 //!
-//! - Per-step recovery totality: every @timeout on a pipe step has @recover on the same step
+//! - Per-step recovery totality (AST tags + Graph IR Timeout→Recover edges)
 //! - path_timeout_sum bounds from `require path_timeout_sum <= N.ms`
-//! - Simple `hold state >= N` discharge for pure integer state
+//! - `hold state >= N` discharge for pure Int/Float state
 //! - `extinct` assumptions recorded for residual risk
 
 use crate::analysis::ir::GraphIR;
@@ -28,7 +28,12 @@ pub fn level2_check(program: &Program, ir: &GraphIR) -> Result<Level2Report> {
     check_per_step_recovery(program)?;
     report
         .discharged
-        .push("per-step @timeout/@recover totality".into());
+        .push("per-step @timeout/@recover totality (AST)".into());
+
+    check_ir_timeout_recover_edges(ir)?;
+    report
+        .discharged
+        .push("Timeout→Recover edges present in Graph IR".into());
 
     let sum = path_timeout_sum_ms(ir);
     report.path_timeout_sum_ms = sum;
@@ -310,6 +315,36 @@ fn cmp_holds(op: BinOp, value: f64, bound: f64) -> bool {
     }
 }
 
+
+fn check_ir_timeout_recover_edges(ir: &GraphIR) -> Result<()> {
+    use crate::analysis::ir::Node;
+    for (idx, node) in ir.nodes.iter().enumerate() {
+        if let Node::Timeout { span, ms } = node {
+            let has_recover_succ = ir.edges.iter().any(|e| {
+                e.from == idx
+                    && matches!(ir.nodes.get(e.to), Some(Node::Recover { .. }))
+            });
+            // Also accept immediate next node Recover (same step lowering)
+            let next_is_recover = matches!(
+                ir.nodes.get(idx + 1),
+                Some(Node::Recover { .. })
+            );
+            if !has_recover_succ && !next_is_recover {
+                let loc = span
+                    .map(|s| format!(" at bytes {}..{}", s.start, s.end))
+                    .unwrap_or_default();
+                bail!(
+                    "Level-2 violation in process '{}'{}: Timeout node ({}ms) has no Recover successor in Graph IR",
+                    ir.process_name,
+                    loc,
+                    ms
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_per_step_recovery(program: &Program) -> Result<()> {
     for process in &program.processes {
         for handler in &process.handlers {
@@ -558,5 +593,28 @@ spec Bad {
         let ir = lower(&prog).expect("lower");
         let report = level2_check(&prog, &ir).expect("level2");
         assert!(report.path_timeout_sum_ms >= 300);
+        assert!(report.path_timeout_bound_ms == Some(500) || report.discharged.iter().any(|d| d.contains("path_timeout")));
+        // total_charged >= 0.0 is pure arithmetic + msg field
+        assert!(
+            report.discharged.iter().any(|d| d.contains("total_charged") || d.contains("hold")),
+            "expected hold discharge notes: {:?}",
+            report.discharged
+        );
+        assert!(
+            report.discharged.iter().any(|d| d.contains("Timeout→Recover") || d.contains("Graph IR")),
+            "expected IR recovery discharge: {:?}",
+            report.discharged
+        );
+    }
+
+    #[test]
+    fn level2_combined_example() {
+        let src = include_str!("../../../examples/level2/slo_and_hold.sigil");
+        let prog = parse(src).expect("parse");
+        assert!(!prog.specs.is_empty());
+        let ir = lower(&prog).expect("lower");
+        let report = level2_check(&prog, &ir).expect("level2");
+        assert_eq!(report.path_timeout_sum_ms, 80);
+        assert!(report.discharged.iter().any(|d| d.contains("hits") || d.contains("hold")));
     }
 }

@@ -81,12 +81,23 @@ Temporal / path obligations on a Level-1-legal graph:
 
 | Check | Meaning |
 |-------|---------|
-| Per-step recovery | Every `@timeout` has `@recover` on the **same** pipeline step |
-| `require path_timeout_sum <= N.ms` | Sum of timed stages on the process path must not exceed N |
-| `hold state >= N` | Discharged when init satisfies and updates are pure; residual if externals feed state |
+| Per-step recovery (AST) | Every `@timeout` has `@recover` on the **same** pipeline step |
+| Timeout→Recover (IR) | Every Timeout node in the Graph IR has a Recover successor |
+| `require path_timeout_sum <= N.ms` | Sum of timed stages must not exceed N |
+| `hold state >= N` | Discharged for pure Int/Float state when init satisfies; residual if externals feed state |
 | `extinct [...]` | Assumptions listed in residual risk |
 
-See `examples/level2/` for a combined SLO + hold program.
+Specs:
+
+```
+spec_def     = "spec" ~ ident ~ "{" ~ spec_item* ~ "}"
+spec_item    = extinct_clause | require_clause | hold_clause
+extinct_clause = "extinct" ~ "[" ~ ident ~ ("," ~ ident)* ~ "]"
+require_clause = "require" ~ expr
+hold_clause    = "hold" ~ expr
+```
+
+See `examples/level2/` for a combined SLO + hold program, and `examples/proofs/` for negative cases.
 
 ```sigil
 spec OrderSlo {
@@ -188,10 +199,12 @@ expr_stmt    = expr
 
 ### Expressions
 
-Precedence: `+` `-` below `*` `/`; pipelines bind to atoms.
+Precedence: comparisons bind looser than `+` `-`, which bind looser than `*` `/`.
 
 ```
-expr         = sum
+expr         = comparison
+comparison   = sum ~ (cmp_op ~ sum)?
+cmp_op       = "<=" | ">=" | "==" | "<" | ">"
 sum          = product ~ (("+" | "-") ~ product)*
 product      = pipeline ~ (("*" | "/") ~ pipeline)*
 

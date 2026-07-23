@@ -31,4 +31,4 @@ cargo run -p sigilc -- examples/pipeline/pipeline.sigil generated/pipeline
 ## Level-2
 
 `spec OrderSlo` requires `path_timeout_sum <= 500.ms` (120 + 200 = 320).
-`hold total_charged >= 0.0` is recorded under residual assumptions.
+`hold total_charged >= 0.0` is discharged when updates are pure arithmetic on message fields (Float).
