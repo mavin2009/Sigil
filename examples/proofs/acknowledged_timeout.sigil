@@ -1,0 +1,10 @@
+// MUST PASS: @timeout + @error is a legal acknowledged timed drop.
+schema M { v: Int }
+transform f(m: M) -> M {}
+process P {
+  state n: Int = 0
+  on m: M {
+    let out = m ~> f @timeout(50.ms) @retry(1) @error
+    n := n + out.v
+  }
+}

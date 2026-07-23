@@ -16,6 +16,10 @@ These failure modes are rejected or unrepresentable at the default safety level:
 - State writes to non-local slots
 - Pipeline stages whose types disagree with declared transform signatures
 - `send` to undeclared processes, type-mismatched topology edges, cyclic process graphs, and Float shard-routing keys
+- Cross-process state writes (Graph IR is per-process; locality is checked against the owning process only)
+- Bare calls to external transforms (external stages must be pipeline steps with a failure path)
+- External calls inside pure transform bodies (pure transforms are the infallibility anchor)
+- Duplicate effect tags on a step, and `@recover` combined with `@error` (a step recovers or acknowledges the drop, not both)
 
 Residual risk outside the model (external transforms, OS, scheduler) is always reported explicitly.
 
@@ -112,6 +116,16 @@ cargo run -p sigilc -- examples/proofs/float_route_key.sigil /tmp/nope
 
 # Must fail Level-2 — (1 + 2 retries) × 200ms = 600ms > 500ms SLO
 cargo run -p sigilc -- examples/proofs/retry_budget_overflow.sigil /tmp/nope --level 2
+
+# Must fail — cross-process state write / bare external call / impure "pure"
+# transform / conflicting @recover+@error
+cargo run -p sigilc -- examples/proofs/cross_process_state.sigil /tmp/nope
+cargo run -p sigilc -- examples/proofs/bare_external_call.sigil /tmp/nope
+cargo run -p sigilc -- examples/proofs/impure_pure_transform.sigil /tmp/nope
+cargo run -p sigilc -- examples/proofs/conflicting_tags.sigil /tmp/nope
+
+# Must PASS — @timeout @retry(1) @error is a legal acknowledged timed drop
+cargo run -p sigilc -- examples/proofs/acknowledged_timeout.sigil /tmp/ok --level 2
 ```
 
 Integration tests assert both programs are rejected with Level-1 / signature diagnostics.
@@ -124,7 +138,7 @@ Temporal / path obligations on a Level-1-legal graph:
 |-------|---------|
 | Per-step recovery (AST) | Every `@timeout` has `@recover` on the **same** pipeline step |
 | Timeout→Recover (IR) | Every Timeout node in the Graph IR has a Recover successor |
-| `require path_timeout_sum <= N.ms` | Worst-case sum of timed stages — `(1 + retries) × timeout` per stage — must not exceed N |
+| `require path_timeout_sum <= N.ms` | Worst-case **longest path through the process topology** — `(1 + retries) × timeout` per stage, per-process sums, parallel branches take max — must not exceed N |
 | `hold state >= N` | Discharged for pure Int/Float state when init satisfies; residual if externals feed state |
 | `extinct [...]` | Assumptions listed in residual risk |
 
@@ -305,6 +319,8 @@ Rules:
 - Every EXTERNAL stage (empty-bodied transform) must carry `@recover` or an explicit `@error` acknowledgment (Level-1). Pure transforms are compiled and infallible — recovery paths should be pure.
 - `@recover(with: f)` names a fallback used when the step fails or times out; it is legal with or without `@timeout`.
 - `@retry(n)` re-attempts the stage up to `n` extra times before the failure path; it requires `@recover` or `@error` on the same step. Level-2 charges the budget the worst case: `(1 + n) × timeout`.
+- `@timeout` + `@error` (no `@recover`) is a legal *acknowledged timed drop*: the failure propagates honestly, is counted in the actor's dropped total, and satisfies both levels.
+- Effect pairing is **per step, per process** — a recover elsewhere in the program never satisfies a timeout here.
 
 Example:
 
@@ -377,4 +393,4 @@ Negative programs live under `examples/proofs/`.
 
 ## Status
 
-v0.3 — Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.
+v0.3.1 — Soundness-hardened ahead of Level 3: per-process Graph IR, per-step effect discipline, bare-call and purity rules, topology-longest-path budgets. Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.

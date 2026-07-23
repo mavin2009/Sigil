@@ -24,6 +24,9 @@ pub enum Node {
     StateWrite { slot: String },
     /// Typed message to another process's actor.
     Send { target: String },
+    /// Explicit @error acknowledgment on a step: failures/timeouts here drop
+    /// the message intentionally, and the drop is counted.
+    ErrorAck { span: Option<crate::frontend::ast::Span> },
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +52,18 @@ impl GraphIR {
     }
 }
 
-pub fn lower(program: &Program) -> Result<GraphIR> {
+/// Lower a program to one Graph IR PER PROCESS. Aggregating processes into a
+/// single graph made Level-1 unsound for multi-process programs: a state
+/// write in A to B's slot passed the locality check, and a timeout in A was
+/// "paired" by a recover in B.
+pub fn lower(program: &Program) -> Result<Vec<GraphIR>> {
+    program.processes.iter().map(|p| lower_process(program, p)).collect()
+}
+
+fn lower_process(
+    _program: &Program,
+    proc: &crate::frontend::ast::Process,
+) -> Result<GraphIR> {
     let mut ir = GraphIR {
         process_name: String::new(),
         process_span: None,
@@ -59,7 +73,8 @@ pub fn lower(program: &Program) -> Result<GraphIR> {
         external_calls: vec![],
     };
 
-    for proc in &program.processes {
+    {
+        let proc = proc;
         ir.process_name = proc.name.clone();
         ir.process_span = Some(proc.span);
         for st in &proc.states {
@@ -197,6 +212,13 @@ fn lower_pipe_step(step: &crate::frontend::ast::PipeStep, prev: usize, ir: &mut 
             Tag::Retry { .. } => {
                 // Folded into the Timeout node's attempts above; no distinct node.
             }
+            Tag::Error { span } => {
+                let idx = ir.nodes.len();
+                ir.nodes.push(Node::ErrorAck { span: Some(*span) });
+                ir.edges.push(Edge { from: current, to: idx, effects: EffectSet::default() });
+                current = idx;
+            }
+            #[allow(unreachable_patterns)]
             Tag::Error { .. } => {
                 // mark error effect on the previous edge if possible
             }

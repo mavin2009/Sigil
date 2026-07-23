@@ -22,7 +22,7 @@ pub struct Level2Report {
     pub residual_assumptions: Vec<String>,
 }
 
-pub fn level2_check(program: &Program, ir: &GraphIR) -> Result<Level2Report> {
+pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> {
     let mut report = Level2Report::default();
 
     check_per_step_recovery(program)?;
@@ -30,12 +30,40 @@ pub fn level2_check(program: &Program, ir: &GraphIR) -> Result<Level2Report> {
         .discharged
         .push("per-step @timeout/@recover totality (AST)".into());
 
-    check_ir_timeout_recover_edges(ir)?;
+    for ir in irs {
+        check_ir_timeout_recover_edges(ir)?;
+    }
     report
         .discharged
-        .push("Timeout→Recover edges present in Graph IR".into());
+        .push("Timeout→Recover edges present in Graph IR (per process)".into());
 
-    let sum = path_timeout_sum_ms(ir);
+    // End-to-end worst-case latency: the LONGEST path through the process
+    // topology, where each process contributes its own timed-stage sum
+    // (already charged (1 + retries) × timeout per stage). For a single
+    // process this degenerates to that process's sum; parallel branches
+    // take the max, not the sum.
+    let per_process: std::collections::BTreeMap<&str, u64> = irs
+        .iter()
+        .map(|ir| (ir.process_name.as_str(), path_timeout_sum_ms(ir)))
+        .collect();
+    let sum = match crate::analysis::topology::derive_topology(program) {
+        Ok(topo) if topo.is_pipeline() => {
+            let mut longest: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+            for pname in &topo.order {
+                let own = *per_process.get(pname.as_str()).unwrap_or(&0);
+                let best_pred = topo
+                    .edges
+                    .iter()
+                    .filter(|e| e.to == *pname)
+                    .filter_map(|e| longest.get(e.from.as_str()).copied())
+                    .max()
+                    .unwrap_or(0);
+                longest.insert(pname.as_str(), best_pred + own);
+            }
+            longest.values().copied().max().unwrap_or(0)
+        }
+        _ => per_process.values().copied().max().unwrap_or(0),
+    };
     report.path_timeout_sum_ms = sum;
 
     let pure_transforms: BTreeSet<String> = program
@@ -323,6 +351,9 @@ fn check_ir_timeout_recover_edges(ir: &GraphIR) -> Result<()> {
         if let Node::Timeout { span, ms, .. } = node {
             let has_recover_succ = ir.edges.iter().any(|e| {
                 e.from == idx
+                    && matches!(ir.nodes.get(e.to), Some(Node::ErrorAck { .. }))
+            }) || ir.edges.iter().any(|e| {
+                e.from == idx
                     && matches!(ir.nodes.get(e.to), Some(Node::Recover { .. }))
             });
             // Also accept immediate next node Recover (same step lowering)
@@ -370,11 +401,12 @@ fn check_expr_steps(expr: &Expr, process: &str) -> Result<()> {
         Expr::Pipeline { steps, span, .. } => {
             for step in steps {
                 let has_timeout = step.tags.iter().any(|t| matches!(t, Tag::Timeout { .. }));
-                let has_recover = step.tags.iter().any(|t| matches!(t, Tag::Recover { .. }));
+                let has_recover = step.tags.iter().any(|t| matches!(t, Tag::Recover { .. }))
+                    || step.tags.iter().any(|t| matches!(t, Tag::Error { .. }));
                 if has_timeout && !has_recover {
                     bail!(
                         "Level-2 violation in process '{}' at bytes {}..{}: \
-                         @timeout on a pipeline step without @recover on the same step",
+                         @timeout on a pipeline step without @recover or @error on the same step",
                         process,
                         span.start,
                         span.end
@@ -628,7 +660,7 @@ spec Bad {
         let prog = parse(src).expect("parse");
         let ir = lower(&prog).expect("lower");
         // Level-1 may pass (global has recover)
-        let _ = crate::analysis::check::level1_check(&ir);
+        let _ = ir.iter().map(crate::analysis::check::level1_check).collect::<Vec<_>>();
         let err = level2_check(&prog, &ir).expect_err("level2 must require per-step recover");
         let msg = format!("{err}");
         assert!(msg.contains("Level-2"), "{msg}");

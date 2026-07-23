@@ -1,0 +1,13 @@
+// MUST FAIL: pure transforms are the infallibility anchor — no external calls.
+schema M { v: Int }
+transform fetch(m: M) -> M {}
+transform not_pure(m: M) -> M {
+  fetch(m)
+}
+process P {
+  state last: Int = 0
+  on m: M {
+    let out = m ~> not_pure
+    last := out.v
+  }
+}

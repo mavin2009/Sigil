@@ -1,0 +1,10 @@
+// MUST FAIL: external transforms may only run as pipeline steps with a failure path.
+schema M { v: Int }
+transform fetch(m: M) -> M {}
+process P {
+  state last: Int = 0
+  on m: M {
+    let out = fetch(m)
+    last := out.v
+  }
+}

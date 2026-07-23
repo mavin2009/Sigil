@@ -130,10 +130,12 @@ mod integration {
     };
 
     /// Full pipeline: parse → lower → L1 → signatures → L2 → emit → residual.
-    fn compile_source(source: &str) -> (String, String, GraphIR) {
+    fn compile_source(source: &str) -> (String, String, Vec<GraphIR>) {
         let program = parse(source).expect("parse");
         let graph = lower(&program).expect("lower");
-        level1_check(&graph).expect("level1");
+        for ir in &graph {
+            level1_check(ir).expect("level1");
+        }
         check_transform_signatures(&program).expect("signatures");
         check_failure_paths(&program).expect("failure paths");
         let l2 = level2_check(&program, &graph).expect("level2");
@@ -145,7 +147,7 @@ mod integration {
     fn expect_l1_or_sig_reject(source: &str, needle: &str) {
         let program = parse(source).expect("parse should succeed");
         let graph = lower(&program).expect("lower");
-        let ir_err = level1_check(&graph).err();
+        let ir_err = graph.iter().find_map(|ir| level1_check(ir).err());
         let sig_err = check_transform_signatures(&program).err();
         let msg = format!(
             "{}{}",
@@ -162,7 +164,9 @@ mod integration {
     fn expect_l2_reject(source: &str, needle: &str) {
         let program = parse(source).expect("parse");
         let graph = lower(&program).expect("lower");
-        level1_check(&graph).expect("level1 should pass for L2-only failures");
+        for ir in &graph {
+            level1_check(ir).expect("level1 should pass for L2-only failures");
+        }
         let _ = check_transform_signatures(&program);
         let err = level2_check(&program, &graph).expect_err("level2 must fail");
         let msg = format!("{err}");
@@ -218,7 +222,7 @@ mod integration {
     #[test]
     fn compile_ingest() {
         let (rust, risk, graph) = compile_source(include_str!("../../examples/ingest/ingest.sigil"));
-        assert!(graph.has_timeout() && graph.has_recover());
+        assert!(graph.iter().any(|i| i.has_timeout()) && graph.iter().any(|i| i.has_recover()));
         assert!(rust.contains("Ingest"));
         assert!(risk.contains("Level-1"));
     }
@@ -234,7 +238,7 @@ mod integration {
     fn compile_resilient() {
         let (rust, risk, graph) =
             compile_source(include_str!("../../examples/resilient/resilient.sigil"));
-        assert!(graph.has_timeout() && graph.has_recover());
+        assert!(graph.iter().any(|i| i.has_timeout()) && graph.iter().any(|i| i.has_recover()));
         assert!(rust.contains("ResilientProcessor") || rust.contains("normalize"));
         assert!(risk.contains("enrich") || risk.contains("external") || risk.contains("Level"));
     }
@@ -243,7 +247,7 @@ mod integration {
     fn compile_circuit() {
         let (rust, risk, graph) =
             compile_source(include_str!("../../examples/circuit/circuit.sigil"));
-        assert!(graph.has_timeout() && graph.has_recover());
+        assert!(graph.iter().any(|i| i.has_timeout()) && graph.iter().any(|i| i.has_recover()));
         assert!(rust.contains("CircuitBreaker"));
         assert!(risk.contains("Level-1"));
     }
@@ -252,7 +256,7 @@ mod integration {
     fn compile_pipeline() {
         let (rust, risk, graph) =
             compile_source(include_str!("../../examples/pipeline/pipeline.sigil"));
-        assert_eq!(graph.process_name, "OrderPipeline");
+        assert_eq!(graph[0].process_name, "OrderPipeline");
         assert!(rust.contains("from_millis(120)") && rust.contains("from_millis(200)"));
         assert!(risk.contains("Level-2") || risk.contains("path_timeout") || risk.contains("320") || risk.contains("discharged"));
         assert!(risk.contains("confirm") || risk.contains("Declared") || risk.contains("Order"));
@@ -262,7 +266,7 @@ mod integration {
     fn compile_level2_example() {
         let (rust, risk, graph) =
             compile_source(include_str!("../../examples/level2/slo_and_hold.sigil"));
-        assert!(graph.has_timeout() && graph.has_recover());
+        assert!(graph.iter().any(|i| i.has_timeout()) && graph.iter().any(|i| i.has_recover()));
         assert!(rust.contains("Service") || rust.contains("on_event"));
         assert!(risk.contains("Level-2") || risk.contains("discharged") || risk.contains("hold"));
     }
@@ -271,7 +275,7 @@ mod integration {
     fn compile_runnable_counter_and_demo_main() {
         let source = include_str!("../../examples/runnable/counter/counter.sigil");
         let (rust, risk, graph) = compile_source(source);
-        assert!(!graph.has_timeout());
+        assert!(graph.iter().all(|i| !i.has_timeout()));
         assert!(rust.contains("fn add"));
         assert!(risk.contains("body present") || risk.contains("Compiled") || risk.contains("hold"));
         let program = parse(source).unwrap();
@@ -321,6 +325,94 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Soundness hardening before Level 3: every hole found in the L1/L2
+    /// audit is closed by a proof program.
+    #[test]
+    fn soundness_hardening_proofs() {
+        use sigilc::{check_transform_purity, derive_topology, run_checks, AssuranceLevel};
+        let reject = |src: &str, needle: &str| {
+            let program = parse(src).expect("parse");
+            let irs = lower(&program).expect("lower");
+            let err = run_checks(&program, &irs, AssuranceLevel::Safe)
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default();
+            assert!(err.contains(needle), "expected '{needle}', got: {err}");
+        };
+        reject(
+            include_str!("../../examples/proofs/cross_process_state.sigil"),
+            "non-local slot",
+        );
+        reject(
+            include_str!("../../examples/proofs/bare_external_call.sigil"),
+            "bare call",
+        );
+        reject(
+            include_str!("../../examples/proofs/impure_pure_transform.sigil"),
+            "pure transform",
+        );
+        reject(
+            include_str!("../../examples/proofs/conflicting_tags.sigil"),
+            "not both",
+        );
+
+        // Purity check directly too.
+        let program =
+            parse(include_str!("../../examples/proofs/impure_pure_transform.sigil")).unwrap();
+        assert!(check_transform_purity(&program).is_err());
+
+        // @timeout + @error is a legal acknowledged drop at L1 AND L2.
+        let ok_src = include_str!("../../examples/proofs/acknowledged_timeout.sigil");
+        let program = parse(ok_src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        run_checks(&program, &irs, AssuranceLevel::Contracts)
+            .expect("acknowledged timeout must pass both levels");
+        let _ = derive_topology(&program).expect("trivial topology");
+        let rust = emit(&program, &irs);
+        // Codegen must propagate honestly, not silently retry-forever or recover.
+        assert!(rust.contains("SigilError::Timeout"), "acknowledged drop must propagate");
+        assert!(rust.contains("__attempt < 1"), "bounded retry before the drop");
+    }
+
+    /// The Level-2 budget is the LONGEST PATH over the topology, not a blind
+    /// global sum: parallel branches take max.
+    #[test]
+    fn budget_is_longest_path() {
+        let src = r#"
+schema M { v: Int }
+transform f(m: M) -> M {}
+transform p(m: M) -> M { m }
+process Entry {
+  state n: Int = 0
+  on m: M {
+    let out = m ~> f @timeout(100.ms) @recover(with: p)
+    n := n + out.v
+    send out to Left
+    send out to Right
+  }
+}
+process Left {
+  state n: Int = 0
+  on m: M {
+    let out = m ~> f @timeout(300.ms) @recover(with: p)
+    n := n + out.v
+  }
+}
+process Right {
+  state n: Int = 0
+  on m: M {
+    let out = m ~> f @timeout(50.ms) @recover(with: p)
+    n := n + out.v
+  }
+}
+"#;
+        let program = parse(src).expect("parse");
+        let irs = lower(&program).expect("lower");
+        let l2 = level2_check(&program, &irs).expect("level2");
+        // Longest path = Entry(100) + Left(300) = 400; a global sum would say 450.
+        assert_eq!(l2.path_timeout_sum_ms, 400);
+    }
+
     /// @retry: proven at three layers — the Level-1 rule, the Level-2 budget
     /// arithmetic, and the emitted retry loop.
     #[test]
@@ -329,7 +421,11 @@ mod integration {
         let bad = include_str!("../../examples/proofs/retry_without_recover.sigil");
         let program = parse(bad).expect("parse");
         let err = check_failure_paths(&program).expect_err("retry needs recover/error");
-        assert!(format!("{err}").contains("@retry"), "got: {err}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("@retry") || msg.contains("no failure path"),
+            "got: {msg}"
+        );
 
         // 2) Budget charges worst case (1 + retries) x timeout: 600 > 500 fails.
         let overflow = include_str!("../../examples/proofs/retry_budget_overflow.sigil");

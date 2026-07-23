@@ -7,8 +7,11 @@ use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 
 pub fn level1_check(ir: &GraphIR) -> Result<()> {
+    // Per-step @timeout pairing lives in check_failure_paths (AST) where
+    // @error is visible; the old process-global pairing was both too weak
+    // (cross-handler pairing) and too strong (rejected @timeout+@error).
     let has_timeout = ir.has_timeout();
-    let has_recover = ir.has_recover();
+    let has_recover = ir.has_recover() || ir.nodes.iter().any(|n| matches!(n, Node::ErrorAck { .. }));
 
     if has_timeout && !has_recover {
         let loc = ir
@@ -399,8 +402,33 @@ fn walk_failure_paths(
                 };
                 if let Some(name) = target {
                     let is_external = !pure.contains(name);
-                    let has_recover = step.tags.iter().any(|t| matches!(t, Tag::Recover { .. }));
-                    let has_error = step.tags.iter().any(|t| matches!(t, Tag::Error { .. }));
+                    let n_timeout = step.tags.iter().filter(|t| matches!(t, Tag::Timeout { .. })).count();
+                    let n_recover = step.tags.iter().filter(|t| matches!(t, Tag::Recover { .. })).count();
+                    let n_retry = step.tags.iter().filter(|t| matches!(t, Tag::Retry { .. })).count();
+                    let n_error = step.tags.iter().filter(|t| matches!(t, Tag::Error { .. })).count();
+                    if n_timeout > 1 || n_recover > 1 || n_retry > 1 || n_error > 1 {
+                        bail!(
+                            "Level-1 violation in process '{process}': stage '{name}' \
+                             repeats an effect tag — at most one @timeout, @recover, \
+                             @retry, and @error per step"
+                        );
+                    }
+                    if n_recover == 1 && n_error == 1 {
+                        bail!(
+                            "Level-1 violation in process '{process}': stage '{name}' \
+                             declares both @recover and @error — a step either recovers \
+                             or acknowledges the drop, not both"
+                        );
+                    }
+                    let has_recover = n_recover == 1;
+                    let has_error = n_error == 1;
+                    if n_timeout == 1 && !has_recover && !has_error {
+                        bail!(
+                            "Level-1 violation in process '{process}': timed stage '{name}' \
+                             has no failure path on the same step — add @recover(with: f) \
+                             or acknowledge the drop with @error"
+                        );
+                    }
                     if let Some(retry) = step.tags.iter().find_map(|t| match t {
                         Tag::Retry { expr, .. } => Some(expr),
                         _ => None,
@@ -447,7 +475,84 @@ fn walk_failure_paths(
             walk_failure_paths(lhs, pure, process, fallible_fallbacks)?;
             walk_failure_paths(rhs, pure, process, fallible_fallbacks)?;
         }
-        Expr::Call { .. } | Expr::Ident { .. } | Expr::Literal { .. } | Expr::FieldAccess { .. } => {}
+        Expr::Call { name, args, .. } => {
+            if !pure.contains(name.as_str()) {
+                bail!(
+                    "Level-1 violation in process '{process}': external transform \
+                     '{name}' is invoked as a bare call — external stages must be \
+                     pipeline steps carrying @recover or @error"
+                );
+            }
+            for a in args {
+                walk_failure_paths(a, pure, process, fallible_fallbacks)?;
+            }
+        }
+        Expr::Ident { .. } | Expr::Literal { .. } | Expr::FieldAccess { .. } => {}
     }
     Ok(())
+}
+
+/// Pure transforms are the language's infallibility anchor: their bodies may
+/// not invoke external transforms, directly or via pipelines.
+pub fn check_transform_purity(program: &Program) -> Result<()> {
+    use std::collections::BTreeSet;
+    let pure: BTreeSet<&str> = program
+        .transforms
+        .iter()
+        .filter(|t| !t.body.is_empty())
+        .map(|t| t.name.as_str())
+        .collect();
+    for t in program.transforms.iter().filter(|t| !t.body.is_empty()) {
+        for stmt in &t.body {
+            let expr = match stmt {
+                Stmt::Let { expr, .. }
+                | Stmt::Assign { expr, .. }
+                | Stmt::Send { expr, .. }
+                | Stmt::Expr { expr, .. } => expr,
+            };
+            walk_purity(expr, &pure, &t.name)?;
+        }
+    }
+    Ok(())
+}
+
+fn walk_purity(
+    expr: &Expr,
+    pure: &std::collections::BTreeSet<&str>,
+    owner: &str,
+) -> Result<()> {
+    match expr {
+        Expr::Call { name, args, .. } => {
+            if !pure.contains(name.as_str()) {
+                bail!(
+                    "Level-1 violation: pure transform '{owner}' calls external \
+                     transform '{name}' — pure bodies are the infallibility anchor \
+                     and may only call other pure transforms"
+                );
+            }
+            for a in args {
+                walk_purity(a, pure, owner)?;
+            }
+            Ok(())
+        }
+        Expr::Pipeline { base, steps, .. } => {
+            walk_purity(base, pure, owner)?;
+            for step in steps {
+                if let Expr::Ident { name, .. } | Expr::Call { name, .. } = &step.expr {
+                    if !pure.contains(name.as_str()) {
+                        bail!(
+                            "Level-1 violation: pure transform '{owner}' pipelines \
+                             into external transform '{name}'"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_purity(lhs, pure, owner)?;
+            walk_purity(rhs, pure, owner)
+        }
+        _ => Ok(()),
+    }
 }

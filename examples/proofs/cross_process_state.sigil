@@ -1,0 +1,14 @@
+// MUST FAIL: process A writes process B's state slot.
+schema M { v: Int }
+process A {
+  state a_count: Int = 0
+  on m: M {
+    b_count := m.v
+  }
+}
+process B {
+  state b_count: Int = 0
+  on m: M {
+    b_count := b_count + m.v
+  }
+}

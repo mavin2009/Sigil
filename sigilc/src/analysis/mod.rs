@@ -10,7 +10,7 @@ pub mod topology;
 pub use ir::{lower, GraphIR, Node, Edge, EffectSet};
 pub use levels::{level_banner, run_checks, AssuranceLevel, CheckOutcome};
 pub use topology::{derive_topology, Topology, TopologyEdge};
-pub use check::{check_failure_paths, check_transform_signatures, level1_check};
+pub use check::{check_failure_paths, check_transform_purity, check_transform_signatures, level1_check};
 pub use residual::residual_risk_report;
 pub use types::{infer_program, type_name, TypeEnv, TransformTypes};
 pub use level2::{level2_check, Level2Report};

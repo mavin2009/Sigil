@@ -8,7 +8,7 @@
 //! automatic: skipping a level never fails the build silently — every skipped
 //! guarantee is surfaced in the residual-risk report.
 
-use crate::analysis::check::{check_failure_paths, check_transform_signatures, level1_check};
+use crate::analysis::check::{check_failure_paths, check_transform_purity, check_transform_signatures, level1_check};
 use crate::analysis::ir::GraphIR;
 use crate::analysis::level2::{level2_check, Level2Report};
 use crate::analysis::topology::derive_topology;
@@ -65,15 +65,18 @@ pub struct CheckOutcome {
 /// Run all checks appropriate for `level`. Failing a check at or below the
 /// chosen level fails the build; guarantees above the chosen level are
 /// recorded as skipped so the residual report can surface them.
-pub fn run_checks(program: &Program, ir: &GraphIR, level: AssuranceLevel) -> Result<CheckOutcome> {
+pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> Result<CheckOutcome> {
     let mut skipped = Vec::new();
     let mut notes = Vec::new();
     let mut level2 = None;
 
     if level >= AssuranceLevel::Safe {
-        level1_check(ir)?;
+        for ir in irs {
+            level1_check(ir)?;
+        }
         check_transform_signatures(program)?;
         check_failure_paths(program)?;
+        check_transform_purity(program)?;
         derive_topology(program)?;
     } else {
         skipped.push("shared-mutability / local-state discipline (Level-1 not run)".into());
@@ -89,7 +92,7 @@ pub fn run_checks(program: &Program, ir: &GraphIR, level: AssuranceLevel) -> Res
     }
 
     if level >= AssuranceLevel::Contracts {
-        level2 = Some(level2_check(program, ir)?);
+        level2 = Some(level2_check(program, irs)?);
     } else if !program.specs.is_empty() {
         skipped.push("spec obligations (require / hold / extinct) — not checked".into());
         notes.push(format!(
@@ -152,9 +155,9 @@ process P {
     #[test]
     fn sketch_mode_accepts_l1_violations_but_reports_them() {
         let program = parse(L1_VIOLATION).expect("parse");
-        let ir = lower(&program).expect("lower");
+        let irs = lower(&program).expect("lower");
         let outcome =
-            run_checks(&program, &ir, AssuranceLevel::Sketch).expect("sketch must not reject");
+            run_checks(&program, &irs, AssuranceLevel::Sketch).expect("sketch must not reject");
         assert!(outcome.level2.is_none());
         assert!(
             outcome.skipped.iter().any(|s| s.contains("@timeout")),
@@ -168,8 +171,8 @@ process P {
     #[test]
     fn safe_level_still_rejects_l1_violations() {
         let program = parse(L1_VIOLATION).expect("parse");
-        let ir = lower(&program).expect("lower");
-        let err = run_checks(&program, &ir, AssuranceLevel::Safe)
+        let irs = lower(&program).expect("lower");
+        let err = run_checks(&program, &irs, AssuranceLevel::Safe)
             .expect_err("level 1 must reject unhandled timeout");
         assert!(format!("{err}").contains("Level-1"));
     }
@@ -189,8 +192,8 @@ spec S {
 }
 "#;
         let program = parse(src).expect("parse");
-        let ir = lower(&program).expect("lower");
-        let outcome = run_checks(&program, &ir, AssuranceLevel::Safe).expect("l1 ok");
+        let irs = lower(&program).expect("lower");
+        let outcome = run_checks(&program, &irs, AssuranceLevel::Safe).expect("l1 ok");
         assert!(outcome.level2.is_none());
         assert!(outcome
             .notes
@@ -198,7 +201,7 @@ spec S {
             .any(|n| n.contains("NOT checked") && n.contains("--level 2")));
 
         let outcome2 =
-            run_checks(&program, &ir, AssuranceLevel::Contracts).expect("l2 ok");
+            run_checks(&program, &irs, AssuranceLevel::Contracts).expect("l2 ok");
         assert!(outcome2.level2.is_some());
         assert!(outcome2.skipped.is_empty());
     }

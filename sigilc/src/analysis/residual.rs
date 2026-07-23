@@ -20,10 +20,11 @@ fn type_name(ty: &Type) -> String {
 /// Build the residual risk report using IR analysis and declared transform signatures.
 pub fn residual_risk_report(
     program: &Program,
-    ir: &GraphIR,
+    irs: &[GraphIR],
     level2: Option<&Level2Report>,
     level1_enforced: bool,
 ) -> String {
+    let ir = &merge_for_report(irs);
     let mut declared = Vec::new();
     let mut external = Vec::new();
     let mut compiled = Vec::new();
@@ -214,6 +215,27 @@ pub fn residual_risk_report(
     )
 }
 
+fn merge_for_report(irs: &[GraphIR]) -> GraphIR {
+    let mut m = GraphIR {
+        process_name: irs
+            .iter()
+            .map(|i| i.process_name.clone())
+            .collect::<Vec<_>>()
+            .join(", "),
+        process_span: None,
+        local_states: vec![],
+        nodes: vec![],
+        edges: vec![],
+        external_calls: vec![],
+    };
+    for ir in irs {
+        m.local_states.extend(ir.local_states.iter().cloned());
+        m.nodes.extend(ir.nodes.iter().cloned());
+        m.external_calls.extend(ir.external_calls.iter().cloned());
+    }
+    m
+}
+
 /// Backward-compatible wrapper when only the IR is available.
 pub fn residual_risk_report_ir(ir: &GraphIR) -> String {
     residual_risk_report(
@@ -223,7 +245,7 @@ pub fn residual_risk_report_ir(ir: &GraphIR) -> String {
             transforms: vec![],
             specs: vec![],
         },
-        ir,
+        std::slice::from_ref(ir),
         None,
         true,
     )
