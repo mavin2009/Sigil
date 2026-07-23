@@ -12,11 +12,38 @@ These failure modes are rejected or unrepresentable at the default safety level:
 - Null or undefined values
 - `@timeout` without a matching `@recover`
 - External stages with no declared failure path (must carry `@recover` or an explicit `@error` acknowledgment)
+- `@retry` without a terminal failure path (retries delay failure, they do not handle it)
 - State writes to non-local slots
 - Pipeline stages whose types disagree with declared transform signatures
 - `send` to undeclared processes, type-mismatched topology edges, cyclic process graphs, and Float shard-routing keys
 
 Residual risk outside the model (external transforms, OS, scheduler) is always reported explicitly.
+
+## Assurance Levels
+
+| Flag | Level | What runs |
+| ---- | ----- | --------- |
+| `--level 0` / `sketch` | exploratory | parse + lower only; every skipped guarantee is listed in the residual report |
+| `--level 1` / `safe` (default) | extinct-by-design | Level-1 checks, transform signatures, failure paths, topology |
+| `--level 2` / `contracts` | spec obligations | `require` / `hold` / `extinct` on a Level-1-legal graph |
+
+A Level-0 build never claims unverified properties: the residual report leads
+with everything that was NOT established.
+
+## Fault Injection (proving the failure paths)
+
+Generated external stubs route through `sigil_rt::chaos`. Configure via env
+and watch the verified `@timeout` / `@retry` / `@recover` machinery fire under
+concurrent load while message accounting stays exact:
+
+```
+SIGIL_CHAOS_FAIL_PCT=15 SIGIL_CHAOS_LATENCY_MS=120 cargo run --bin demo
+```
+
+Measured on `examples/concurrent/orderflow` (3,200 orders, 15% faults):
+recoveries fell from ~1,700 (no retries) to 510 with `@retry(2)` — matching
+the binomial prediction (0.15³ per retried stage) — with zero messages lost
+at any stage and exact float aggregates throughout.
 
 ## Quick Start
 
@@ -76,6 +103,15 @@ cargo run -p sigilc -- examples/proofs/type_mismatch.sigil /tmp/nope
 
 # Must fail — external stage with no @recover / @error
 cargo run -p sigilc -- examples/proofs/unrecovered_external.sigil /tmp/nope
+
+# Must fail — @retry with no terminal failure path
+cargo run -p sigilc -- examples/proofs/retry_without_recover.sigil /tmp/nope
+
+# Must fail — Float shard-routing key
+cargo run -p sigilc -- examples/proofs/float_route_key.sigil /tmp/nope
+
+# Must fail Level-2 — (1 + 2 retries) × 200ms = 600ms > 500ms SLO
+cargo run -p sigilc -- examples/proofs/retry_budget_overflow.sigil /tmp/nope --level 2
 ```
 
 Integration tests assert both programs are rejected with Level-1 / signature diagnostics.
@@ -88,7 +124,7 @@ Temporal / path obligations on a Level-1-legal graph:
 |-------|---------|
 | Per-step recovery (AST) | Every `@timeout` has `@recover` on the **same** pipeline step |
 | Timeout→Recover (IR) | Every Timeout node in the Graph IR has a Recover successor |
-| `require path_timeout_sum <= N.ms` | Sum of timed stages must not exceed N |
+| `require path_timeout_sum <= N.ms` | Worst-case sum of timed stages — `(1 + retries) × timeout` per stage — must not exceed N |
 | `hold state >= N` | Discharged for pure Int/Float state when init satisfies; residual if externals feed state |
 | `extinct [...]` | Assumptions listed in residual risk |
 
@@ -115,7 +151,7 @@ spec OrderSlo {
 ## Compiler Pipeline
 
 ```
-parse → lower → level1_check → check_transform_signatures → level2_check
+parse → lower → level1_check → check_transform_signatures → check_failure_paths → derive_topology → level2_check
       → residual_risk_report → emit
 ```
 
@@ -193,12 +229,29 @@ on_handler   = "on" ~ ident ~ ":" ~ type ~ "{" ~ stmt* ~ "}"
 
 State is process-local only. Handlers receive a typed message and run a sequence of statements.
 
+Processes form a compiler-verified topology via `send`:
+
+```
+send ok to Risk by ok.id        // hash affinity: same key → same shard
+send s to Settlement            // round-robin (default)
+send done to Audit broadcast    // every shard receives a clone
+```
+
+Every process compiles to a shared-nothing actor: `spawn(self)` moves state
+into an isolated task; a Clone-able typed handle is the only way in; `join()`
+returns state + `{handled, dropped}` accounting after the channel drains.
+Generated code contains no `Mutex`, `Arc`, atomics, or `unsafe` (enforced by
+test). Send targets, edge message types, acyclicity, and shard-key hashability
+(Float keys rejected) are all checked at Level 1.
+
 ### Statements
 
 ```
-stmt         = let_stmt | assign_stmt | expr_stmt
+stmt         = let_stmt | assign_stmt | send_stmt | expr_stmt
 let_stmt     = "let" ~ ident ~ "=" ~ expr
 assign_stmt  = ident ~ ":=" ~ expr            // local state write
+send_stmt    = "send" ~ expr ~ "to" ~ ident ~ route_clause?
+route_clause = ("by" ~ expr) | "broadcast"    // default: round-robin
 expr_stmt    = expr
 ```
 
@@ -242,18 +295,21 @@ Attached to a pipeline step after the transform atom:
 ```
 tag          = "@timeout" ~ "(" ~ expr ~ ")"
              | "@recover" ~ "(" ~ "with" ~ ":" ~ expr ~ ")"
+             | "@retry" ~ "(" ~ expr ~ ")"
              | "@error"
 ```
 
 Rules:
 
 - Every `@timeout` must have a matching `@recover` on the same program (Level-1).
-- `@recover(with: f)` names a fallback transform or expression used when the timed step fails or times out.
+- Every EXTERNAL stage (empty-bodied transform) must carry `@recover` or an explicit `@error` acknowledgment (Level-1). Pure transforms are compiled and infallible — recovery paths should be pure.
+- `@recover(with: f)` names a fallback used when the step fails or times out; it is legal with or without `@timeout`.
+- `@retry(n)` re-attempts the stage up to `n` extra times before the failure path; it requires `@recover` or `@error` on the same step. Level-2 charges the budget the worst case: `(1 + n) × timeout`.
 
 Example:
 
 ```
-let reserved = auth ~> reserve @timeout(120.ms) @recover(with: release)
+let reserved = auth ~> reserve @timeout(120.ms) @retry(2) @recover(with: release)
 ```
 
 ### Specs (parsed; reserved for higher assurance levels)
@@ -293,7 +349,7 @@ process OrderPipeline {
 
   on order: Order {
     let auth = order ~> authorize
-    let reserved = auth ~> reserve @timeout(120.ms) @recover(with: release)
+    let reserved = auth ~> reserve @timeout(120.ms) @retry(2) @recover(with: release)
     let charged = reserved ~> charge @timeout(200.ms) @recover(with: refund)
     let receipt = charged ~> confirm
     last_order := receipt.id
@@ -321,4 +377,4 @@ Negative programs live under `examples/proofs/`.
 
 ## Status
 
-v0.2 — Modular compiler (frontend / analysis / backend), declared transform signatures, pure transform bodies, signature-checked pipelines, residual risk reporting, multi-stage examples in dedicated subdirectories.
+v0.3 — Stratified assurance levels; shared-nothing actor codegen (lock-free by construction, enforced by test); compiler-wired multi-process topologies with hash / round-robin / broadcast routing; total failure-path coverage with `@retry`/`@recover`/`@error`; retry-aware Level-2 timeout budgets; runtime fault injection with exact message accounting; measured zero-loss chaos demos.

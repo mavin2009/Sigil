@@ -34,6 +34,18 @@ entry stage from 64 concurrent producers, then shuts down **stage by stage**:
 closing a stage's channels drains its actors, which release their outboxes,
 cascading a clean shutdown with no message stranded in a closed channel.
 
+## Retries, proven
+
+`score @timeout(60.ms) @retry(2) @recover(with: waive)` and
+`post @retry(2) @recover(with: refund)`:
+
+- Level-1 rejects `@retry` without a terminal failure path
+- Level-2 charges the worst case: `(1+2) × 60ms = 180ms ≤ 200ms` SLO passes;
+  the same shape at `200ms` timeouts fails (`retry_budget_overflow` proof)
+- Under 15% chaos, recoveries fell **~1,700 → 510** with 1,495 retries
+  absorbing faults — matching the binomial prediction: `validate`
+  (recover-only) ≈ 0.15 × 3,200 ≈ 480; each retried stage ≈ 0.15³ × 3,200 ≈ 11
+
 ## Measured under chaos (15% faults, 120ms spikes, 3,200 orders)
 
 ```

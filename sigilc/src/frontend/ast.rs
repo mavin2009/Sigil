@@ -140,6 +140,9 @@ pub struct PipeStep {
 pub enum Tag {
     Timeout { expr: Expr, span: Span },
     Recover { with: Expr, span: Span },
+    /// Re-attempt the stage up to N extra times before taking the failure
+    /// path. Requires @recover or @error on the same step.
+    Retry { expr: Expr, span: Span },
     Error { span: Span },
 }
 
@@ -493,6 +496,9 @@ fn parse_tag(pair: pest::iterators::Pair<Rule>) -> Result<Tag> {
     } else if full.starts_with("@recover") {
         let expr = parse_expr(inner.next().unwrap())?;
         Ok(Tag::Recover { with: expr, span })
+    } else if full.starts_with("@retry") {
+        let expr = parse_expr(inner.next().unwrap())?;
+        Ok(Tag::Retry { expr, span })
     } else {
         Ok(Tag::Error { span })
     }

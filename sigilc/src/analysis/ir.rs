@@ -19,7 +19,7 @@ pub struct GraphIR {
 pub enum Node {
     Input { name: String },
     Call { name: String },
-    Timeout { ms: u64, span: Option<crate::frontend::ast::Span> },
+    Timeout { ms: u64, attempts: u64, span: Option<crate::frontend::ast::Span> },
     Recover { fallback: String, span: Option<crate::frontend::ast::Span> },
     StateWrite { slot: String },
     /// Typed message to another process's actor.
@@ -153,6 +153,17 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
 
 fn lower_pipe_step(step: &crate::frontend::ast::PipeStep, prev: usize, ir: &mut GraphIR) -> usize {
     let mut current = lower_expr(&step.expr, prev, ir);
+    // Attempts = 1 + retries declared on this step.
+    let attempts: u64 = 1 + step
+        .tags
+        .iter()
+        .find_map(|t| match t {
+            Tag::Retry { expr: Expr::Literal { value: Literal::Int(n), .. }, .. } => {
+                Some((*n).max(0) as u64)
+            }
+            _ => None,
+        })
+        .unwrap_or(0);
     for tag in &step.tags {
         match tag {
             Tag::Timeout { expr, span } => {
@@ -161,7 +172,7 @@ fn lower_pipe_step(step: &crate::frontend::ast::PipeStep, prev: usize, ir: &mut 
                     _ => 0,
                 };
                 let idx = ir.nodes.len();
-                ir.nodes.push(Node::Timeout { ms, span: Some(*span) });
+                ir.nodes.push(Node::Timeout { ms, attempts, span: Some(*span) });
                 ir.edges.push(Edge {
                     from: current,
                     to: idx,
@@ -182,6 +193,9 @@ fn lower_pipe_step(step: &crate::frontend::ast::PipeStep, prev: usize, ir: &mut 
                     effects: EffectSet { pure: true, ..Default::default() },
                 });
                 current = idx;
+            }
+            Tag::Retry { .. } => {
+                // Folded into the Timeout node's attempts above; no distinct node.
             }
             Tag::Error { .. } => {
                 // mark error effect on the previous edge if possible

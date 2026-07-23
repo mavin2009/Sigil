@@ -321,6 +321,38 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// @retry: proven at three layers — the Level-1 rule, the Level-2 budget
+    /// arithmetic, and the emitted retry loop.
+    #[test]
+    fn retry_is_proven() {
+        // 1) Retry without a terminal failure path is rejected.
+        let bad = include_str!("../../examples/proofs/retry_without_recover.sigil");
+        let program = parse(bad).expect("parse");
+        let err = check_failure_paths(&program).expect_err("retry needs recover/error");
+        assert!(format!("{err}").contains("@retry"), "got: {err}");
+
+        // 2) Budget charges worst case (1 + retries) x timeout: 600 > 500 fails.
+        let overflow = include_str!("../../examples/proofs/retry_budget_overflow.sigil");
+        let program = parse(overflow).expect("parse");
+        let graph = lower(&program).expect("lower");
+        let err = level2_check(&program, &graph).expect_err("600ms must exceed 500ms SLO");
+        let msg = format!("{err}");
+        assert!(msg.contains("path_timeout_sum"), "got: {msg}");
+
+        // 3) The orderflow budget passes precisely because (1+2)x60 = 180 <= 200,
+        //    and the emitted code contains bounded retry loops.
+        let src = include_str!("../../examples/concurrent/orderflow/orderflow.sigil");
+        let program = parse(src).expect("parse");
+        let graph = lower(&program).expect("lower");
+        let l2 = level2_check(&program, &graph).expect("budget holds with retries");
+        assert_eq!(l2.path_timeout_sum_ms, 180, "budget must charge attempts x timeout");
+        let (rust, _, _) = compile_source(src);
+        assert!(rust.contains("__attempt < 2"), "bounded retry loop missing");
+        assert!(rust.contains("note_retry(\"score\")"));
+        assert!(rust.contains("note_retry(\"post\")"), "untimed retry loop missing");
+        assert!(!rust.contains("Mutex") && !rust.contains("Arc<") && !rust.contains("unsafe"));
+    }
+
     /// Routing: Float keys rejected; the three policies emit distinct code.
     #[test]
     fn routing_policies() {

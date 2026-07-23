@@ -1,0 +1,14 @@
+// MUST FAIL Level-2: worst case (1 + 2 retries) x 200ms = 600ms > 500ms SLO.
+schema M { v: Int }
+transform slow(m: M) -> M {}
+transform skip(m: M) -> M { m }
+process P {
+  state last: Int = 0
+  on m: M {
+    let out = m ~> slow @timeout(200.ms) @retry(2) @recover(with: skip)
+    last := out.v
+  }
+}
+spec Slo {
+  require path_timeout_sum <= 500.ms
+}

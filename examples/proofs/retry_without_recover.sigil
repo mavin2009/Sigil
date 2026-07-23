@@ -1,0 +1,10 @@
+// MUST FAIL: @retry delays failure, it does not handle it.
+schema M { v: Int }
+transform fetch(m: M) -> M {}
+process Broken {
+  state last: Int = 0
+  on m: M {
+    let out = m ~> fetch @timeout(50.ms) @retry(3)
+    last := out.v
+  }
+}

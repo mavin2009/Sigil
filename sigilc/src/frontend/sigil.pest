@@ -54,6 +54,7 @@ pipe_tail = { "~>" ~ atom ~ tag* }
 tag = {
     "@timeout" ~ "(" ~ expr ~ ")"
   | "@recover" ~ "(" ~ "with" ~ ":" ~ expr ~ ")"
+  | "@retry" ~ "(" ~ expr ~ ")"
   | "@error"
 }
 

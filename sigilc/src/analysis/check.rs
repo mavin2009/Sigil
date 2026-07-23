@@ -267,7 +267,7 @@ mod tests {
             process_span: None,
             local_states: vec!["s".into()],
             nodes: vec![
-                Node::Timeout { ms: 50, span: None },
+                Node::Timeout { ms: 50, attempts: 1, span: None },
                 Node::Recover {
                     fallback: "f".into(),
                     span: None,
@@ -285,7 +285,7 @@ mod tests {
             process_name: "P".into(),
             process_span: None,
             local_states: vec![],
-            nodes: vec![Node::Timeout { ms: 50, span: None }],
+            nodes: vec![Node::Timeout { ms: 50, attempts: 1, span: None }],
             edges: vec![],
             external_calls: vec![],
         };
@@ -401,6 +401,28 @@ fn walk_failure_paths(
                     let is_external = !pure.contains(name);
                     let has_recover = step.tags.iter().any(|t| matches!(t, Tag::Recover { .. }));
                     let has_error = step.tags.iter().any(|t| matches!(t, Tag::Error { .. }));
+                    if let Some(retry) = step.tags.iter().find_map(|t| match t {
+                        Tag::Retry { expr, .. } => Some(expr),
+                        _ => None,
+                    }) {
+                        if !has_recover && !has_error {
+                            bail!(
+                                "Level-1 violation in process '{process}': stage '{name}' \
+                                 declares @retry without a terminal failure path — retries \
+                                 delay failure, they do not handle it; add @recover or @error"
+                            );
+                        }
+                        match retry {
+                            crate::frontend::ast::Expr::Literal {
+                                value: crate::frontend::ast::Literal::Int(n),
+                                ..
+                            } if *n >= 1 => {}
+                            _ => bail!(
+                                "Level-1 violation in process '{process}': @retry on stage \
+                                 '{name}' requires an integer literal count >= 1"
+                            ),
+                        }
+                    }
                     if is_external && !has_recover && !has_error {
                         bail!(
                             "Level-1 violation in process '{process}': external stage '{name}' \

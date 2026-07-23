@@ -74,6 +74,7 @@ pub mod chaos {
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     static RECOVERIES: AtomicU64 = AtomicU64::new(0);
+    static RETRIES: AtomicU64 = AtomicU64::new(0);
 
     /// splitmix64 — deterministic sequence, no external deps.
     fn next() -> u64 {
@@ -120,6 +121,11 @@ pub mod chaos {
         Ok(())
     }
 
+    /// Called by generated code whenever a stage re-attempt begins.
+    pub fn note_retry(_stage: &'static str) {
+        RETRIES.fetch_add(1, Relaxed);
+    }
+
     /// Called by generated code whenever a @recover fallback path is taken.
     pub fn note_recovery(_stage: &'static str) {
         RECOVERIES.fetch_add(1, Relaxed);
@@ -131,9 +137,10 @@ pub mod chaos {
 
     pub fn report() -> String {
         format!(
-            "chaos: external calls={} injected faults={} recover paths taken={} (fail_pct={} max_latency={}ms)",
+            "chaos: external calls={} injected faults={} retries={} recover paths taken={} (fail_pct={} max_latency={}ms)",
             CALLS.load(Relaxed),
             FAULTS.load(Relaxed),
+            RETRIES.load(Relaxed),
             RECOVERIES.load(Relaxed),
             fail_pct(),
             max_latency_ms()

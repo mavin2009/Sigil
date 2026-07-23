@@ -320,7 +320,7 @@ fn cmp_holds(op: BinOp, value: f64, bound: f64) -> bool {
 fn check_ir_timeout_recover_edges(ir: &GraphIR) -> Result<()> {
     use crate::analysis::ir::Node;
     for (idx, node) in ir.nodes.iter().enumerate() {
-        if let Node::Timeout { span, ms } = node {
+        if let Node::Timeout { span, ms, .. } = node {
             let has_recover_succ = ir.edges.iter().any(|e| {
                 e.from == idx
                     && matches!(ir.nodes.get(e.to), Some(Node::Recover { .. }))
@@ -403,7 +403,7 @@ fn path_timeout_sum_ms(ir: &GraphIR) -> u64 {
     ir.nodes
         .iter()
         .filter_map(|n| match n {
-            crate::analysis::ir::Node::Timeout { ms, .. } => Some(*ms),
+            crate::analysis::ir::Node::Timeout { ms, attempts, .. } => Some(*ms * *attempts),
             _ => None,
         })
         .sum()

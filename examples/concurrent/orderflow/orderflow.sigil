@@ -38,7 +38,7 @@ process Risk {
   state scored: Int = 0
 
   on order: Order {
-    let s = order ~> score @timeout(60.ms) @recover(with: waive)
+    let s = order ~> score @timeout(60.ms) @retry(2) @recover(with: waive)
     scored := scored + s.units
     send s to Settlement
   }
@@ -49,7 +49,7 @@ process Settlement {
   state total_amount: Float = 0.0
 
   on order: Order {
-    let done = order ~> post @recover(with: refund)
+    let done = order ~> post @retry(2) @recover(with: refund)
     posted := posted + done.units
     total_amount := total_amount + done.amount
     send done to Audit broadcast

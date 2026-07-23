@@ -502,8 +502,25 @@ fn emit_pipeline(
             },
             _ => None,
         });
+        let retries: u64 = step
+            .tags
+            .iter()
+            .find_map(|t| match t {
+                Tag::Retry { expr: Expr::Literal { value: Literal::Int(n), .. }, .. } => {
+                    Some((*n).max(0) as u64)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
 
-        if let Some(ms) = timeout_ms {
+        if let (Some(ms), true) = (timeout_ms, retries > 0) {
+            let fallback = recover.clone().unwrap_or_else(|| transform.clone());
+            // Bounded re-attempts, then the recover path. Worst case
+            // (1 + retries) x timeout is what Level-2 charges the budget.
+            current = format!(
+                "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ __attempt += 1; sigil_rt::chaos::note_retry(\"{transform}\"); }} _ => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
+            );
+        } else if let Some(ms) = timeout_ms {
             let fallback = recover.unwrap_or_else(|| transform.clone());
             if multiline {
                 let inner = format!(
@@ -525,10 +542,17 @@ fn emit_pipeline(
                 );
             }
         } else if let Some(fallback) = recover {
-            // Untimed external stage with a declared recovery path.
-            current = format!(
-                "({{ let __in = {current}; match {transform}(__in.clone()).await {{ Ok(v) => v, Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }})"
-            );
+            if retries > 0 {
+                // Untimed external stage: bounded re-attempts, then recover.
+                current = format!(
+                    "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match {transform}(__in.clone()).await {{ Ok(v) => break v, Err(_) if __attempt < {retries} => {{ __attempt += 1; sigil_rt::chaos::note_retry(\"{transform}\"); }} Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
+                );
+            } else {
+                // Untimed external stage with a declared recovery path.
+                current = format!(
+                    "({{ let __in = {current}; match {transform}(__in.clone()).await {{ Ok(v) => v, Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }})"
+                );
+            }
         } else {
             current = format!("{transform}({current}).await?");
         }
