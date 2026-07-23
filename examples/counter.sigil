@@ -1,0 +1,16 @@
+schema Tick {
+  value: Int
+}
+
+schema Count {
+  total: Int
+}
+
+process Counter {
+  state total: Int = 0
+
+  on tick: Tick {
+    let next = tick ~> increment
+    total := next
+  }
+}

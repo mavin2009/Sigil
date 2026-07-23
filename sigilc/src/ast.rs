@@ -315,4 +315,26 @@ mod tests {
         // body should have several statements
         assert!(p.handlers[0].body.len() >= 3);
     }
+
+    #[test]
+    fn parse_counter_example() {
+        let src = r#"
+schema Tick {
+  value: Int
+}
+process Counter {
+  state total: Int = 0
+  on tick: Tick {
+    let next = tick ~> increment
+    total := next
+  }
+}
+"#;
+        let prog = parse(src).expect("should parse counter");
+        assert_eq!(prog.processes.len(), 1);
+        assert_eq!(prog.processes[0].name, "Counter");
+        assert_eq!(prog.processes[0].states.len(), 1);
+        assert_eq!(prog.processes[0].handlers.len(), 1);
+    }
+
 }
