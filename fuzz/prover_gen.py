@@ -20,7 +20,7 @@ def gen(seed):
     holds = []
 
     for i, p in enumerate(procs):
-        body = [f"process {p} {{", f"  state c{i}: Int = 0", f"  state k{i}: Int = 0", f"  state f{i}: Float = 0.0"]
+        body = [f"process {p} {{", f"  state c{i}: Int = 0", f"  state k{i}: Int = 0", f"  state a{i}: Int = 0"]
         body.append("  on m: M {")
         if r.random() < 0.6:
             body.append("    let z = m ~> ext @timeout(30.ms) @recover(with: pure_f)")
@@ -44,10 +44,10 @@ def gen(seed):
 
         body.append(f"    k{i} := k{i} + 1")
 
-        # float accumulation, clamped one-sided or two-sided
+        # Exact integer accumulation with a two-sided lower clamp.
         if r.random() < 0.5:
-            body.append(f"    f{i} := f{i} + if {src}.v < 0.0 {{ 0.0 }} else {{ {src}.v }}")
-            holds.append(f"  hold f{i} >= 0.0")
+            body.append(f"    a{i} := a{i} + if {src}.n < 0 {{ 0 }} else {{ {src}.n }}")
+            holds.append(f"  hold a{i} >= 0")
 
         # forward, possibly guarded (sometimes with the WRONG guard on purpose)
         if i + 1 < nproc:

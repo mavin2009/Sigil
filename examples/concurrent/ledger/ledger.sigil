@@ -7,7 +7,7 @@
 
 schema Payment {
   id: String,
-  amount: Float,
+  amount: Int,
   units: Int
 }
 
@@ -25,7 +25,7 @@ transform refund(p: Payment) -> Payment { p }
 
 process Ledger {
   state posted: Int = 0
-  state total_amount: Float = 0.0
+  state total_amount: Int = 0
 
   on payment: Payment {
     let ok = payment ~> validate @recover(with: quarantine)
@@ -39,6 +39,6 @@ process Ledger {
 
 spec LedgerSlo {
   require path_timeout_sum <= 200.ms
-  hold total_amount >= 0.0
+  hold total_amount >= 0
   extinct [null]
 }

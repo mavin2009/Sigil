@@ -5,53 +5,91 @@
 //!   INDUCTIVE: assuming every held state satisfies its predicate, every
 //!              reachable assignment to the state re-establishes it.
 //!
-//! The abstract domain is intervals over the reals (sound for Int and Float
-//! updates built from literals, held states, guarded message fields, +, -,
-//! and ×). Anything outside the fragment — values flowing through external
-//! transforms, unguarded inputs — is NOT assumed; it is unbounded, and if
-//! the proof then fails, the error says exactly which assumption is missing.
+//! The abstract domain is exact integer intervals for Rust `i64` operations
+//! that complete without overflow. Generated crates enable overflow checks in
+//! every profile, so an overflowing assignment fails the actor before it can
+//! install a wrapped value. `Float` remains an executable language type but is
+//! deliberately outside the proof fragment: accepting an IEEE-754 theorem
+//! requires explicit rounding, NaN, infinity, and signed-zero semantics.
+//! Anything else — values flowing through external transforms or unguarded
+//! inputs — is the full `i64` range, so an insufficient assumption fails
+//! closed instead of being guessed.
 //!
 //! Input assumptions are written `require <msg>.<field> <cmp> <literal>` in
 //! a spec. They are not taken on faith: codegen emits a guard at handler
 //! entry that rejects (and counts) any message violating them, so every
 //! proof assumption is enforced at runtime and the proof is unconditional.
 
-use crate::frontend::ast::{BinOp, Expr, Literal, Process, Program, SpecItem, Stmt};
+use crate::frontend::ast::{BinOp, Expr, Literal, Process, Program, SpecItem, Stmt, Type};
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+const I64_MIN: i128 = i64::MIN as i128;
+const I64_MAX: i128 = i64::MAX as i128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Interval {
-    pub lo: f64, // -inf allowed
-    pub hi: f64, // +inf allowed
+    pub lo: i128,
+    pub hi: i128,
 }
 
 impl Interval {
     pub const TOP: Interval = Interval {
-        lo: f64::NEG_INFINITY,
-        hi: f64::INFINITY,
+        lo: I64_MIN,
+        hi: I64_MAX,
     };
+    const EMPTY: Interval = Interval { lo: 1, hi: 0 };
 
-    fn point(v: f64) -> Self {
+    fn point(v: i64) -> Self {
+        let v = i128::from(v);
         Interval { lo: v, hi: v }
     }
 
+    /// Range of successful Rust `i64` additions. Values outside the `i64`
+    /// range panic because generated crates enable overflow checks, so they
+    /// cannot become post-state values.
     fn add(self, o: Self) -> Self {
-        Interval {
-            lo: self.lo + o.lo,
-            hi: self.hi + o.hi,
+        Self::runtime_range(self.lo + o.lo, self.hi + o.hi)
+    }
+
+    /// Range of successful Rust `i64` subtractions.
+    fn sub(self, o: Self) -> Self {
+        Self::runtime_range(self.lo - o.hi, self.hi - o.lo)
+    }
+
+    /// Mathematical interval subtraction used for proof deltas, not for an
+    /// emitted arithmetic expression. Delta endpoints can exceed `i64` but
+    /// remain within `i128`.
+    fn math_sub(self, o: Self) -> Self {
+        if self.is_empty() || o.is_empty() {
+            Self::EMPTY
+        } else {
+            Interval {
+                lo: self.lo - o.hi,
+                hi: self.hi - o.lo,
+            }
         }
     }
 
-    fn sub(self, o: Self) -> Self {
-        Interval {
-            lo: self.lo - o.hi,
-            hi: self.hi - o.lo,
+    fn negate_delta(self) -> Self {
+        if self.is_empty() {
+            Self::EMPTY
+        } else {
+            Interval {
+                lo: -self.hi,
+                hi: -self.lo,
+            }
         }
     }
 
     /// Smallest interval containing both — the join of two branches.
     fn hull(self, o: Self) -> Self {
+        if self.is_empty() {
+            return o;
+        }
+        if o.is_empty() {
+            return self;
+        }
         Interval {
             lo: self.lo.min(o.lo),
             hi: self.hi.max(o.hi),
@@ -59,27 +97,59 @@ impl Interval {
     }
 
     fn meet(self, o: Self) -> Self {
-        Interval {
+        let result = Interval {
             lo: self.lo.max(o.lo),
             hi: self.hi.min(o.hi),
+        };
+        if result.is_empty() {
+            Self::EMPTY
+        } else {
+            result
         }
     }
 
     fn mul(self, o: Self) -> Self {
-        let mut c: Vec<f64> = Vec::new();
+        if self.is_empty() || o.is_empty() {
+            return Self::EMPTY;
+        }
+        let mut lo = i128::MAX;
+        let mut hi = i128::MIN;
         for a in [self.lo, self.hi] {
             for b in [o.lo, o.hi] {
-                let v = if (a == 0.0 && b.is_infinite()) || (b == 0.0 && a.is_infinite()) {
-                    0.0 // conservative: 0 × ∞ treated as 0 for corner enumeration
-                } else {
-                    a * b
-                };
-                c.push(v);
+                let v = a * b;
+                lo = lo.min(v);
+                hi = hi.max(v);
             }
         }
-        Interval {
-            lo: c.iter().cloned().fold(f64::INFINITY, f64::min),
-            hi: c.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        Self::runtime_range(lo, hi)
+    }
+
+    fn runtime_range(lo: i128, hi: i128) -> Self {
+        let lo = lo.max(I64_MIN);
+        let hi = hi.min(I64_MAX);
+        if lo > hi {
+            Self::EMPTY
+        } else {
+            Interval { lo, hi }
+        }
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.lo > self.hi
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumericBound {
+    Int(i64),
+    Float(f64),
+}
+
+impl std::fmt::Display for NumericBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(value) => write!(f, "{value}"),
+            Self::Float(value) => write!(f, "{value}"),
         }
     }
 }
@@ -88,44 +158,57 @@ impl Interval {
 #[derive(Debug, Clone)]
 pub struct Pred {
     pub op: BinOp,
-    pub bound: f64,
+    pub bound: NumericBound,
 }
 
 impl Pred {
     /// The region this predicate admits, as an interval.
-    fn region(&self) -> Interval {
-        match self.op {
+    fn region(&self) -> Option<Interval> {
+        let NumericBound::Int(bound) = self.bound else {
+            return None;
+        };
+        let bound = i128::from(bound);
+        Some(match self.op {
             BinOp::Ge => Interval {
-                lo: self.bound,
-                hi: f64::INFINITY,
+                lo: bound,
+                hi: I64_MAX,
             },
+            BinOp::Gt if bound == I64_MAX => Interval::EMPTY,
             BinOp::Gt => Interval {
-                lo: self.bound,
-                hi: f64::INFINITY,
-            }, // sound over-approx of assumption
-            BinOp::Le => Interval {
-                lo: f64::NEG_INFINITY,
-                hi: self.bound,
+                lo: bound + 1,
+                hi: I64_MAX,
             },
+            BinOp::Le => Interval {
+                lo: I64_MIN,
+                hi: bound,
+            },
+            BinOp::Lt if bound == I64_MIN => Interval::EMPTY,
             BinOp::Lt => Interval {
-                lo: f64::NEG_INFINITY,
-                hi: self.bound,
+                lo: I64_MIN,
+                hi: bound - 1,
             },
             _ => Interval::TOP,
-        }
+        })
     }
 
     fn admits(&self, v: Interval) -> bool {
+        if v.is_empty() {
+            return false;
+        }
+        let NumericBound::Int(bound) = self.bound else {
+            return false;
+        };
+        let bound = i128::from(bound);
         match self.op {
-            BinOp::Ge => v.lo >= self.bound,
-            BinOp::Gt => v.lo > self.bound,
-            BinOp::Le => v.hi <= self.bound,
-            BinOp::Lt => v.hi < self.bound,
+            BinOp::Ge => v.lo >= bound,
+            BinOp::Gt => v.lo > bound,
+            BinOp::Le => v.hi <= bound,
+            BinOp::Lt => v.hi < bound,
             _ => false,
         }
     }
 
-    fn admits_point(&self, v: f64) -> bool {
+    fn admits_point(&self, v: i64) -> bool {
         self.admits(Interval::point(v))
     }
 
@@ -158,14 +241,21 @@ pub struct Level3Report {
     pub residual: Vec<String>,
 }
 
-pub(crate) fn lit_value_pub(l: &Literal) -> Option<f64> {
-    lit_value(l)
+pub(crate) fn int_literal_pub(l: &Literal) -> Option<i64> {
+    int_literal(l)
 }
 
-fn lit_value(l: &Literal) -> Option<f64> {
+fn numeric_bound(l: &Literal) -> Option<NumericBound> {
     match l {
-        Literal::Int(i) => Some(*i as f64),
-        Literal::Float(f) => Some(*f),
+        Literal::Int(i) => Some(NumericBound::Int(*i)),
+        Literal::Float(f) if f.is_finite() => Some(NumericBound::Float(*f)),
+        _ => None,
+    }
+}
+
+fn int_literal(l: &Literal) -> Option<i64> {
+    match l {
+        Literal::Int(value) => Some(*value),
         _ => None,
     }
 }
@@ -174,7 +264,7 @@ fn cmp_pred(op: &BinOp, bound: &Expr) -> Option<Pred> {
     let Expr::Literal { value, .. } = bound else {
         return None;
     };
-    let bound = lit_value(value)?;
+    let bound = numeric_bound(value)?;
     match op {
         BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt => Some(Pred {
             op: op.clone(),
@@ -222,6 +312,9 @@ pub fn input_preconditions(program: &Program) -> Vec<InputPrecondition> {
 
 /// Prove every hold in every spec, or fail with an actionable message.
 pub fn level3_prove(program: &Program) -> Result<Level3Report> {
+    // Keep this public entry point sound even when callers bypass the
+    // stratified `run_checks` pipeline.
+    crate::analysis::check::check_numeric_types(program)?;
     let mut report = Level3Report::default();
     let preconds = input_preconditions(program);
     for pc in &preconds {
@@ -335,11 +428,25 @@ fn prove_one(
 
     // BASE
     let decl = owner.states.iter().find(|s| s.name == state).unwrap();
+    if !matches!(decl.ty, Type::Int) {
+        bail!(
+            "Level-3 violation in spec '{spec_name}': state '{state}' has type Float. \
+             Float is executable but outside the proof fragment until Sigil has an \
+             explicit IEEE-754 abstract domain. Represent exact quantities as Int \
+             (for example, monetary minor units) or keep this hold residual below Level 3."
+        );
+    }
+    if !matches!(pred.bound, NumericBound::Int(_)) {
+        bail!(
+            "Level-3 violation in spec '{spec_name}': hold on Int state '{state}' \
+             requires an Int literal bound; Sigil does not coerce proof operands"
+        );
+    }
     match &decl.init {
         Expr::Literal { value, .. } => {
-            let Some(v) = lit_value(value) else {
+            let Some(v) = int_literal(value) else {
                 bail!(
-                    "Level-3 violation in spec '{spec_name}': state '{state}' init is not numeric"
+                    "Level-3 violation in spec '{spec_name}': state '{state}' init must be an Int literal"
                 );
             };
             if !pred.admits_point(v) {
@@ -622,7 +729,7 @@ pub(crate) fn handler_delta_under(
                 let e = eval_interval(rhs, owner, &handler.msg_name, holds, preconds, lets, why);
                 delta = match op {
                     BinOp::Add => Some(e),
-                    BinOp::Sub => Some(Interval::point(0.0).sub(e)),
+                    BinOp::Sub => Some(e.negate_delta()),
                     _ => {
                         why.push(format!("`{state}` update is not additive"));
                         return None;
@@ -637,7 +744,7 @@ pub(crate) fn handler_delta_under(
             }
         }
     }
-    Some(delta.unwrap_or(Interval::point(0.0)))
+    Some(delta.unwrap_or(Interval::point(0)))
 }
 
 /// Prove `a <op> b` for two states of the same process:
@@ -670,11 +777,21 @@ fn prove_relational(
              processes — same-process only at Level 3 (cross-process relations are Level 4)"
         );
     }
-    let lit_init = |st: &str| -> Result<f64> {
+    let a_decl = owner.states.iter().find(|s| s.name == a).unwrap();
+    let b_decl = owner.states.iter().find(|s| s.name == b).unwrap();
+    if !matches!(a_decl.ty, Type::Int) || !matches!(b_decl.ty, Type::Int) {
+        bail!(
+            "Level-3 violation in spec '{spec_name}': relational Float holds are outside \
+             the proof fragment until Sigil has explicit IEEE-754 semantics"
+        );
+    }
+    let lit_init = |st: &str| -> Result<i64> {
         let d = owner.states.iter().find(|s| s.name == st).unwrap();
         match &d.init {
-            Expr::Literal { value, .. } => lit_value(value).ok_or_else(|| {
-                anyhow::anyhow!("Level-3 violation in spec '{spec_name}': `{st}` init not numeric")
+            Expr::Literal { value, .. } => int_literal(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Level-3 violation in spec '{spec_name}': `{st}` init is not an Int literal"
+                )
             }),
             _ => bail!("Level-3 violation in spec '{spec_name}': `{st}` init not a literal"),
         }
@@ -723,10 +840,10 @@ fn prove_relational(
             );
         };
         // Gap change: (b + db) - (a + da) - (b - a) = db - da
-        let gap = db.sub(da);
+        let gap = db.math_sub(da);
         let ok = match op {
-            BinOp::Le | BinOp::Lt => gap.lo >= 0.0,
-            BinOp::Ge | BinOp::Gt => gap.hi <= 0.0,
+            BinOp::Le | BinOp::Lt => gap.lo >= 0,
+            BinOp::Ge | BinOp::Gt => gap.hi <= 0,
             _ => false,
         };
         if !ok {
@@ -759,14 +876,19 @@ pub(crate) fn eval_interval(
     why: &mut Vec<String>,
 ) -> Interval {
     match expr {
-        Expr::Literal { value, .. } => lit_value(value)
+        Expr::Literal { value, .. } => int_literal(value)
             .map(Interval::point)
             .unwrap_or(Interval::TOP),
         Expr::Ident { name, .. } => {
             if let Some(v) = lets.get(name) {
                 *v // tracked let binding
             } else if let Some((p, _)) = holds.get(name) {
-                p.region() // inductive hypothesis
+                p.region().unwrap_or_else(|| {
+                    why.push(format!(
+                        "state `{name}` has a Float hold outside the proof fragment"
+                    ));
+                    Interval::TOP
+                }) // inductive hypothesis
             } else if owner.states.iter().any(|s| s.name == *name) {
                 why.push(format!("state `{name}` has no hold of its own"));
                 Interval::TOP
@@ -795,13 +917,10 @@ pub(crate) fn eval_interval(
                     ));
                     Interval::TOP
                 } else {
-                    bounds.iter().fold(Interval::TOP, |acc, pc| {
-                        let r = pc.pred.region();
-                        Interval {
-                            lo: acc.lo.max(r.lo),
-                            hi: acc.hi.min(r.hi),
-                        }
-                    })
+                    bounds
+                        .iter()
+                        .filter_map(|pc| pc.pred.region())
+                        .fold(Interval::TOP, Interval::meet)
                 }
             } else {
                 why.push(format!(
@@ -882,7 +1001,7 @@ pub(crate) fn narrow(
         return (then_env, else_env);
     };
     let Some(bound) = (match rhs.as_ref() {
-        Expr::Literal { value, .. } => lit_value(value),
+        Expr::Literal { value, .. } => int_literal(value),
         _ => None,
     }) else {
         return (then_env, else_env);
@@ -898,45 +1017,62 @@ pub(crate) fn narrow(
     let current = eval_interval(lhs, owner, msg_name, holds, preconds, lets, &mut scratch);
 
     // Regions admitted by the comparison and by its negation.
+    let bound = i128::from(bound);
     let (t_region, e_region) = match op {
         BinOp::Gt => (
-            Interval {
-                lo: bound,
-                hi: f64::INFINITY,
+            if bound == I64_MAX {
+                Interval::EMPTY
+            } else {
+                Interval {
+                    lo: bound + 1,
+                    hi: I64_MAX,
+                }
             },
             Interval {
-                lo: f64::NEG_INFINITY,
+                lo: I64_MIN,
                 hi: bound,
             },
         ),
         BinOp::Ge => (
             Interval {
                 lo: bound,
-                hi: f64::INFINITY,
+                hi: I64_MAX,
             },
-            Interval {
-                lo: f64::NEG_INFINITY,
-                hi: bound,
+            if bound == I64_MIN {
+                Interval::EMPTY
+            } else {
+                Interval {
+                    lo: I64_MIN,
+                    hi: bound - 1,
+                }
             },
         ),
         BinOp::Lt => (
-            Interval {
-                lo: f64::NEG_INFINITY,
-                hi: bound,
+            if bound == I64_MIN {
+                Interval::EMPTY
+            } else {
+                Interval {
+                    lo: I64_MIN,
+                    hi: bound - 1,
+                }
             },
             Interval {
                 lo: bound,
-                hi: f64::INFINITY,
+                hi: I64_MAX,
             },
         ),
         BinOp::Le => (
             Interval {
-                lo: f64::NEG_INFINITY,
+                lo: I64_MIN,
                 hi: bound,
             },
-            Interval {
-                lo: bound,
-                hi: f64::INFINITY,
+            if bound == I64_MAX {
+                Interval::EMPTY
+            } else {
+                Interval {
+                    lo: bound + 1,
+                    hi: I64_MAX,
+                }
             },
         ),
         _ => return (then_env, else_env),
@@ -992,20 +1128,20 @@ mod tests {
     use crate::frontend::ast::parse;
 
     const PROVABLE: &str = r#"
-schema Payment { id: String, amount: Float, units: Int }
+schema Payment { id: String, amount: Int, units: Int }
 process Ledger {
   state posted: Int = 0
-  state total: Float = 0.0
+  state total: Int = 0
   on payment: Payment {
     posted := posted + payment.units
     total := total + payment.amount
   }
 }
 spec Safe {
-  require payment.amount >= 0.0
+  require payment.amount >= 0
   require payment.units >= 0
   hold posted >= 0
-  hold total >= 0.0
+  hold total >= 0
 }
 "#;
 
@@ -1019,7 +1155,7 @@ spec Safe {
 
     #[test]
     fn unguarded_input_fails_with_actionable_fix() {
-        let src = PROVABLE.replace("  require payment.amount >= 0.0\n", "");
+        let src = PROVABLE.replace("  require payment.amount >= 0\n", "");
         let program = parse(&src).expect("parse");
         let err = level3_prove(&program).expect_err("unbounded input must fail");
         let msg = format!("{err}");
@@ -1041,7 +1177,7 @@ spec Safe {
 
     #[test]
     fn bad_init_fails_base_case() {
-        let src = PROVABLE.replace("state total: Float = 0.0", "state total: Float = -1.0");
+        let src = PROVABLE.replace("state total: Int = 0", "state total: Int = -1");
         let program = parse(&src).expect("parse");
         let err = level3_prove(&program).expect_err("init violates the hold");
         assert!(format!("{err}").contains("BASE CASE fails"));
@@ -1050,9 +1186,9 @@ spec Safe {
     #[test]
     fn let_bindings_keep_guarded_intervals() {
         let src = r#"
-schema Payment { id: String, amount: Float }
+schema Payment { id: String, amount: Int }
 process P {
-  state total: Float = 0.0
+  state total: Int = 0
   on payment: Payment {
     let amt = payment.amount
     let doubled = amt + amt
@@ -1060,8 +1196,8 @@ process P {
   }
 }
 spec S {
-  require payment.amount >= 0.0
-  hold total >= 0.0
+  require payment.amount >= 0
+  hold total >= 0
 }
 "#;
         let program = parse(src).expect("parse");
@@ -1070,19 +1206,19 @@ spec S {
     }
 
     const RELATIONAL: &str = r#"
-schema Tx { id: String, charge: Float, refund: Float }
+schema Tx { id: String, charge: Int, refund: Int }
 process Book {
-  state charged: Float = 0.0
-  state refunded: Float = 0.0
+  state charged: Int = 0
+  state refunded: Int = 0
   on tx: Tx {
     charged := charged + tx.charge
     refunded := refunded + tx.refund
   }
 }
 spec Rel {
-  require tx.charge >= 0.0
-  require tx.refund >= 0.0
-  require tx.refund <= 0.0
+  require tx.charge >= 0
+  require tx.refund >= 0
+  require tx.refund <= 0
   hold refunded <= charged
 }
 "#;
@@ -1102,7 +1238,7 @@ spec Rel {
     fn relational_hold_fails_when_gap_can_shrink() {
         // Remove the upper guard: refund can exceed charge → gap can shrink.
         let src = RELATIONAL.replace(
-            "  require tx.refund <= 0.0
+            "  require tx.refund <= 0
 ",
             "",
         );
@@ -1117,7 +1253,7 @@ spec Rel {
 
     #[test]
     fn relational_hold_fails_bad_init() {
-        let src = RELATIONAL.replace("state refunded: Float = 0.0", "state refunded: Float = 1.0");
+        let src = RELATIONAL.replace("state refunded: Int = 0", "state refunded: Int = 1");
         let program = parse(&src).expect("parse");
         let err = level3_prove(&program).expect_err("init ordering violated");
         assert!(format!("{err}").contains("BASE CASE fails"));
@@ -1125,20 +1261,82 @@ spec Rel {
 
     #[test]
     fn interval_arithmetic_is_sound_on_corners() {
-        let a = Interval {
-            lo: 0.0,
-            hi: f64::INFINITY,
-        };
-        let b = Interval {
-            lo: 0.0,
-            hi: f64::INFINITY,
-        };
+        let a = Interval { lo: 0, hi: I64_MAX };
+        let b = Interval { lo: 0, hi: I64_MAX };
         let s = a.add(b);
-        assert_eq!(s.lo, 0.0);
-        let d = a.sub(b);
-        assert_eq!(d.lo, f64::NEG_INFINITY); // [0,∞) - [0,∞) can be anything ≤ ∞
-        let m = Interval { lo: -2.0, hi: 3.0 }.mul(Interval { lo: -1.0, hi: 4.0 });
-        assert_eq!(m.lo, -8.0);
-        assert_eq!(m.hi, 12.0);
+        assert_eq!(s, Interval { lo: 0, hi: I64_MAX });
+        let d = a.math_sub(b);
+        assert_eq!(d.lo, -I64_MAX);
+        let m = Interval { lo: -2, hi: 3 }.mul(Interval { lo: -1, hi: 4 });
+        assert_eq!(m.lo, -8);
+        assert_eq!(m.hi, 12);
+    }
+
+    #[test]
+    fn integers_above_f64_precision_are_compared_exactly() {
+        let src = r#"
+process P {
+  state low: Int = 9007199254740991
+  state value: Int = 9007199254740993
+}
+spec Exact {
+  hold low < 9007199254740992
+  hold value > 9007199254740992
+}
+"#;
+        let program = parse(src).expect("parse");
+        level3_prove(&program).expect("i64 comparison must not round through f64");
+
+        let bad = src.replace(
+            "hold value > 9007199254740992",
+            "hold value <= 9007199254740992",
+        );
+        let program = parse(&bad).expect("parse");
+        let error = level3_prove(&program).expect_err("exactly larger value must be rejected");
+        assert!(error.to_string().contains("BASE CASE fails"));
+    }
+
+    #[test]
+    fn checked_i64_overflow_cannot_install_a_wrapped_post_state() {
+        let near_max = Interval {
+            lo: I64_MAX - 1,
+            hi: I64_MAX,
+        };
+        assert_eq!(
+            near_max.add(Interval::point(1)),
+            Interval {
+                lo: I64_MAX,
+                hi: I64_MAX
+            }
+        );
+        assert!(Interval::point(i64::MAX).add(Interval::point(1)).is_empty());
+
+        let near_min = Interval {
+            lo: I64_MIN,
+            hi: I64_MIN + 1,
+        };
+        assert_eq!(
+            near_min.sub(Interval::point(1)),
+            Interval {
+                lo: I64_MIN,
+                hi: I64_MIN
+            }
+        );
+        assert!(Interval::point(i64::MIN).sub(Interval::point(1)).is_empty());
+    }
+
+    #[test]
+    fn float_holds_fail_closed_until_ieee_semantics_exist() {
+        let src = r#"
+process P {
+  state value: Float = 0.0
+}
+spec Unsupported {
+  hold value >= 0.0
+}
+"#;
+        let program = parse(src).expect("parse");
+        let error = level3_prove(&program).expect_err("Float theorem must not be emitted");
+        assert!(error.to_string().contains("outside the proof fragment"));
     }
 }

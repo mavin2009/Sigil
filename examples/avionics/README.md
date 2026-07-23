@@ -74,9 +74,11 @@ are legitimate recovery targets and are not fault-injected.
 | `Guidance.commands <= Fusion.fused` | 4 |
 | `Telemetry.sent <= Guidance.commands` | 4 |
 | `valid_frames <= sampled` (conditional acceptance) | 3 relational |
-| `confidence_sum >= 0.0` (two-sided clamp) | 3 inductive |
 | end-to-end latency ≤ 250 ms including hand-off | 2 |
 | no data races, no shared accumulators, every failure path declared | 1 |
+
+`confidence_sum` remains executable Float telemetry. It intentionally has no
+Level-3 theorem until Sigil defines IEEE-754 proof semantics.
 
 Composed: **no attitude command is issued that was not derived from a sampled
 frame, and nothing is downlinked that was not commanded.**

@@ -15,7 +15,7 @@
 
 schema Order {
   id: String,
-  amount: Float
+  amount: Int
 }
 
 transform validate(o: Order) -> Order {}
@@ -47,7 +47,7 @@ process Risk {
 
 process Settlement {
   state posted: Int = 0
-  state total_amount: Float = 0.0
+  state total_amount: Int = 0
 
   on order: Order {
     let done = order ~> post @recover(with: refund)
@@ -57,9 +57,9 @@ process Settlement {
 }
 
 spec Conservation {
-  require order.amount >= 0.0
+  require order.amount >= 0
   require path_timeout_sum <= 200.ms
-  hold total_amount >= 0.0
+  hold total_amount >= 0
   hold Settlement.posted <= Gateway.admitted
   hold Risk.scored <= Gateway.admitted
 }

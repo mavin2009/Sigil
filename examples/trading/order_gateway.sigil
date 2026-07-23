@@ -26,7 +26,8 @@
 //   break the invariants below, since it only DECREASES downstream counts.
 //
 // PROVEN AT --level 3:
-//   notional_at_risk >= 0.0   (assumption `new_order.notional >= 0.0` is
+//   notional_at_risk >= 0     (exact minor-unit assumption
+//                              `new_order.notional >= 0` is
 //                              compiled into a runtime guard)
 //
 // BY CONSTRUCTION (Level 1): no data races, no shared accumulators, every
@@ -37,7 +38,7 @@ schema NewOrder {
   id: String,
   account: String,
   symbol: String,
-  notional: Float
+  notional: Int
 }
 
 schema Cancel {
@@ -80,7 +81,7 @@ process OrderGateway {
 
 process RiskEngine {
   state cleared: Int = 0
-  state notional_at_risk: Float = 0.0
+  state notional_at_risk: Int = 0
 
   on new_order: NewOrder {
     let checked = new_order ~> check_limits @timeout(40.ms) @retry(2) @recover(with: breach_limit)
@@ -113,13 +114,13 @@ process MatchingEngine {
 }
 
 spec ExchangeSafety {
-  require new_order.notional >= 0.0
+  require new_order.notional >= 0
   // END-TO-END bound: processing AND queue hand-off. This is only provable
   // because every send declares a bounded back-pressure policy; with the
   // default @block the compiler rejects the claim as unprovable.
   require path_latency <= 400.ms
 
-  hold notional_at_risk >= 0.0
+  hold notional_at_risk >= 0
 
   hold RiskEngine.cleared <= OrderGateway.received
   hold MatchingEngine.processed <= RiskEngine.cleared

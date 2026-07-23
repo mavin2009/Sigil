@@ -101,7 +101,7 @@ shedding only *decreases* downstream counts:
 
 ```
 [OrderGateway]   received  = 16000
-[RiskEngine]     cleared   = 16000   notional_at_risk = 8000.0
+[RiskEngine]     cleared   = 16000   notional_at_risk = 8000
 [MatchingEngine] processed = 16000
 ```
 

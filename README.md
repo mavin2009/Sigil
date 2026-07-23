@@ -129,7 +129,7 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 | [`examples/avionics/`](examples/avionics/) | **spacecraft attitude control** — every transform bound to a real Rust crate; blocking drivers auto-dispatched off the async runtime; no stubs to hand-edit |
 | [`examples/clearinghouse/`](examples/clearinghouse/) | **derivatives clearing house** — fan-out with divergent reliability, conditional acceptance, clamped accumulation; the most complex example |
 | [`examples/security/`](examples/security/) | **zero-trust secrets vault** — audit-before-serve proven; fail-closed by construction |
-| [`examples/finance/`](examples/finance/) | **clearing & settlement** — 5 proofs, 380 ms budget, an `f64` accumulator with no `Arc<Mutex<>>` |
+| [`examples/finance/`](examples/finance/) | **clearing & settlement** — 5 proofs, 380 ms budget, exact integer minor-unit accounting |
 | [`examples/trading/`](examples/trading/) | **exchange order gateway** — multi-handler; cancels are risk-checked, provably |
 | [`examples/level4/`](examples/level4/) | system conservation across a topology |
 | [`examples/level3/`](examples/level3/) | inductive invariants with runtime-guarded assumptions |
@@ -145,9 +145,9 @@ fallible recovery paths, `Float` shard keys, and sends to a type the target
 cannot receive.
 
 Generated crates additionally forbid `unsafe`, enable overflow checks in
-every profile, and reject non-finite floats at handler entry — because a
-wrapped counter or an `+inf` accumulator would break a proof that the
-compiler had already discharged.
+every profile, and reject non-finite floats at handler entry. Level 3/4
+proofs use exact `Int` semantics; Float remains executable but does not
+receive a theorem.
 
 By proof, when you ask for it: inductive state invariants, relational
 invariants, cross-process conservation, and latency budgets that include
@@ -174,7 +174,7 @@ docs/             language reference, assurance levels, runtime, rationale
 cargo test
 ```
 
-103 tests: runtime, CLI, parser, per-level checks, both provers, topology and
+108 tests: runtime, CLI, parser, per-level checks, both provers, topology and
 routing, codegen shape, end-to-end generated crates, and default-on chaos
 regressions. Every rule has a program in `examples/proofs/` asserted to fail
 *for the right reason*.
@@ -185,7 +185,7 @@ Honest status, because this is the question that matters:
 
 | Area | State |
 | ---- | ----- |
-| Compiler correctness | 95 compiler tests, 5 runtime tests, 3 default-on end-to-end chaos regressions, 27 must-fail programs, fuzz/property scripts, and generated demos that assert their own proofs. Multiple real defects were found this way, including a proof unsoundness. |
+| Compiler correctness | 100 compiler tests, 5 runtime tests, 3 default-on end-to-end chaos regressions, 27 must-fail programs, fuzz/property scripts, and generated demos that assert their own proofs. Multiple real defects were found this way, including proof unsoundnesses. |
 | Residual risk process | Documented with a review gate, control mappings and a PR template |
 | Integration | Documented; generated crates are ordinary Rust with no build script |
 | Observability | Optional `tracing` spans, `ActorStats`, `--emit-graph` topology export |

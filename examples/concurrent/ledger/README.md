@@ -43,11 +43,11 @@ failing mid-recovery.
 
 | Hazard in hand-written Rust                          | Sigil                                        |
 | ---------------------------------------------------- | -------------------------------------------- |
-| Shared `f64` needs `Arc<Mutex<f64>>` (no float atomics) | State is task-local by construction       |
+| Shared exact total needs synchronization                | State is task-local by construction       |
 | Forgetting a timeout fallback → hung request         | `@timeout` without `@recover` fails the build |
 | Forgetting error handling on one RPC → silent loss   | Untagged external stage fails the build      |
 | Holding a user lock across `.await`                  | Sigil emits no user locks                    |
 | Message loss invisible until reconciliation          | Actors count handled/dropped; demo asserts conservation |
 
 Sigil-emitted code contains **zero** `Mutex`, `Arc`, atomics, or `unsafe`
-(enforced by test `emitted_process_is_a_lock_free_actor`).
+(enforced by test `emitted_process_is_a_shared_nothing_actor`).

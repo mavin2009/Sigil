@@ -1,16 +1,16 @@
 // Level-3 proven ledger: both holds are PROVEN inductively, and every proof
 // assumption is a runtime-guarded input precondition.
 //
-//   BASE:      posted = 0 satisfies >= 0; total_amount = 0.0 satisfies >= 0.0
+//   BASE:      posted = 0 satisfies >= 0; total_amount = 0 satisfies >= 0
 //   INDUCTIVE: posted + units stays >= 0 because units is guarded >= 0;
-//              total_amount + amount stays >= 0.0 because amount is guarded >= 0.0
+//              total_amount + amount stays >= 0 because amount is guarded >= 0
 //
 // Compile with --level 3. Remove either `require` and the proof fails with
 // the exact missing assumption named.
 
 schema Payment {
   id: String,
-  amount: Float,
+  amount: Int,
   units: Int
 }
 
@@ -19,7 +19,7 @@ transform quarantine(p: Payment) -> Payment { p }
 
 process Ledger {
   state posted: Int = 0
-  state total_amount: Float = 0.0
+  state total_amount: Int = 0
 
   on payment: Payment {
     let ok = payment ~> validate @recover(with: quarantine)
@@ -29,9 +29,9 @@ process Ledger {
 }
 
 spec Proven {
-  require payment.amount >= 0.0
+  require payment.amount >= 0
   require payment.units >= 0
   hold posted >= 0
-  hold total_amount >= 0.0
+  hold total_amount >= 0
   extinct [null]
 }

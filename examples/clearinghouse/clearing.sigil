@@ -39,7 +39,8 @@
 //   RiskEngine.cleared <= RiskEngine.assessed    (relational: conditional
 //                                                 acceptance never exceeds
 //                                                 what was assessed)
-//   exposure >= 0.0, settled_value >= 0.0        (inductive, with clamping)
+//   exposure >= 0, settled_value >= 0            (exact integer minor units,
+//                                                  inductive, with clamping)
 //
 // PROVEN AT --level 2:
 //   end-to-end latency <= 500ms INCLUDING queue hand-off
@@ -48,14 +49,14 @@
 schema Trade {
   id: String,
   account: String,
-  notional: Float,
+  notional: Int,
   lots: Int
 }
 
 schema Amendment {
   id: String,
   account: String,
-  delta_notional: Float
+  delta_notional: Int
 }
 
 // ---- External residual stages: the real world lives behind these ----
@@ -101,18 +102,18 @@ process Intake {
 process RiskEngine {
   state assessed: Int = 0
   state cleared: Int = 0
-  state exposure: Float = 0.0
+  state exposure: Int = 0
 
   on trade: Trade {
     let checked = trade ~> margin_check @timeout(60.ms) @retry(2) @recover(with: no_margin)
     assessed := assessed + 1
 
-    // Two-sided clamp. A one-sided clamp does NOT prove `exposure >= 0.0`;
+    // Two-sided clamp. A one-sided clamp does NOT prove `exposure >= 0`;
     // the prover rejects it, which is the whole point.
-    let bounded = if checked.notional > 1000000.0 {
-      1000000.0
+    let bounded = if checked.notional > 1000000 {
+      1000000
     } else {
-      if checked.notional < 0.0 { 0.0 } else { checked.notional }
+      if checked.notional < 0 { 0 } else { checked.notional }
     }
     exposure := exposure + bounded
 
@@ -131,10 +132,10 @@ process RiskEngine {
     let checked = amendment ~> amend_margin @timeout(40.ms) @retry(1) @recover(with: no_amend_margin)
     assessed := assessed + 1
 
-    let bounded = if checked.delta_notional > 1000000.0 {
-      1000000.0
+    let bounded = if checked.delta_notional > 1000000 {
+      1000000
     } else {
-      if checked.delta_notional < 0.0 { 0.0 } else { checked.delta_notional }
+      if checked.delta_notional < 0 { 0 } else { checked.delta_notional }
     }
     exposure := exposure + bounded
     cleared := cleared + 1
@@ -145,19 +146,19 @@ process RiskEngine {
 
 process Settlement {
   state settled: Int = 0
-  state settled_value: Float = 0.0
+  state settled_value: Int = 0
 
   on trade: Trade {
     let posted = trade ~> post_trade @timeout(80.ms) @retry(1) @recover(with: unposted_trade)
     settled := settled + 1
-    let value = if posted.notional < 0.0 { 0.0 } else { posted.notional }
+    let value = if posted.notional < 0 { 0 } else { posted.notional }
     settled_value := settled_value + value
   }
 
   on amendment: Amendment {
     let posted = amendment ~> post_amend @timeout(80.ms) @retry(1) @recover(with: unposted_amend)
     settled := settled + 1
-    let value = if posted.delta_notional < 0.0 { 0.0 } else { posted.delta_notional }
+    let value = if posted.delta_notional < 0 { 0 } else { posted.delta_notional }
     settled_value := settled_value + value
   }
 }
@@ -179,8 +180,8 @@ process AuditTrail {
 spec ClearingSafety {
   require path_latency <= 500.ms
 
-  hold exposure >= 0.0
-  hold settled_value >= 0.0
+  hold exposure >= 0
+  hold settled_value >= 0
   hold cleared <= assessed
 
   hold RiskEngine.assessed <= Intake.accepted

@@ -12,8 +12,8 @@
 //   RiskGate.passed    <= Ingest.admitted   no risk pass without intake
 //
 // PROVEN AT --level 3 (per process, inductive):
-//   settled_value >= 0.0                    the book never goes negative
-//   exposure      >= 0.0
+//   settled_value >= 0                      exact minor-unit book never goes negative
+//   exposure      >= 0
 //
 // GUARANTEED BY CONSTRUCTION (Level 1):
 //   no data races (state is task-local; spawn moves it into an isolated task)
@@ -32,7 +32,7 @@
 schema Payment {
   id: String,
   account: String,
-  amount: Float,
+  amount: Int,
   units: Int
 }
 
@@ -61,7 +61,7 @@ process Ingest {
 
 process RiskGate {
   state passed: Int = 0
-  state exposure: Float = 0.0
+  state exposure: Int = 0
 
   on payment: Payment {
     let checked = payment ~> check_limit @timeout(50.ms) @retry(1) @recover(with: hold_for_review)
@@ -83,7 +83,7 @@ process Clearing {
 
 process Settlement {
   state settled: Int = 0
-  state settled_value: Float = 0.0
+  state settled_value: Int = 0
 
   on payment: Payment {
     let posted = payment ~> post_ledger @timeout(70.ms) @retry(1) @recover(with: reverse)
@@ -94,15 +94,15 @@ process Settlement {
 
 spec ClearingHouse {
   // Input contract — compiled into runtime guards at every handler entry.
-  require payment.amount >= 0.0
+  require payment.amount >= 0
 
   // Latency budget: worst case along the longest path through the topology,
   // charging (1 + retries) x timeout per stage.
   require path_timeout_sum <= 400.ms
 
   // Per-process invariants, proven inductively.
-  hold settled_value >= 0.0
-  hold exposure >= 0.0
+  hold settled_value >= 0
+  hold exposure >= 0
 
   // System invariants, proven structurally over the topology.
   hold Settlement.settled <= Ingest.admitted

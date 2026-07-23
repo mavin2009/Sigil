@@ -150,7 +150,7 @@ fn lower_expr(expr: &Expr, prev: usize, ir: &mut GraphIR) -> usize {
             }
             current
         }
-        Expr::Call { name, args: _, .. } => {
+        Expr::Call { name, .. } => {
             let idx = ir.nodes.len();
             ir.nodes.push(Node::Call { name: name.clone() });
             ir.external_calls.push(name.clone());

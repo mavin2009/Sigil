@@ -12,16 +12,17 @@ Status marks:
 
 ## P0 — proof and language soundness
 
-- [ ] **Define the numeric semantics and make the prover implement them.**
-  Level 3 currently represents both `Int` and `Float` intervals with `f64`.
-  That is not an adequate model of `i64` overflow, integers above `2^53`,
-  IEEE-754 rounding, signed zero, or finite operations that produce infinity
-  or NaN. Input finiteness guards do not close the arithmetic case.
-  Acceptance: separate exact integer and explicitly rounded floating-point
-  domains (or remove `Float` from the provable fragment); checked/generated
-  arithmetic has the same semantics; boundary tests cover `i64::{MIN,MAX}`,
-  `2^53±1`, subnormals, signed zero, NaN, infinities, and overflow; no Float
-  theorem is emitted until this is complete.
+- [x] **Define the numeric semantics and make the prover implement them.**
+  The Level 3/4 proof fragment is now exact `Int` only. Its interval endpoints
+  are `i128`, per-shard assertions compare `i64` directly (aggregate checks
+  use `i128`), strict bounds are discrete, and each emitted arithmetic
+  operation is intersected with the successful `i64` range. Generated crates
+  enable overflow checks in every profile, so an overflowing operation fails
+  before wrapped state can be installed. Tests cover `i64::{MIN,MAX}`, values
+  on both sides of `2^53`,
+  mixed proof operands, strict comparisons, and overflow. `Float` remains an
+  executable type, with non-finite input rejected, but every Float hold fails
+  closed at Level 3/4. No IEEE-754 theorem is emitted.
 
 - [ ] **Write reviewable soundness arguments for every Level 3/4 rule.**
   Acceptance: a document states formal preconditions and preservation
@@ -34,9 +35,10 @@ Status marks:
   Duplicate declarations, Rust keywords, unknown schema types, generated
   type collisions, ambiguous state names, actor-field collisions, invalid
   dependency requirements, and TOML injection are now rejected/tested.
-  Remaining acceptance: type-check every expression form, assignment,
-  transform return, field access, schema literal (missing/extra/duplicate
-  fields), conditional branch, route key, and spec operand before codegen.
+  Numeric initializers, assignments, conditionals, spec operands, and spec
+  field access are now checked too. Remaining acceptance: type-check every
+  transform return, call argument, non-numeric assignment, field access,
+  schema literal (missing/extra/duplicate fields), and route key before codegen.
   The property `accepted at Level 1 => generated crate type-checks` must be
   exhaustive over a typed AST generator, not only sampled text.
 
@@ -123,9 +125,11 @@ Status marks:
   smoke campaigns are configured. Remaining acceptance: protect the branch,
   pin Actions by commit, and add dependency policy, the platform/MSRV matrix,
   coverage, and artifact reproducibility.
-- [ ] Declare and test an MSRV. Pin the CI toolchain; record compiler,
-  language, runtime, dependency lockfile, and source SHA in generated
-  artifacts.
+- [~] Declare and test an MSRV. The verification toolchain is pinned to
+  Rust 1.97.0. Remaining acceptance: declare a distinct minimum supported
+  Rust version, test both it and the pinned verification toolchain, and
+  record compiler, language, runtime, dependency lockfile, and source SHA in
+  generated artifacts.
 - [ ] Add `cargo-audit`/RustSec and `cargo-deny` policy for advisories,
   licenses, duplicate critical crates, and allowed registries/git sources.
 - [ ] Generate an SBOM, sign release artifacts and provenance, and verify

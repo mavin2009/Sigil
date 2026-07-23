@@ -51,11 +51,11 @@ cascading a clean shutdown with no message stranded in a closed channel.
 ```
 [Gateway]    handled + dropped = 3200 + 0 = 3200
 [Risk]       handled + dropped = 3200 + 0 = 3200   (~1,700 recoveries fired)
-[Settlement] posted = 3200, total_amount = 3200.0
+[Settlement] posted = 3200, total_amount = 3200
 [Audit]      mirrored = 12800  (= 3200 × 4 shards — broadcast exact)
 ```
 
-Every message accounted for at every stage, exact float totals, and zero
+Every message accounted for at every stage, exact integer totals, and zero
 explicit locks in Sigil-emitted code.
 Hand-writing this in Rust means: channel wiring, shutdown ordering (a
 notorious deadlock source), per-stage timeout/fallback plumbing, and shared

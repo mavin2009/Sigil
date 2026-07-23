@@ -5,7 +5,7 @@
 schema Order {
   id: String,
   sku: String,
-  amount: Float
+  amount: Int
 }
 
 schema Receipt {
@@ -28,7 +28,7 @@ transform confirm(o: Order) -> Receipt {}
 
 process OrderPipeline {
   state last_order: String = "none"
-  state total_charged: Float = 0.0
+  state total_charged: Int = 0
 
   on order: Order {
     let priced = order ~> add_fee
@@ -45,5 +45,5 @@ process OrderPipeline {
 spec OrderSlo {
   require path_timeout_sum <= 500.ms
   extinct [null]
-  hold total_charged >= 0.0
+  hold total_charged >= 0
 }

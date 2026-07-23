@@ -10,7 +10,7 @@
 
 schema Order {
   id: String,
-  amount: Float,
+  amount: Int,
   units: Int
 }
 
@@ -46,7 +46,7 @@ process Risk {
 
 process Settlement {
   state posted: Int = 0
-  state total_amount: Float = 0.0
+  state total_amount: Int = 0
 
   on order: Order {
     let done = order ~> post @retry(2) @recover(with: refund)
@@ -66,6 +66,6 @@ process Audit {
 
 spec Flow {
   require path_timeout_sum <= 200.ms
-  hold total_amount >= 0.0
+  hold total_amount >= 0
   extinct [null]
 }

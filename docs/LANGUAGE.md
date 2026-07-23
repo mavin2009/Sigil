@@ -54,7 +54,9 @@ type = "Int" | "Float" | "String" | "Bool"
 ```
 
 `Int` becomes `i64`, `Float` becomes `f64`. There is no null, no optional,
-and no union type — a value of type `T` is always a `T`.
+and no union type — a value of type `T` is always a `T`. Levels 3–4 prove
+only `Int`; Float programs execute normally, but Float holds fail closed
+until the language defines an IEEE-754 abstract domain.
 
 ## Schemas
 
@@ -234,7 +236,7 @@ Conditionals are expressions, and the provers evaluate each branch under the
 one-sided one does not:
 
 ```
-let bounded = if x > 1000.0 { 1000.0 } else { if x < 0.0 { 0.0 } else { x } }
+let bounded = if x > 1000 { 1000 } else { if x < 0 { 0 } else { x } }
 ```
 
 Conditional counting (`kept := kept + if c { 1 } else { 0 }`) yields a delta
@@ -366,7 +368,8 @@ hardest to anticipate:
 | ---------- | --- |
 | `#![forbid(unsafe_code)]` | not merely unused — unrepresentable |
 | `overflow-checks = true` in **all** profiles | silent wrapping past `i64::MAX` would break a proven invariant; overflow is fail-stop and is surfaced as `ActorPanicked` when the task is joined. It is **not** counted as an ordinary dropped message |
-| finiteness guards on every input `Float` field | rejects `NaN` and infinities at handler entry. Arithmetic on finite values can still overflow to infinity; closing that numeric-model gap is a pre-production checklist item |
+| exact `Int` proof domain | Level 3/4 uses discrete `i64` bounds without converting through `f64`; successful arithmetic matches checked generated operations |
+| fail-closed Float proofs | input `Float` fields reject `NaN` and infinities, but Float holds are rejected at Level 3/4 until an explicit IEEE-754 proof domain exists |
 | no `Mutex`, `RwLock`, `Arc`, or atomics in Sigil-emitted code | asserted by test; this is a shared-nothing source guarantee, not a lock-freedom claim about Tokio or the platform |
 
 Values are **moved on their last use** and cloned only when genuinely needed
@@ -429,7 +432,7 @@ being emitted as invalid or ambiguous Rust.
 ## Complete example
 
 ```
-schema Order   { id: String, amount: Float }
+schema Order   { id: String, amount: Int }
 schema Receipt { id: String, status: String }
 
 transform authorize(o: Order) -> Order {}
@@ -439,7 +442,7 @@ transform refund(o: Order) -> Order { o }
 
 process OrderPipeline {
   state last_order: String = "none"
-  state total_charged: Float = 0.0
+  state total_charged: Int = 0
 
   on order: Order {
     let auth    = order ~> authorize @error
@@ -451,9 +454,9 @@ process OrderPipeline {
 }
 
 spec OrderSlo {
-  require order.amount >= 0.0
+  require order.amount >= 0
   require path_timeout_sum <= 500.ms
-  hold total_charged >= 0.0
+  hold total_charged >= 0
   extinct [null]
 }
 ```

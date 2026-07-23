@@ -33,7 +33,7 @@ SIGIL_DEMO_CAPACITY=4 SIGIL_CHAOS_FAIL_PCT=15 SIGIL_CHAOS_LATENCY_MS=90 cargo ru
 | `Settlement.settled <= RiskEngine.cleared` | 4 |
 | `AuditTrail.recorded <= Intake.accepted` | 4 |
 | `cleared <= assessed` (conditional acceptance never exceeds assessment) | 3 (relational) |
-| `exposure >= 0.0`, `settled_value >= 0.0` | 3 (inductive, via clamping) |
+| `exposure >= 0`, `settled_value >= 0` | 3 (exact integer minor units, inductive via clamping) |
 | end-to-end latency ≤ 500 ms **including queue hand-off** | 2 |
 | no data races, no shared accumulators, every failure path declared | 1 |
 
@@ -63,12 +63,12 @@ fails again — the guard is load-bearing, and a test asserts it.
 the classic shipped bug:
 
 ```
-let bounded = if checked.notional > 1000000.0 { 1000000.0 } else { checked.notional }
+let bounded = if checked.notional > 1000000 { 1000000 } else { checked.notional }
 ```
 
 ```
 INDUCTIVE STEP fails — update `exposure := exposure + bounded` yields
-[-inf, inf] which can escape `exposure >= 0`
+the full `i64` range, which can escape `exposure >= 0`
 ```
 
 The prover evaluates each branch under the **narrowed** condition, so a
@@ -92,10 +92,10 @@ Every number reconciles:
 
 ## Hardening
 
-The generated crate forbids `unsafe` outright, enables overflow checks in
-every profile (a wrapped counter would invalidate a proof), and rejects
-non-finite floats at handler entry — `+inf` satisfies `>= 0.0` and would
-otherwise poison `exposure`.
+The generated crate forbids `unsafe` outright and enables overflow checks in
+every profile. Monetary values use exact integer minor units in both the
+generated code and the Level-3 proof domain; wrapped counters cannot be
+installed as state.
 
 The audit path degraded under pressure, exactly as declared. The settlement
 path stayed fully accounted. Nothing was lost silently, and no invariant

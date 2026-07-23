@@ -2,7 +2,7 @@
 
 use crate::analysis::ir::{GraphIR, Node};
 use crate::analysis::types::{infer_program, type_name};
-use crate::frontend::ast::{BinOp, Expr, Program, Stmt, Tag};
+use crate::frontend::ast::{BinOp, Expr, Literal, Program, SpecItem, Stmt, Tag, Type};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 
@@ -709,6 +709,17 @@ pub fn check_numeric_types(program: &Program) -> Result<()> {
             .collect();
         for st in &process.states {
             check_expr_numeric(&st.init, &base, &schemas, &sigs, &process.name)?;
+            if let Some(init_ty) = expr_ty(&st.init, &base, &schemas, &sigs) {
+                let declared = type_name(&st.ty);
+                if init_ty != declared {
+                    bail!(
+                        "Level-1 violation in process '{}': state '{}' is declared {declared} \
+                         but its initializer has type {init_ty}",
+                        process.name,
+                        st.name
+                    );
+                }
+            }
         }
         for handler in &process.handlers {
             let mut env = base.clone();
@@ -722,15 +733,30 @@ pub fn check_numeric_types(program: &Program) -> Result<()> {
                         }
                         continue;
                     }
-                    Stmt::Assign { expr, .. }
-                    | Stmt::Send { expr, .. }
-                    | Stmt::Expr { expr, .. } => expr,
+                    Stmt::Assign { name, expr, .. } => {
+                        check_expr_numeric(expr, &env, &schemas, &sigs, &process.name)?;
+                        if let (Some(target_ty), Some(value_ty)) =
+                            (env.get(name), expr_ty(expr, &env, &schemas, &sigs))
+                        {
+                            if target_ty != &value_ty {
+                                bail!(
+                                    "Level-1 violation in process '{}': assignment to '{}' \
+                                     expects {target_ty}, found {value_ty}",
+                                    process.name,
+                                    name
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    Stmt::Send { expr, .. } | Stmt::Expr { expr, .. } => expr,
                 };
                 check_expr_numeric(expr, &env, &schemas, &sigs, &process.name)?;
             }
         }
         base.clear();
     }
+    check_spec_numeric_types(program, &schemas)?;
     Ok(())
 }
 
@@ -796,6 +822,17 @@ fn check_expr_numeric(
     process: &str,
 ) -> Result<()> {
     match e {
+        Expr::Literal {
+            value: Literal::Float(value),
+            span,
+        } if !value.is_finite() => {
+            bail!(
+                "Level-1 violation in process '{process}' at bytes {}..{}: \
+                 Float literal must be finite",
+                span.start,
+                span.end
+            )
+        }
         Expr::Binary { op, lhs, rhs, span } => {
             check_expr_numeric(lhs, env, schemas, sigs, process)?;
             check_expr_numeric(rhs, env, schemas, sigs, process)?;
@@ -853,11 +890,35 @@ fn check_expr_numeric(
             cond,
             then_branch,
             else_branch,
-            ..
+            span,
         } => {
             check_expr_numeric(cond, env, schemas, sigs, process)?;
             check_expr_numeric(then_branch, env, schemas, sigs, process)?;
-            check_expr_numeric(else_branch, env, schemas, sigs, process)
+            check_expr_numeric(else_branch, env, schemas, sigs, process)?;
+            if let Some(cond_ty) = expr_ty(cond, env, schemas, sigs) {
+                if cond_ty != "Bool" {
+                    bail!(
+                        "Level-1 violation in process '{process}' at bytes {}..{}: \
+                         if condition must be Bool, found {cond_ty}",
+                        span.start,
+                        span.end
+                    );
+                }
+            }
+            if let (Some(then_ty), Some(else_ty)) = (
+                expr_ty(then_branch, env, schemas, sigs),
+                expr_ty(else_branch, env, schemas, sigs),
+            ) {
+                if then_ty != else_ty {
+                    bail!(
+                        "Level-1 violation in process '{process}' at bytes {}..{}: \
+                         if branches have different types ({then_ty} and {else_ty})",
+                        span.start,
+                        span.end
+                    );
+                }
+            }
+            Ok(())
         }
         Expr::SchemaLit { fields, .. } => {
             for (_, fe) in fields {
@@ -874,6 +935,220 @@ fn check_expr_numeric(
         }
         _ => Ok(()),
     }
+}
+
+fn check_spec_numeric_types(program: &Program, schemas: &SchemaMap<'_>) -> Result<()> {
+    fn spec_expr_ty(program: &Program, schemas: &SchemaMap<'_>, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Literal { value, .. } => Some(
+                match value {
+                    Literal::Int(_) => "Int",
+                    Literal::Float(_) => "Float",
+                    Literal::String(_) => "String",
+                    Literal::Bool(_) => "Bool",
+                    Literal::DurationMs(_) => "Duration",
+                }
+                .to_string(),
+            ),
+            Expr::Ident { name, .. } if name == "path_timeout_sum" || name == "path_latency" => {
+                Some("Duration".into())
+            }
+            Expr::Ident { name, .. } => program
+                .processes
+                .iter()
+                .flat_map(|process| &process.states)
+                .find(|state| state.name == *name)
+                .map(|state| crate::analysis::types::type_name(&state.ty)),
+            Expr::FieldAccess { base, field, .. } => {
+                if let Some(process) = program
+                    .processes
+                    .iter()
+                    .find(|process| process.name == *base)
+                {
+                    return process
+                        .states
+                        .iter()
+                        .find(|state| state.name == *field)
+                        .map(|state| crate::analysis::types::type_name(&state.ty));
+                }
+                let mut found: Option<String> = None;
+                for handler in program
+                    .processes
+                    .iter()
+                    .flat_map(|process| &process.handlers)
+                    .filter(|handler| handler.msg_name == *base)
+                {
+                    let Type::Named(schema_name) = &handler.msg_ty else {
+                        continue;
+                    };
+                    let Some(field_ty) = schemas
+                        .get(schema_name.as_str())
+                        .and_then(|fields| fields.get(field.as_str()))
+                    else {
+                        continue;
+                    };
+                    match &found {
+                        None => found = Some(field_ty.clone()),
+                        Some(existing) if existing == field_ty => {}
+                        Some(_) => return None,
+                    }
+                }
+                found
+            }
+            Expr::Binary { op, lhs, rhs, .. } => match op {
+                BinOp::Le | BinOp::Ge | BinOp::Lt | BinOp::Gt | BinOp::Eq => Some("Bool".into()),
+                _ => spec_expr_ty(program, schemas, lhs)
+                    .or_else(|| spec_expr_ty(program, schemas, rhs)),
+            },
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => spec_expr_ty(program, schemas, then_branch)
+                .or_else(|| spec_expr_ty(program, schemas, else_branch)),
+            _ => None,
+        }
+    }
+
+    fn walk(program: &Program, schemas: &SchemaMap<'_>, expr: &Expr, spec: &str) -> Result<()> {
+        match expr {
+            Expr::Literal {
+                value: Literal::Float(value),
+                span,
+            } if !value.is_finite() => bail!(
+                "Level-1 violation in spec '{spec}' at bytes {}..{}: Float literal must be finite",
+                span.start,
+                span.end
+            ),
+            Expr::Binary { op, lhs, rhs, span } => {
+                walk(program, schemas, lhs, spec)?;
+                walk(program, schemas, rhs, spec)?;
+                let (Some(lhs_ty), Some(rhs_ty)) = (
+                    spec_expr_ty(program, schemas, lhs),
+                    spec_expr_ty(program, schemas, rhs),
+                ) else {
+                    return Ok(());
+                };
+                let numeric = |ty: &str| ty == "Int" || ty == "Float";
+                let arithmetic = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+                let ordering = matches!(op, BinOp::Le | BinOp::Ge | BinOp::Lt | BinOp::Gt);
+                if (arithmetic || ordering)
+                    && (numeric(&lhs_ty) || numeric(&rhs_ty))
+                    && lhs_ty != rhs_ty
+                {
+                    bail!(
+                        "Level-1 violation in spec '{spec}' at bytes {}..{}: \
+                         numeric operands have different types ({lhs_ty} and {rhs_ty}); \
+                         Sigil never coerces Int and Float proof operands",
+                        span.start,
+                        span.end
+                    );
+                }
+                if matches!(op, BinOp::Eq) && lhs_ty != rhs_ty {
+                    bail!(
+                        "Level-1 violation in spec '{spec}' at bytes {}..{}: \
+                         cannot compare {lhs_ty} with {rhs_ty}",
+                        span.start,
+                        span.end
+                    );
+                }
+                Ok(())
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                walk(program, schemas, cond, spec)?;
+                walk(program, schemas, then_branch, spec)?;
+                walk(program, schemas, else_branch, spec)
+            }
+            Expr::SchemaLit { fields, .. } => {
+                for (_, field) in fields {
+                    walk(program, schemas, field, spec)?;
+                }
+                Ok(())
+            }
+            Expr::Call { args, .. } => {
+                for argument in args {
+                    walk(program, schemas, argument, spec)?;
+                }
+                Ok(())
+            }
+            Expr::Pipeline { base, steps, .. } => {
+                walk(program, schemas, base, spec)?;
+                for step in steps {
+                    walk(program, schemas, &step.expr, spec)?;
+                }
+                Ok(())
+            }
+            Expr::FieldAccess { base, field, span } => {
+                if let Some(process) = program
+                    .processes
+                    .iter()
+                    .find(|process| process.name == *base)
+                {
+                    if process.states.iter().any(|state| state.name == *field) {
+                        return Ok(());
+                    }
+                    bail!(
+                        "Level-1 violation in spec '{spec}' at bytes {}..{}: \
+                         process '{base}' has no state '{field}'",
+                        span.start,
+                        span.end
+                    );
+                }
+                let handlers: Vec<_> = program
+                    .processes
+                    .iter()
+                    .flat_map(|process| &process.handlers)
+                    .filter(|handler| handler.msg_name == *base)
+                    .collect();
+                if handlers.is_empty() {
+                    bail!(
+                        "Level-1 violation in spec '{spec}' at bytes {}..{}: \
+                         unknown message or process '{base}'",
+                        span.start,
+                        span.end
+                    );
+                }
+                for handler in handlers {
+                    let Type::Named(schema_name) = &handler.msg_ty else {
+                        bail!(
+                            "Level-1 violation in spec '{spec}': '{base}' does not have \
+                             a schema field '{field}'"
+                        );
+                    };
+                    let present = schemas
+                        .get(schema_name.as_str())
+                        .is_some_and(|fields| fields.contains_key(field.as_str()));
+                    if !present {
+                        bail!(
+                            "Level-1 violation in spec '{spec}' at bytes {}..{}: \
+                             schema '{schema_name}' has no field '{field}'",
+                            span.start,
+                            span.end
+                        );
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    for spec in &program.specs {
+        for item in &spec.items {
+            match item {
+                SpecItem::Require { expr, .. } | SpecItem::Hold { expr, .. } => {
+                    walk(program, schemas, expr, &spec.name)?;
+                }
+                SpecItem::Extinct { .. } => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Well-formedness of multi-handler processes.
@@ -1318,6 +1593,13 @@ mod declaration_tests {
             .to_string()
     }
 
+    fn numeric_rejection(source: &str) -> String {
+        let program = parse(source).expect("test source parses");
+        check_numeric_types(&program)
+            .expect_err("source must be rejected")
+            .to_string()
+    }
+
     #[test]
     fn rejects_names_that_would_break_generated_rust() {
         let duplicate = r#"
@@ -1378,5 +1660,58 @@ process P { on m: M {} }
         let control_path = "extern crate dep = path \"../ok\ninjected\"\n\
 schema M { value: Int }\nprocess P { on m: M {} }";
         assert!(rejection(control_path).contains("control-character"));
+    }
+
+    #[test]
+    fn rejects_numeric_type_gaps_before_proof_or_codegen() {
+        let bad_init = r#"
+schema M { value: Int }
+process P {
+  state count: Int = 0.0
+  on m: M {}
+}
+"#;
+        assert!(numeric_rejection(bad_init).contains("initializer has type Float"));
+
+        let bad_assign = r#"
+schema M { value: Int }
+process P {
+  state count: Int = 0
+  on m: M { count := 1.0 }
+}
+"#;
+        assert!(numeric_rejection(bad_assign).contains("expects Int, found Float"));
+
+        let bad_spec = r#"
+schema M { value: Int }
+process P {
+  state count: Int = 0
+  on m: M { count := count + m.value }
+}
+spec S {
+  require m.value >= 0.0
+  hold count >= 0
+}
+"#;
+        assert!(numeric_rejection(bad_spec).contains("different types"));
+
+        let missing_field = r#"
+schema M { value: Int }
+process P {
+  state count: Int = 0
+  on m: M { count := count + m.value }
+}
+spec S {
+  require m.missing >= 0
+  hold count >= 0
+}
+"#;
+        assert!(numeric_rejection(missing_field).contains("has no field 'missing'"));
+
+        let non_finite = format!(
+            "schema M {{ value: Int }}\nprocess P {{ state x: Float = {}.0 on m: M {{}} }}",
+            "9".repeat(400)
+        );
+        assert!(numeric_rejection(&non_finite).contains("must be finite"));
     }
 }

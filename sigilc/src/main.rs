@@ -489,7 +489,7 @@ mod integration {
         let outcome =
             run_checks(&program, &irs, AssuranceLevel::System).expect("avionics must pass Level 4");
         assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 3);
-        assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 2);
+        assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 1);
 
         let rust = emit(&program, &irs);
 
@@ -732,21 +732,26 @@ process P {{
             "dev AND release"
         );
 
-        // IEEE-754 has values that satisfy `>= 0.0` yet break the interval
-        // model the proofs are stated over. Every Float field is checked
-        // finite at handler entry, whether or not it carries a `require`.
+        // Float is outside the proof fragment, but executable schemas still
+        // reject hostile non-finite input at actor boundaries.
+        let float_src = r#"
+schema Reading { value: Float }
+process Gauge {
+  state seen: Int = 0
+  on reading: Reading {
+    seen := seen + 1
+  }
+}
+"#;
+        let float_program = parse(float_src).expect("parse");
+        let float_irs = lower(&float_program).expect("lower");
+        let float_rust = emit(&float_program, &float_irs);
         assert!(
-            rust.contains("is_finite()"),
+            float_rust.contains("reading.value.is_finite()"),
             "float inputs must be validated"
         );
-        for field in ["notional", "delta_notional"] {
-            assert!(
-                rust.contains(&format!("{field}.is_finite()")),
-                "missing finiteness guard for {field}"
-            );
-        }
         // The rejection is a typed error the actor counts, not a panic.
-        assert!(rust.contains("SigilError::Schema"));
+        assert!(float_rust.contains("SigilError::Schema"));
     }
 
     /// Conditional routing: `send ... when <cond>`. The prover correlates the
@@ -1243,8 +1248,8 @@ spec S { hold Down.got <= Up.seen }
         );
         let rust = emit(&program, &irs);
         assert!(no_shared_mutability(&rust));
-        // The float accumulator that would need Arc<Mutex<f64>> by hand.
-        assert!(rust.contains("pub settled_value: f64"));
+        // Monetary state uses exact integer minor units, never binary floats.
+        assert!(rust.contains("pub settled_value: i64"));
     }
 
     /// The security component: audit-before-serve is PROVEN, and the two
@@ -1360,11 +1365,11 @@ spec S { hold Down.got <= Up.seen }
         // The assumptions are ENFORCED: guards appear in the emitted handler.
         let rust = emit(&program, &irs);
         assert!(
-            rust.contains("payment.amount >= 0f64"),
+            rust.contains("payment.amount >= 0i64"),
             "amount guard missing"
         );
         assert!(
-            rust.contains("(payment.units as f64) >= 0f64"),
+            rust.contains("payment.units >= 0i64"),
             "units guard missing"
         );
         assert!(
@@ -1372,8 +1377,33 @@ spec S { hold Down.got <= Up.seen }
             "guard must reject typed"
         );
 
+        // Neither generated guards nor runtime proof assertions may round
+        // large integers through f64.
+        let exact_src = r#"
+schema M { amount: Int }
+process Exact {
+  state total: Int = 9007199254740993
+  on m: M {
+    total := total + 0
+  }
+}
+spec Exactness {
+  require m.amount > 9007199254740992
+  hold total > 9007199254740992
+}
+"#;
+        let exact_program = parse(exact_src).expect("parse exact integer proof");
+        let exact_irs = lower(&exact_program).expect("lower");
+        run_checks(&exact_program, &exact_irs, AssuranceLevel::Proofs)
+            .expect("exact integer proof");
+        let exact_rust = emit(&exact_program, &exact_irs);
+        assert!(exact_rust.contains("m.amount > 9007199254740992i64"));
+        let exact_demo = sigilc::emit_demo_main(&exact_program);
+        assert!(exact_demo.contains("st.total > 9007199254740992i64"));
+        assert!(!exact_demo.contains("st.total as f64"));
+
         // Dropping an assumption breaks the inductive step with a named fix.
-        let unguarded = src.replace("  require payment.amount >= 0.0\n", "");
+        let unguarded = src.replace("  require payment.amount >= 0\n", "");
         let program = parse(&unguarded).expect("parse");
         let err = level3_prove(&program).expect_err("must fail without the guard");
         let msg = format!("{err}");

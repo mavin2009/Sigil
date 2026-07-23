@@ -291,13 +291,13 @@ process P {
         let src = r#"
 schema M { v: Int }
 process P {
-  state total: Float = 0.0
+  state total: Int = 0
   on m: M {
-    total := total + 1.0
+    total := total + 1
   }
 }
 spec S {
-  hold total >= 0.0
+  hold total >= 0
 }
 "#;
         let program = parse(src).expect("parse");

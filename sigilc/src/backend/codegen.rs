@@ -264,14 +264,9 @@ fn build_input_guards(
         std::collections::BTreeMap::new();
 
     // Finiteness guards on EVERY Float field of every inbound message.
-    //
-    // The provers reason over intervals of finite reals. IEEE-754 has two
-    // values that satisfy `x >= 0.0` while breaking that model: `+inf`
-    // (which poisons any accumulator it touches, and makes `inf - inf` a
-    // NaN) and, in the other direction, NaN itself — which fails every
-    // comparison, so it is rejected by any ordering guard but would slip
-    // through a field with no `require` at all. Both are refused here, so
-    // the numeric model the proofs assume is the model the code executes.
+    // Float is not currently in the Level-3/4 proof fragment, but rejecting
+    // NaN and infinities at the actor boundary gives executable schemas a
+    // predictable finite-input contract.
     for process in &program.processes {
         for handler in &process.handlers {
             let Type::Named(schema_name) = &handler.msg_ty else {
@@ -306,9 +301,16 @@ fn build_input_guards(
             })
             .and_then(|sc| sc.fields.iter().find(|(f, _)| *f == pc.field))
             .map(|(_, ty)| ty.clone());
-        let lhs = match field_ty {
-            Some(Type::Int) => format!("({}.{} as f64)", pc.msg_name, pc.field),
-            _ => format!("{}.{}", pc.msg_name, pc.field),
+        let (lhs, bound) = match (field_ty, pc.pred.bound) {
+            (Some(Type::Int), crate::analysis::level3::NumericBound::Int(value)) => (
+                format!("{}.{}", pc.msg_name, pc.field),
+                format!("{value}i64"),
+            ),
+            (Some(Type::Float), crate::analysis::level3::NumericBound::Float(value)) => (
+                format!("{}.{}", pc.msg_name, pc.field),
+                format!("{value:?}f64"),
+            ),
+            _ => continue,
         };
         let op = match pc.pred.op {
             BinOp::Ge => ">=",
@@ -318,8 +320,8 @@ fn build_input_guards(
             _ => continue,
         };
         let line = format!(
-            "        // Level-3 guarded assumption (spec {}): reject out-of-contract input\n        if !({lhs} {op} {}f64) {{\n            return Err(sigil_rt::SigilError::Schema);\n        }}\n",
-            pc.spec, pc.pred.bound
+            "        // Runtime-enforced spec precondition (spec {}): reject out-of-contract input\n        if !({lhs} {op} {bound}) {{\n            return Err(sigil_rt::SigilError::Schema);\n        }}\n",
+            pc.spec
         );
         map.entry((pc.process.clone(), pc.msg_name.clone()))
             .or_default()
@@ -1386,7 +1388,7 @@ fn demo_field_init(program: &Program, msg_ty: &Type, var: &str, indent: &str) ->
 #[derive(Default)]
 struct HoldChecks {
     /// (process, state, cmp, bound) — checked per shard.
-    scalar: Vec<(String, String, String, f64)>,
+    scalar: Vec<(String, String, String, i64)>,
     /// (process, lo_state, cmp, hi_state) — same process, checked per shard.
     relational: Vec<(String, String, String, String)>,
     /// (lo_proc, lo_state, cmp, hi_proc, hi_state) — checked on aggregates.
@@ -1407,12 +1409,24 @@ fn collect_hold_checks(program: &Program) -> HoldChecks {
     use crate::frontend::ast::{Literal, SpecItem};
     let mut hc = HoldChecks::default();
     let is_proc = |n: &str| program.processes.iter().any(|p| p.name == n);
-    let owner_of = |state: &str| -> Option<String> {
+    let owner_of = |state: &str| -> Option<(String, Type)> {
+        program.processes.iter().find_map(|process| {
+            process
+                .states
+                .iter()
+                .find(|candidate| candidate.name == state)
+                .map(|decl| (process.name.clone(), decl.ty.clone()))
+        })
+    };
+    let state_ty = |process: &str, state: &str| -> Option<Type> {
         program
             .processes
             .iter()
-            .find(|p| p.states.iter().any(|s| s.name == state))
-            .map(|p| p.name.clone())
+            .find(|candidate| candidate.name == process)?
+            .states
+            .iter()
+            .find(|candidate| candidate.name == state)
+            .map(|decl| decl.ty.clone())
     };
 
     for spec in &program.specs {
@@ -1428,18 +1442,19 @@ fn collect_hold_checks(program: &Program) -> HoldChecks {
                 // hold <state> <cmp> <literal>
                 (Expr::Ident { name, .. }, Expr::Literal { value, .. }) => {
                     let bound = match value {
-                        Literal::Int(i) => *i as f64,
-                        Literal::Float(f) => *f,
+                        Literal::Int(i) => *i,
                         _ => continue,
                     };
-                    if let Some(owner) = owner_of(name) {
+                    if let Some((owner, Type::Int)) = owner_of(name) {
                         hc.scalar
                             .push((owner, name.clone(), cmp.to_string(), bound));
                     }
                 }
                 // hold <state> <cmp> <state>   (same process)
                 (Expr::Ident { name: a, .. }, Expr::Ident { name: b, .. }) => {
-                    if let (Some(oa), Some(ob)) = (owner_of(a), owner_of(b)) {
+                    if let (Some((oa, Type::Int)), Some((ob, Type::Int))) =
+                        (owner_of(a), owner_of(b))
+                    {
                         if oa == ob {
                             hc.relational
                                 .push((oa, a.clone(), cmp.to_string(), b.clone()));
@@ -1458,7 +1473,11 @@ fn collect_hold_checks(program: &Program) -> HoldChecks {
                         field: rf,
                         ..
                     },
-                ) if is_proc(lb) && is_proc(rb) => {
+                ) if is_proc(lb)
+                    && is_proc(rb)
+                    && matches!(state_ty(lb, lf), Some(Type::Int))
+                    && matches!(state_ty(rb, rf), Some(Type::Int)) =>
+                {
                     hc.system.push((
                         lb.clone(),
                         lf.clone(),
@@ -1635,8 +1654,12 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         for st in &process.states {
             match st.ty {
                 Type::Int => {
-                    let _ = writeln!(agg_decl, "    let mut {lc}_agg_{}: i64 = 0;", st.name);
-                    let _ = writeln!(agg_add, "        {lc}_agg_{} += st.{};", st.name, st.name);
+                    let _ = writeln!(agg_decl, "    let mut {lc}_agg_{}: i128 = 0;", st.name);
+                    let _ = writeln!(
+                        agg_add,
+                        "        {lc}_agg_{} += i128::from(st.{});",
+                        st.name, st.name
+                    );
                     let _ = writeln!(
                         agg_print,
                         "    println!(\"[{pname}] aggregate {} = {{}}\", {lc}_agg_{});",
@@ -1667,7 +1690,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
             }
             let _ = writeln!(
                 shard_asserts,
-                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {pname}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});"
+                "        assert!(st.{state} {cmp} {bound}i64, \"PROVEN INVARIANT VIOLATED: {pname}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});"
             );
         }
         for (proc_name, a, cmp, b) in &checks.relational {
@@ -1676,7 +1699,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
             }
             let _ = writeln!(
                 shard_asserts,
-                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {pname}.{a} {cmp} {pname}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});"
+                "        assert!(st.{a} {cmp} st.{b}, \"PROVEN INVARIANT VIOLATED: {pname}.{a} {cmp} {pname}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});"
             );
         }
 
@@ -1701,7 +1724,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
             let (llc, hlc) = (lp.to_lowercase(), hp.to_lowercase());
             let _ = writeln!(
                 out,
-                "    assert!(({llc}_agg_{ls} as f64) {cmp} ({hlc}_agg_{hs} as f64), \"PROVEN INVARIANT VIOLATED: {lp}.{ls} {cmp} {hp}.{hs} ({{}} vs {{}})\", {llc}_agg_{ls}, {hlc}_agg_{hs});"
+                "    assert!({llc}_agg_{ls} {cmp} {hlc}_agg_{hs}, \"PROVEN INVARIANT VIOLATED: {lp}.{ls} {cmp} {hp}.{hs} ({{}} vs {{}})\", {llc}_agg_{ls}, {hlc}_agg_{hs});"
             );
         }
         let _ = writeln!(
@@ -1878,7 +1901,7 @@ pub fn emit_demo_main(program: &Program) -> String {
             }
             let _ = writeln!(
                 fleet_asserts,
-                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {p}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});"
+                "        assert!(st.{state} {cmp} {bound}i64, \"PROVEN INVARIANT VIOLATED: {p}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});"
             );
         }
         for (proc_name, a, cmp, b) in &checks.relational {
@@ -1887,7 +1910,7 @@ pub fn emit_demo_main(program: &Program) -> String {
             }
             let _ = writeln!(
                 fleet_asserts,
-                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {p}.{a} {cmp} {p}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});"
+                "        assert!(st.{a} {cmp} st.{b}, \"PROVEN INVARIANT VIOLATED: {p}.{a} {cmp} {p}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});"
             );
         }
     }
@@ -1901,8 +1924,11 @@ pub fn emit_demo_main(program: &Program) -> String {
     for st in &process.states {
         match st.ty {
             Type::Int => {
-                agg_decl.push_str(&format!("    let mut agg_{}: i64 = 0;\n", st.name));
-                agg_add.push_str(&format!("        agg_{} += st.{};\n", st.name, st.name));
+                agg_decl.push_str(&format!("    let mut agg_{}: i128 = 0;\n", st.name));
+                agg_add.push_str(&format!(
+                    "        agg_{} += i128::from(st.{});\n",
+                    st.name, st.name
+                ));
                 agg_print.push_str(&format!(
                     "    println!(\"aggregate {} = {{}}\", agg_{});\n",
                     st.name, st.name

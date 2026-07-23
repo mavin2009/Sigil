@@ -139,14 +139,14 @@ tokens ever appear in generated code.
 Now consider the accumulator in `examples/finance/clearing.sigil`:
 
 ```
-state settled_value: Float = 0.0
+state settled_value: Int = 0
 ```
 
-Rust has no atomic float. The hand-written equivalent of a shared settlement
-total is `Arc<Mutex<f64>>` — which means lock ordering, contention on the hot
-path, and the ever-present risk of holding the guard across an `.await`.
-Sigil's answer is that the value never needs sharing: it lives inside one
-actor's task and comes back at `join()`.
+The value is stored in exact integer minor units so the theorem never depends
+on binary floating-point rounding. A hand-written shared total still needs
+synchronization, with its lock ordering, contention, and risk of holding a
+guard across an `.await`. Sigil's answer is that the value never needs
+sharing: it lives inside one actor's task and comes back at `join()`.
 
 ---
 
@@ -279,7 +279,7 @@ The finance component behaves the same way:
 ```
 [Ingest]     admitted = 1920      [Clearing]   netted  = 1920
 [RiskGate]   passed   = 1920      [Settlement] settled = 1920
-             exposure = 1920.0                 settled_value = 1920.0
+             exposure = 1920                   settled_value = 1920
 ```
 
 `settled <= admitted` is not observed to hold in this run. It was proven

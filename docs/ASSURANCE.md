@@ -73,8 +73,8 @@ Holds are residual at this level; Level 3 proves them.
 
 ## Level 3 — Proofs
 
-A built-in inductive prover over an interval domain — no external SMT
-dependency. For each `hold`:
+A built-in inductive prover over an exact `i64` interval domain — no external
+SMT dependency. For each `hold`:
 
 - **BASE** the declared init satisfies the predicate
 - **INDUCTIVE** assuming every hold, each reachable update re-establishes it
@@ -83,6 +83,11 @@ Also proves **relational holds** within a process (`hold refunded <=
 charged`) by a per-handler delta argument. That is sound at handler
 boundaries precisely because actors are shared-nothing: no interleaving is
 observable mid-handler.
+
+`Float` is executable but deliberately outside Levels 3–4. IEEE-754
+rounding, signed zero, NaN, and infinity require a different abstract domain;
+until one exists, a Float hold is a compile error rather than a guessed
+theorem. Proven monetary quantities use integer minor units.
 
 **Assumptions are never taken on faith.** A `require msg.field <cmp> lit`
 compiles into a guard at handler entry; out-of-contract messages are
@@ -95,7 +100,8 @@ also names it (`unbounded because: input \`payment.amount\` is unguarded`):
 
 ```
 Level-3 violation in spec 'Broken': INDUCTIVE STEP fails — in process
-'Refunds', update `total := total - payment.amount` yields [-inf, inf]
+'Refunds', update `total := total - payment.amount` yields
+[-9223372036854775807, 9223372036854775807]
 which can escape `total >= 0`
   fix: constrain the inputs with `require <msg>.<field> >= 0` in the spec,
   or restructure the update

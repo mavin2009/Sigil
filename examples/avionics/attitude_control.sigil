@@ -29,8 +29,9 @@
 //   Telemetry.sent    <= Guidance.commands     no downlink without a command
 //
 // PROVEN AT --level 3:
-//   confidence_sum >= 0.0    (two-sided clamp; a one-sided clamp is rejected)
 //   valid_frames <= sampled  (conditional acceptance never exceeds intake)
+// Float telemetry remains executable but deliberately outside the proof
+// fragment until Sigil defines explicit IEEE-754 semantics.
 //
 // PROVEN AT --level 2:
 //   end-to-end latency <= 250ms including queue hand-off, because every send
@@ -144,7 +145,6 @@ process Telemetry {
 spec FlightSafety {
   require path_latency <= 250.ms
 
-  hold confidence_sum >= 0.0
   hold valid_frames <= sampled
 
   hold Fusion.fused <= SensorBus.sampled

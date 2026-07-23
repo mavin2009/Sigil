@@ -332,7 +332,22 @@ fn classify_rhs(expr: &Expr, pure_transforms: &BTreeSet<String>, states: &[State
     }
 }
 
-fn parse_numeric_hold(expr: &Expr) -> Option<(String, BinOp, f64)> {
+#[derive(Debug, Clone, Copy)]
+enum NumericValue {
+    Int(i64),
+    Float(f64),
+}
+
+impl std::fmt::Display for NumericValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(value) => write!(f, "{value}"),
+            Self::Float(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+fn parse_numeric_hold(expr: &Expr) -> Option<(String, BinOp, NumericValue)> {
     match expr {
         Expr::Binary { op, lhs, rhs, .. }
             if matches!(
@@ -351,27 +366,32 @@ fn parse_numeric_hold(expr: &Expr) -> Option<(String, BinOp, f64)> {
     }
 }
 
-fn literal_number(expr: &Expr) -> Option<f64> {
+fn literal_number(expr: &Expr) -> Option<NumericValue> {
     match expr {
         Expr::Literal {
             value: Literal::Int(i),
             ..
-        } => Some(*i as f64),
+        } => Some(NumericValue::Int(*i)),
         Expr::Literal {
             value: Literal::Float(f),
             ..
-        } => Some(*f),
+        } if f.is_finite() => Some(NumericValue::Float(*f)),
         _ => None,
     }
 }
 
-fn cmp_holds(op: BinOp, value: f64, bound: f64) -> bool {
-    match op {
-        BinOp::Ge => value >= bound,
-        BinOp::Gt => value > bound,
-        BinOp::Le => value <= bound,
-        BinOp::Lt => value < bound,
-        BinOp::Eq => (value - bound).abs() < f64::EPSILON,
+fn cmp_holds(op: BinOp, value: NumericValue, bound: NumericValue) -> bool {
+    match (value, bound, op) {
+        (NumericValue::Int(value), NumericValue::Int(bound), BinOp::Ge) => value >= bound,
+        (NumericValue::Int(value), NumericValue::Int(bound), BinOp::Gt) => value > bound,
+        (NumericValue::Int(value), NumericValue::Int(bound), BinOp::Le) => value <= bound,
+        (NumericValue::Int(value), NumericValue::Int(bound), BinOp::Lt) => value < bound,
+        (NumericValue::Int(value), NumericValue::Int(bound), BinOp::Eq) => value == bound,
+        (NumericValue::Float(value), NumericValue::Float(bound), BinOp::Ge) => value >= bound,
+        (NumericValue::Float(value), NumericValue::Float(bound), BinOp::Gt) => value > bound,
+        (NumericValue::Float(value), NumericValue::Float(bound), BinOp::Le) => value <= bound,
+        (NumericValue::Float(value), NumericValue::Float(bound), BinOp::Lt) => value < bound,
+        (NumericValue::Float(value), NumericValue::Float(bound), BinOp::Eq) => value == bound,
         _ => false,
     }
 }

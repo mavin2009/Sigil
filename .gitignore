@@ -1,4 +1,33 @@
-/target/
+# Cargo and generated output
+target/
 /generated/
 **/*.rs.bk
+
+# Compiled artifacts outside Cargo's target directory
+*.a
+*.dylib
+*.dll
+*.exe
+*.o
+*.obj
+*.pdb
+*.rlib
+*.rmeta
+*.so
+*.dSYM/
+
+# Coverage, profiling, and crash output
+/coverage/
+*.profdata
+*.profraw
+lcov.info
+core
+core.*
+
+# Editor and operating-system files
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1143,10 +1143,10 @@ process P {
                         assert!(span.is_valid() || span.start <= span.end);
                         for step in steps {
                             match &step.expr {
-                                Expr::Ident { span, .. } | Expr::Call { span, .. } => {
-                                    if span.is_valid() {
-                                        found_ident_or_call = true;
-                                    }
+                                Expr::Ident { span, .. } | Expr::Call { span, .. }
+                                    if span.is_valid() =>
+                                {
+                                    found_ident_or_call = true;
                                 }
                                 _ => {}
                             }
@@ -1159,10 +1159,8 @@ process P {
                             }
                         }
                     }
-                    Expr::Ident { span, .. } | Expr::Call { span, .. } => {
-                        if span.is_valid() {
-                            found_ident_or_call = true;
-                        }
+                    Expr::Ident { span, .. } | Expr::Call { span, .. } if span.is_valid() => {
+                        found_ident_or_call = true;
                     }
                     _ => {}
                 }

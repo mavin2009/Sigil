@@ -29,7 +29,7 @@ use crate::analysis::level3::{
     eval_interval, handler_delta, handler_delta_under, input_preconditions, Interval,
 };
 use crate::analysis::topology::derive_topology;
-use crate::frontend::ast::{BinOp, Expr, Program, Route, SpecItem, Stmt};
+use crate::frontend::ast::{BinOp, Expr, Program, Route, SpecItem, Stmt, Type};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -101,6 +101,8 @@ fn collect_system_holds(program: &Program) -> Result<Vec<SystemHold>> {
 }
 
 pub fn level4_prove(program: &Program) -> Result<Level4Report> {
+    // Direct callers receive the same numeric/type gate as `run_checks`.
+    crate::analysis::check::check_numeric_types(program)?;
     let mut report = Level4Report::default();
     let holds = collect_system_holds(program)?;
     if holds.is_empty() {
@@ -307,11 +309,18 @@ fn prove_system_hold(
                 h.lo_state
             )
         })?;
+    if !matches!(sa.ty, Type::Int) || !matches!(sb.ty, Type::Int) {
+        bail!(
+            "Level-4 violation in spec '{spec}': system Float holds are outside the \
+             proof fragment until Sigil has explicit IEEE-754 rounding, NaN, and \
+             infinity semantics. Use Int units for proven quantities."
+        );
+    }
 
     // ---- BASE ----
-    let lit = |e: &Expr| -> Option<f64> {
+    let lit = |e: &Expr| -> Option<i64> {
         match e {
-            Expr::Literal { value, .. } => crate::analysis::level3::lit_value_pub(value),
+            Expr::Literal { value, .. } => crate::analysis::level3::int_literal_pub(value),
             _ => None,
         }
     };
@@ -319,11 +328,7 @@ fn prove_system_hold(
         (Some(x), Some(y)) => (x, y),
         _ => bail!("Level-4 violation in spec '{spec}': inits must be numeric literals"),
     };
-    let base_holds = match ib.partial_cmp(&ia) {
-        Some(std::cmp::Ordering::Less) => true,
-        Some(std::cmp::Ordering::Equal) => !h.strict,
-        Some(std::cmp::Ordering::Greater) | None => false,
-    };
+    let base_holds = ib < ia || (!h.strict && ib == ia);
     if !base_holds {
         bail!(
             "Level-4 violation in spec '{spec}': BASE CASE fails — init {}.{} = {ib} vs {}.{} = {ia}",
@@ -431,20 +436,19 @@ fn prove_system_hold(
             h.lo_proc
         );
     }
-    let mut db_max: f64 = 0.0;
+    let mut db_max: i128 = 0;
     for hh in &reachable_b {
         let d = delta_of(b, hh, &h.lo_state)?;
-        if d.hi.is_infinite() {
+        if d.is_empty() {
             bail!(
-                "Level-4 violation in spec '{spec}': `{}.{}` has no upper bound per message \
-                 in the `{}` handler — guard the increment (e.g. `require` an upper bound, \
-                 or use a literal counter)",
+                "Level-4 violation in spec '{spec}': `{}.{}` has no successful integer \
+                 delta in the `{}` handler because every represented result overflows",
                 h.lo_proc,
                 h.lo_state,
                 hh.msg_name
             );
         }
-        db_max = db_max.max(d.hi.max(0.0));
+        db_max = db_max.max(d.hi.max(0));
     }
 
     // ---- Per-handler obligations on A ----
@@ -452,7 +456,16 @@ fn prove_system_hold(
     for ha in &a.handlers {
         let da = delta_of(a, ha, &h.hi_state)?;
         // No handler may decrease the bounding counter.
-        if da.lo < 0.0 {
+        if da.is_empty() {
+            bail!(
+                "Level-4 violation in spec '{spec}': `{}.{}` has no successful integer \
+                 delta in the `{}` handler because every represented result overflows",
+                h.hi_proc,
+                h.hi_state,
+                ha.msg_name
+            );
+        }
+        if da.lo < 0 {
             bail!(
                 "Level-4 violation in spec '{spec}': `{}.{}` can DECREASE in the `{}` \
                  handler (delta lo = {}) — the counting argument needs every handler to be \
@@ -599,7 +612,7 @@ fn prove_system_hold(
                 &mut why,
             )
             .unwrap_or(da);
-            let need = (*mult as f64) * db_max;
+            let need = i128::from(*mult) * db_max;
             let ok = if h.strict {
                 need < da_g.lo
             } else {
@@ -635,4 +648,36 @@ fn prove_system_hold(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::ast::parse;
+
+    #[test]
+    fn system_float_holds_fail_closed() {
+        let source = r#"
+schema M { value: Int }
+process Up {
+  state total: Float = 0.0
+  on m: M {
+    total := total + 0.0
+    send m to Down
+  }
+}
+process Down {
+  state total_down: Float = 0.0
+  on m: M {
+    total_down := total_down + 0.0
+  }
+}
+spec Unsupported {
+  hold Down.total_down <= Up.total
+}
+"#;
+        let program = parse(source).expect("parse");
+        let error = level4_prove(&program).expect_err("Float theorem must not be emitted");
+        assert!(error.to_string().contains("system Float holds"));
+    }
 }
