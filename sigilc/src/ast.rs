@@ -528,4 +528,14 @@ process P {
         assert!(found_timeout || found_ident_or_call, "expected Timeout or Ident/Call with valid span");
     }
 
+
+    #[test]
+    fn parse_pipeline_example() {
+        let src = include_str!("../../examples/pipeline.sigil");
+        let prog = parse(src).expect("should parse pipeline.sigil");
+        assert_eq!(prog.processes[0].name, "OrderPipeline");
+        assert_eq!(prog.processes[0].states.len(), 2);
+        assert!(!prog.processes[0].handlers[0].body.is_empty());
+    }
+
 }

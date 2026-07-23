@@ -1,6 +1,5 @@
-// Resilient event processor.
-// Explicit @timeout + @recover, process-local state, causal pipeline.
-// Level-1 rejects an unhandled timeout; residual risk lists only external transforms.
+// Resilient event processor with timed enrichment and local ack state.
+// Pipeline: validate → enrich (timeout/recover) → store → ack.
 
 schema Event {
   id: String,
@@ -14,11 +13,13 @@ schema Result {
 
 process ResilientProcessor {
   state last_ok: String = "none"
+  state processed: Int = 0
 
   on event: Event {
     let validated = event ~> validate
-    let processed = validated ~> enrich @timeout(80.ms) @recover(with: fallback)
-    let stored = processed ~> store
+    let enriched = validated ~> enrich @timeout(80.ms) @recover(with: fallback)
+    let stored = enriched ~> store
     last_ok := stored.id
+    processed := processed + 1
   }
 }

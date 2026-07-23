@@ -1,3 +1,7 @@
+// Multi-stage telemetry ingest.
+// Validate → decompress (timed) → extract metrics → store.
+// Unhandled timeout is rejected at Level-1; recover path is explicit.
+
 schema Telemetry {
   id: String,
   payload: String
@@ -10,12 +14,14 @@ schema Metrics {
 
 process Ingest {
   state last: String = "00000000-0000-0000-0000-000000000000"
+  state count: Int = 0
 
   on packet: Telemetry {
     let v = packet ~> validate
     let d = v ~> decompress @timeout(50.ms) @recover(with: empty)
     let m = d ~> extract
-    m ~> store
+    let _s = m ~> store
     last := m.id
+    count := count + 1
   }
 }

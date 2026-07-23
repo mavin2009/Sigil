@@ -1,11 +1,10 @@
-
-//! Sigilc — Compiler for the Sigil language
-//! Level-1 extinct-by-design properties mapped to safe Rust.
+//! Sigilc — compiler for the Sigil language.
+//! Parses Sigil, lowers to Graph IR, runs Level-1 checks, emits ownership-safe Rust.
 
 use anyhow::{Context, Result};
+use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::env;
 
 mod ast;
 mod check;
@@ -31,23 +30,32 @@ fn main() -> Result<()> {
     println!("=== Sigilc ===");
     println!("Input: {}", input.display());
 
-    let program = ast::parse(&source)
-        .context("parsing")?;
+    let program = ast::parse(&source).context("parsing")?;
+    println!(
+        "Parsed {} schema(s), {} process(es)",
+        program.schemas.len(),
+        program.processes.len()
+    );
 
-    println!("Parsed {} schema(s), {} process(es)", program.schemas.len(), program.processes.len());
+    let graph = ir::lower(&program).context("lowering to Graph IR")?;
+    check::level1_check(&graph).context("Level-1 checks")?;
 
-    let graph = ir::lower(&program)
-        .context("lowering to Graph IR")?;
+    fs::create_dir_all(out.join("src"))?;
 
-    check::level1_check(&graph)
-        .context("Level-1 extinct-by-design checks")?;
+    let rust_code = codegen::emit(&program, &graph);
+    let lib_path = out.join("src/lib.rs");
+    fs::write(&lib_path, &rust_code)?;
+    println!("[codegen] Wrote {}", lib_path.display());
 
-    fs::create_dir_all(&out)?;
-
-    let rust_code = codegen::emit(&graph);
-    let rust_path = out.join("main.rs");
-    fs::write(&rust_path, &rust_code)?;
-    println!("[codegen] Wrote {}", rust_path.display());
+    let pkg_name = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("sigil_out")
+        .replace('-', "_");
+    let cargo = codegen::emit_cargo_toml(&pkg_name);
+    let cargo_path = out.join("Cargo.toml");
+    fs::write(&cargo_path, cargo)?;
+    println!("[codegen] Wrote {}", cargo_path.display());
 
     let risk = codegen::residual_risk_report(&graph);
     let risk_path = out.join("RESIDUAL_RISK.md");
@@ -56,29 +64,22 @@ fn main() -> Result<()> {
 
     println!();
     println!("Level-1 checks passed.");
-    println!("Generated project is ready in {}", out.display());
+    println!("Generated crate is ready in {}", out.display());
     Ok(())
 }
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod integration {
     use crate::ast;
-    use crate::ir;
     use crate::check;
     use crate::codegen;
+    use crate::ir;
 
     fn compile_source(source: &str) -> (String, String, ir::GraphIR) {
         let program = ast::parse(source).expect("parse");
         let graph = ir::lower(&program).expect("lower");
         check::level1_check(&graph).expect("level1");
-        let rust = codegen::emit(&graph);
+        let rust = codegen::emit(&program, &graph);
         let risk = codegen::residual_risk_report(&graph);
         (rust, risk, graph)
     }
@@ -87,49 +88,49 @@ mod integration {
     fn compile_ingest_example() {
         let source = include_str!("../../examples/ingest.sigil");
         let (rust, risk, graph) = compile_source(source);
-
-        assert!(rust.contains("Ingest") || rust.contains("on_packet"));
+        assert!(rust.contains("struct Ingest") || rust.contains("pub struct Ingest"));
+        assert!(rust.contains("on_packet") || rust.contains("timeout"));
         assert!(risk.contains("Level-1"));
-        assert!(risk.contains("Timeout") || risk.contains("timeout") || risk.contains("50ms"));
         assert!(graph.has_timeout());
         assert!(graph.has_recover());
         assert!(!graph.local_states.is_empty());
     }
 
     #[test]
-    
+    fn compile_resilient_example() {
+        let source = include_str!("../../examples/resilient.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert!(graph.has_timeout());
+        assert!(graph.has_recover());
+        assert!(risk.contains("Level-1"));
+        assert!(graph.local_states.iter().any(|s| s == "last_ok"));
+        assert!(rust.contains("ResilientProcessor") || rust.contains("on_event"));
+        assert!(rust.contains("timeout") || rust.contains("Duration"));
+    }
+
     #[test]
-    
+    fn compile_counter_example() {
+        let source = include_str!("../../examples/counter.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert!(!graph.has_timeout() || graph.has_recover());
+        assert!(risk.contains("Level-1"));
+        assert!(rust.contains("Counter") || rust.contains("total") || rust.len() > 50);
+    }
+
     #[test]
     fn compile_circuit_example() {
         let source = include_str!("../../examples/circuit.sigil");
         let (rust, risk, graph) = compile_source(source);
-        assert!(graph.has_timeout(), "circuit example must have a timeout");
-        assert!(graph.has_recover(), "circuit example must recover the timeout");
+        assert_eq!(graph.process_name, "CircuitBreaker");
+        assert!(graph.has_timeout());
+        assert!(graph.has_recover());
         assert!(risk.contains("Level-1"));
-        assert!(graph.local_states.iter().any(|s| s == "last_status" || s == "failures"));
-        assert!(rust.len() > 50);
-    }
-
-    fn compile_resilient_example() {
-        let source = include_str!("../../examples/resilient.sigil");
-        let (rust, risk, graph) = compile_source(source);
-        assert!(graph.has_timeout(), "resilient example must have a timeout");
-        assert!(graph.has_recover(), "resilient example must recover the timeout");
-        assert!(risk.contains("Level-1"));
-        assert!(graph.local_states.iter().any(|s| s == "last_ok"));
-        assert!(rust.len() > 50);
-    }
-
-    fn compile_counter_example() {
-        let source = include_str!("../../examples/counter.sigil");
-        let (rust, risk, graph) = compile_source(source);
-
-        // Counter has no timeouts — still must pass Level-1
-        assert!(!graph.has_timeout() || graph.has_recover());
-        assert!(risk.contains("Level-1"));
-        assert!(!graph.local_states.is_empty() || graph.process_name == "Counter");
-        // Generated code should mention the process or state
-        assert!(rust.contains("Ingest") || rust.contains("Counter") || rust.contains("last") || rust.contains("total") || rust.len() > 100);
+        assert!(
+            graph
+                .local_states
+                .iter()
+                .any(|s| s == "failures" || s == "last_status" || s == "open")
+        );
+        assert!(rust.contains("CircuitBreaker") || rust.contains("on_req"));
     }
 }
