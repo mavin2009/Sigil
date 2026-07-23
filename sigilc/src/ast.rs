@@ -55,6 +55,7 @@ pub struct StateDecl {
     pub name: String,
     pub ty: Type,
     pub init: Expr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +63,7 @@ pub struct OnHandler {
     pub msg_name: String,
     pub msg_ty: Type,
     pub body: Vec<Stmt>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -179,14 +181,16 @@ fn parse_process(pair: pest::iterators::Pair<Rule>) -> Result<Process> {
 }
 
 fn parse_state(pair: pest::iterators::Pair<Rule>) -> Result<StateDecl> {
+    let span = Span::from_pest(pair.as_span());
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
     let ty = parse_type(inner.next().unwrap())?;
     let init = parse_expr(inner.next().unwrap())?;
-    Ok(StateDecl { name, ty, init })
+    Ok(StateDecl { name, ty, init, span })
 }
 
 fn parse_handler(pair: pest::iterators::Pair<Rule>) -> Result<OnHandler> {
+    let span = Span::from_pest(pair.as_span());
     let mut inner = pair.into_inner();
     let msg_name = inner.next().unwrap().as_str().to_string();
     let msg_ty = parse_type(inner.next().unwrap())?;
@@ -194,7 +198,7 @@ fn parse_handler(pair: pest::iterators::Pair<Rule>) -> Result<OnHandler> {
     for item in inner {
         body.push(parse_stmt(item)?);
     }
-    Ok(OnHandler { msg_name, msg_ty, body })
+    Ok(OnHandler { msg_name, msg_ty, body, span })
 }
 
 fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
@@ -391,6 +395,10 @@ mod tests {
         assert!(!prog.processes.is_empty());
         assert!(prog.processes[0].span.is_valid(), "process should have a valid span");
         assert!(prog.processes[0].span.start < prog.processes[0].span.end);
+        assert!(!prog.processes[0].states.is_empty());
+        assert!(prog.processes[0].states[0].span.is_valid());
+        assert!(!prog.processes[0].handlers.is_empty());
+        assert!(prog.processes[0].handlers[0].span.is_valid());
     }
 
     #[test]
