@@ -443,6 +443,17 @@ process P {
     }
 
     #[test]
+    fn parse_circuit_example() {
+        let src = include_str!("../../examples/circuit.sigil");
+        let prog = parse(src).expect("should parse circuit.sigil");
+        assert_eq!(prog.processes.len(), 1);
+        assert_eq!(prog.processes[0].name, "CircuitBreaker");
+        assert_eq!(prog.processes[0].states.len(), 2);
+        assert_eq!(prog.processes[0].handlers.len(), 1);
+        assert!(prog.processes[0].handlers[0].body.len() >= 3);
+    }
+
+    #[test]
     fn parse_resilient_example() {
         let src = include_str!("../../examples/resilient.sigil");
         let prog = parse(src).expect("should parse resilient.sigil");

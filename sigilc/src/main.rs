@@ -99,6 +99,18 @@ mod integration {
     #[test]
     
     #[test]
+    
+    #[test]
+    fn compile_circuit_example() {
+        let source = include_str!("../../examples/circuit.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert!(graph.has_timeout(), "circuit example must have a timeout");
+        assert!(graph.has_recover(), "circuit example must recover the timeout");
+        assert!(risk.contains("Level-1"));
+        assert!(graph.local_states.iter().any(|s| s == "last_status" || s == "failures"));
+        assert!(rust.len() > 50);
+    }
+
     fn compile_resilient_example() {
         let source = include_str!("../../examples/resilient.sigil");
         let (rust, risk, graph) = compile_source(source);

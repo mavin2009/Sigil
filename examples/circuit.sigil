@@ -1,0 +1,29 @@
+// CircuitBreaker — second impressive example demonstrating Sigil's power:
+// - Explicit timeout + recover path that models "open the circuit"
+// - Isolated local state for status tracking
+// - Causal dataflow pipelines
+// - Level-1 extinct-by-design (timeout is recovered; no unhandled failure)
+// - Residual risk reports only the true external transforms
+// - Fully handled by the general modular pipeline (no special-casing)
+
+schema Request {
+  id: String,
+  payload: String
+}
+
+schema Response {
+  id: String,
+  status: String
+}
+
+process CircuitBreaker {
+  state failures: Int = 0
+  state last_status: String = "closed"
+
+  on req: Request {
+    let validated = req ~> validate
+    let result = validated ~> call_service @timeout(50.ms) @recover(with: open_circuit)
+    let final = result ~> record
+    last_status := final.status
+  }
+}
