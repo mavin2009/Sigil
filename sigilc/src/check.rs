@@ -9,14 +9,22 @@ pub fn level1_check(ir: &GraphIR) -> Result<()> {
     let has_recover = ir.has_recover();
 
     if has_timeout && !has_recover {
-        bail!("Level-1 violation: @timeout without a matching @recover path");
+        bail!(
+            "Level-1 violation in process '{}': @timeout without a matching @recover path\n\
+             (source location support is expanding; future versions will point to the exact @timeout)",
+            ir.process_name
+        );
     }
 
     // StateWrite only to local slots
     for node in &ir.nodes {
         if let Node::StateWrite { slot } = node {
             if !ir.local_states.contains(slot) {
-                bail!("Level-1 violation: state write to non-local slot '{}'", slot);
+                bail!(
+                    "Level-1 violation in process '{}': state write to non-local slot '{}'\n\
+                     (source location support is expanding; future versions will point to the assignment)",
+                    ir.process_name, slot
+                );
             }
         }
     }
@@ -53,7 +61,10 @@ mod tests {
             edges: vec![],
             external_calls: vec![],
         };
-        assert!(level1_check(&ir).is_err());
+        let err = level1_check(&ir).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("Level-1 violation"));
+        assert!(msg.contains("@timeout"));
     }
 
     #[test]
@@ -65,6 +76,8 @@ mod tests {
             edges: vec![],
             external_calls: vec![],
         };
-        assert!(level1_check(&ir).is_err());
+        let err = level1_check(&ir).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("non-local slot"));
     }
 }
