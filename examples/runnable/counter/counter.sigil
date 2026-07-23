@@ -1,0 +1,19 @@
+// Runnable counter: pure transform + local state, intended for printed demo output.
+
+schema Tick {
+  value: Int
+}
+
+transform add(x: Int) -> Int {
+  x + 1
+}
+
+process Counter {
+  state total: Int = 0
+
+  on tick: Tick {
+    let next = total + tick.value
+    let bumped = next ~> add
+    total := bumped
+  }
+}

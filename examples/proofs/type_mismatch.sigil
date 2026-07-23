@@ -1,0 +1,22 @@
+// PROOF (negative): feeding Order into a transform that expects Receipt must fail.
+// Expected: compile error — transform 'needs_receipt' expects input type Receipt
+
+schema Order {
+  id: String
+}
+
+schema Receipt {
+  id: String,
+  status: String
+}
+
+transform needs_receipt(r: Receipt) -> Receipt {}
+
+process Broken {
+  state s: String = "none"
+
+  on order: Order {
+    let bad = order ~> needs_receipt
+    s := bad.id
+  }
+}

@@ -52,6 +52,28 @@ Each example lives in its own subdirectory with a `.sigil` program and a short f
 | `examples/resilient/` | compiled `normalize` + residual `enrich` / `store` |
 | `examples/circuit/` | timeout + recover + local status state |
 | `examples/pipeline/` | pure `add_fee` + dual timed residual stages, `Order → Receipt` |
+| `examples/runnable/counter/` | demo-oriented counter for printed state output |
+| `examples/proofs/` | **negative** programs that must fail Level-1 (bug prevention proofs) |
+
+### Runnable demo
+
+```bash
+cargo run -p sigilc -- examples/runnable/counter/counter.sigil generated/runnable_counter --emit-main
+```
+
+Generated crate includes `src/main.rs` that constructs the process, runs one handler, and prints local state.
+
+### Proofs (bug prevention)
+
+```bash
+# Must fail — unhandled @timeout
+cargo run -p sigilc -- examples/proofs/unhandled_timeout.sigil /tmp/nope
+
+# Must fail — Order fed to transform expecting Receipt
+cargo run -p sigilc -- examples/proofs/type_mismatch.sigil /tmp/nope
+```
+
+Integration tests assert both programs are rejected with Level-1 / signature diagnostics.
 
 ## Compiler Pipeline
 

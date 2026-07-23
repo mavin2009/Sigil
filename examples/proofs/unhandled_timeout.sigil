@@ -1,0 +1,17 @@
+// PROOF (negative): @timeout without @recover must fail Level-1.
+// Expected: compile error — Level-1 violation ... @timeout without a matching @recover path
+
+schema Msg {
+  id: String
+}
+
+transform work(m: Msg) -> Msg {}
+
+process Broken {
+  state last: String = "none"
+
+  on msg: Msg {
+    let out = msg ~> work @timeout(10.ms)
+    last := out.id
+  }
+}
