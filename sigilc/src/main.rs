@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use sigilc::{emit, emit_cargo_toml, level1_check, lower, parse, relative_sigil_rt_path, residual_risk_report};
+use sigilc::{check_transform_signatures, emit, emit_cargo_toml, level1_check, lower, parse, relative_sigil_rt_path, residual_risk_report};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -35,6 +35,7 @@ fn main() -> Result<()> {
 
     let graph = lower(&program).context("lowering to Graph IR")?;
     level1_check(&graph).context("Level-1 checks")?;
+    check_transform_signatures(&program).context("transform signature checks")?;
     println!("Level-1 checks passed.");
 
     fs::create_dir_all(out.join("src"))?;
@@ -64,12 +65,13 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod integration {
-    use sigilc::{emit, level1_check, lower, parse, residual_risk_report, GraphIR};
+    use sigilc::{check_transform_signatures, emit, level1_check, lower, parse, residual_risk_report, GraphIR};
 
     fn compile_source(source: &str) -> (String, String, GraphIR) {
         let program = parse(source).expect("parse");
         let graph = lower(&program).expect("lower");
         level1_check(&graph).expect("level1");
+        check_transform_signatures(&program).expect("signatures");
         let rust = emit(&program, &graph);
         let risk = residual_risk_report(&program, &graph);
         (rust, risk, graph)
@@ -97,6 +99,16 @@ mod integration {
         assert!(rust.contains("ResilientProcessor"));
         assert!(rust.contains("on_event"));
         assert!(rust.contains("from_millis(80)") || rust.contains("80"));
+        // Pure normalize is compiled; enrich is external residual
+        assert!(rust.contains("fn normalize"));
+        assert!(
+            risk.contains("normalize") && (risk.contains("body present") || risk.contains("Compiled")),
+            "normalize should be compiled in residual report"
+        );
+        assert!(
+            risk.contains("enrich") && risk.contains("external residual"),
+            "enrich should be external residual"
+        );
     }
 
     #[test]
@@ -170,8 +182,8 @@ mod integration {
 #[cfg(test)]
 mod gen_project {
     use sigilc::{
-        emit, emit_cargo_toml, level1_check, lower, parse, relative_sigil_rt_path,
-        residual_risk_report,
+        check_transform_signatures, emit, emit_cargo_toml, level1_check, lower, parse,
+        relative_sigil_rt_path, residual_risk_report,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -183,6 +195,7 @@ mod gen_project {
         let program = parse(source).expect("parse");
         let graph = lower(&program).expect("lower");
         level1_check(&graph).expect("level1");
+        check_transform_signatures(&program).expect("signatures");
 
         let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/sigil_gen_pipeline");
         let _ = fs::remove_dir_all(&out);

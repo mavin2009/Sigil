@@ -40,14 +40,15 @@ fn schema_field_index(program: &Program) -> BTreeMap<String, BTreeSet<String>> {
     map
 }
 
-fn type_name(ty: &Type) -> String {
+/// Schema-level type name for analysis (not Rust codegen names).
+pub fn type_name(ty: &Type) -> String {
     match ty {
-        Type::Int => "i64".into(),
-        Type::Float => "f64".into(),
+        Type::Int => "Int".into(),
+        Type::Float => "Float".into(),
         Type::String => "String".into(),
-        Type::Bool => "bool".into(),
-        Type::UUID => "String".into(),
-        Type::Bytes => "Vec<u8>".into(),
+        Type::Bool => "Bool".into(),
+        Type::UUID => "UUID".into(),
+        Type::Bytes => "Bytes".into(),
         Type::Duration => "Duration".into(),
         Type::Named(n) => n.clone(),
     }

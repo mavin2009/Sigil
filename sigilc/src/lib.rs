@@ -7,5 +7,5 @@ pub mod analysis;
 pub mod backend;
 
 pub use frontend::{parse, Program, Span};
-pub use analysis::{lower, level1_check, residual_risk_report, GraphIR};
+pub use analysis::{check_transform_signatures, lower, level1_check, residual_risk_report, GraphIR};
 pub use backend::{emit, emit_cargo_toml, relative_sigil_rt_path};

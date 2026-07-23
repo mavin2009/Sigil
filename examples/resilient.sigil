@@ -1,5 +1,4 @@
-// Resilient event processor with timed enrichment and local ack state.
-// Pipeline: validate → enrich (timeout/recover) → store → ack.
+// Resilient processor: pure compiled normalize + timed residual enrich/store.
 
 schema Event {
   id: String,
@@ -11,12 +10,22 @@ schema Result {
   status: String
 }
 
+// Pure: compiled into the generated crate (not residual).
+transform normalize(e: Event) -> Event {
+  e
+}
+
+// External residual stages (empty bodies).
+transform enrich(e: Event) -> Event {}
+transform fallback(e: Event) -> Event {}
+transform store(e: Event) -> Result {}
+
 process ResilientProcessor {
   state last_ok: String = "none"
   state processed: Int = 0
 
   on event: Event {
-    let validated = event ~> validate
+    let validated = event ~> normalize
     let enriched = validated ~> enrich @timeout(80.ms) @recover(with: fallback)
     let stored = enriched ~> store
     last_ok := stored.id
