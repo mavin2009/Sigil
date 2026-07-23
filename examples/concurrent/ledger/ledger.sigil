@@ -1,0 +1,41 @@
+// Concurrent payment ledger.
+//
+// Compiled with --emit-main this becomes a fleet of 8 shared-nothing Ledger
+// actors fed by 64 concurrent producer tasks (16,000 payments) on a
+// multi-threaded runtime. Every aggregate is exact with ZERO locks, Arcs, or
+// atomics — the equivalent hand-written Rust needs Arc<Mutex<f64>> (floats
+// can't be atomic) plus per-stage timeout/fallback plumbing.
+
+schema Payment {
+  id: String,
+  amount: Float,
+  units: Int
+}
+
+// External residual transforms (empty bodies → identity stubs in generated code).
+transform validate(p: Payment) -> Payment {}
+transform risk_check(p: Payment) -> Payment {}
+transform hold_funds(p: Payment) -> Payment {}
+transform release(p: Payment) -> Payment {}
+transform refund(p: Payment) -> Payment {}
+transform post(p: Payment) -> Payment {}
+
+process Ledger {
+  state posted: Int = 0
+  state total_amount: Float = 0.0
+
+  on payment: Payment {
+    let ok = payment ~> validate
+    let risked = ok ~> risk_check @timeout(50.ms) @recover(with: release)
+    let held = risked ~> hold_funds @timeout(80.ms) @recover(with: refund)
+    let done = held ~> post
+    posted := posted + done.units
+    total_amount := total_amount + done.amount
+  }
+}
+
+spec LedgerSlo {
+  require path_timeout_sum <= 200.ms
+  hold total_amount >= 0.0
+  extinct [null]
+}

@@ -288,11 +288,48 @@ mod integration {
             include_str!("../../examples/pipeline/pipeline.sigil"),
             include_str!("../../examples/level2/slo_and_hold.sigil"),
             include_str!("../../examples/runnable/counter/counter.sigil"),
+            include_str!("../../examples/concurrent/ledger/ledger.sigil"),
         ];
         for (i, src) in files.iter().enumerate() {
             let (rust, risk, _) = compile_source(src);
             assert!(rust.len() > 50, "example {i} empty codegen");
             assert!(risk.contains("Level-1"), "example {i} missing residual L1 section");
         }
+    }
+
+    /// Every process must compile to a shared-nothing actor: state moves into
+    /// an isolated task, reachable only through a Clone-able message handle.
+    /// No lock or shared-ownership machinery may appear in generated code.
+    #[test]
+    fn emitted_process_is_a_lock_free_actor() {
+        let source = include_str!("../../examples/concurrent/ledger/ledger.sigil");
+        let (rust, _, _) = compile_source(source);
+        assert!(rust.contains("pub struct LedgerHandle"), "missing actor handle");
+        assert!(
+            rust.contains("tokio::sync::mpsc::channel::<Payment>"),
+            "actor must own a typed channel"
+        );
+        assert!(
+            rust.contains("pub fn spawn(mut self"),
+            "spawn must take state by move — isolation by construction"
+        );
+        assert!(!rust.contains("Mutex"), "generated code must not use locks");
+        assert!(!rust.contains("Arc<"), "generated code must not share ownership");
+        assert!(!rust.contains("unsafe"), "generated code must not use unsafe");
+    }
+
+    /// The demo driver must exercise real concurrency: a fleet of shards fed
+    /// by many producer tasks on a multi-threaded runtime, with aggregate
+    /// invariants printed for verification.
+    #[test]
+    fn demo_main_is_a_concurrent_stress_driver() {
+        let source = include_str!("../../examples/concurrent/ledger/ledger.sigil");
+        let program = parse(source).unwrap();
+        let main_rs = emit_demo_main(&program);
+        assert!(main_rs.contains("multi_thread"));
+        assert!(main_rs.contains("const SHARDS"));
+        assert!(main_rs.contains("const PRODUCERS"));
+        assert!(main_rs.contains("agg_posted") && main_rs.contains("agg_total_amount"));
+        assert!(!main_rs.contains("Mutex") && !main_rs.contains("Arc<"));
     }
 }

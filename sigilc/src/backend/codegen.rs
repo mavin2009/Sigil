@@ -50,6 +50,8 @@ pub fn emit(program: &Program, ir: &GraphIR) -> String {
     for process in &program.processes {
         out.push_str(&emit_process(process));
         out.push('\n');
+        out.push_str(&emit_actor(process));
+        out.push('\n');
     }
 
     let primary_ty = primary_message_type(program);
@@ -168,6 +170,112 @@ fn emit_process(process: &Process) -> String {
     }
     s.push_str("}\n");
     s
+}
+
+
+/// Emit shared-nothing actor machinery for a process.
+///
+/// This is where the Level-1 "no shared mutable state" guarantee is realized
+/// in the generated Rust, not just checked by the compiler:
+///   - `spawn(self)` MOVES the state into an isolated tokio task; after that
+///     no reference to it can exist anywhere else in the program.
+///   - The only way in is a message via a Clone-able `Handle` (an mpsc Sender).
+///   - The only way out is `join()` after the channel closes.
+/// There is no `Arc`, no `Mutex`, and no way to observe state concurrently.
+fn emit_actor(process: &Process) -> String {
+    if process.handlers.is_empty() {
+        return String::new();
+    }
+    let p = &process.name;
+    let mut s = String::new();
+
+    if process.handlers.len() == 1 {
+        let h = &process.handlers[0];
+        let msg_ty = rust_type(&h.msg_ty);
+        let method = format!("on_{}", h.msg_name);
+        s.push_str(&format!(
+            "/// Clone-able, thread-safe handle to a running `{p}` actor.\n\
+             /// Sending is the ONLY way to interact with the actor's state.\n\
+             #[derive(Clone)]\n\
+             pub struct {p}Handle {{\n\
+             \x20   tx: tokio::sync::mpsc::Sender<{msg_ty}>,\n\
+             }}\n\n\
+             impl {p}Handle {{\n\
+             \x20   pub async fn send(&self, msg: {msg_ty}) -> Result<()> {{\n\
+             \x20       self.tx\n\
+             \x20           .send(msg)\n\
+             \x20           .await\n\
+             \x20           .map_err(|_| sigil_rt::SigilError::Transform(\"actor stopped\".into()))\n\
+             \x20   }}\n\
+             }}\n\n\
+             impl {p} {{\n\
+             \x20   /// Move this process's state into an isolated task.\n\
+             \x20   /// After `spawn`, the state is unreachable except via messages;\n\
+             \x20   /// it is returned intact when the last Handle is dropped.\n\
+             \x20   pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<Self>) {{\n\
+             \x20       let (tx, mut rx) = tokio::sync::mpsc::channel::<{msg_ty}>(capacity);\n\
+             \x20       let join = tokio::spawn(async move {{\n\
+             \x20           while let Some(msg) = rx.recv().await {{\n\
+             \x20               if let Err(e) = self.{method}(msg).await {{\n\
+             \x20                   eprintln!(\"[{p}] handler error (recovered stages already applied): {{e:?}}\");\n\
+             \x20               }}\n\
+             \x20           }}\n\
+             \x20           self\n\
+             \x20       }});\n\
+             \x20       ({p}Handle {{ tx }}, join)\n\
+             \x20   }}\n\
+             }}\n"
+        ));
+        return s;
+    }
+
+    // Multiple handlers: dispatch enum, one variant per message type.
+    let enum_name = format!("{p}Msg");
+    s.push_str(&format!("pub enum {enum_name} {{\n"));
+    for h in &process.handlers {
+        s.push_str(&format!(
+            "    {}({}),\n",
+            variant_name(&h.msg_name),
+            rust_type(&h.msg_ty)
+        ));
+    }
+    s.push_str("}\n\n");
+
+    s.push_str(&format!(
+        "#[derive(Clone)]\npub struct {p}Handle {{\n    tx: tokio::sync::mpsc::Sender<{enum_name}>,\n}}\n\nimpl {p}Handle {{\n"
+    ));
+    for h in &process.handlers {
+        s.push_str(&format!(
+            "    pub async fn send_{}(&self, msg: {}) -> Result<()> {{\n        self.tx.send({enum_name}::{}(msg)).await.map_err(|_| sigil_rt::SigilError::Transform(\"actor stopped\".into()))\n    }}\n",
+            h.msg_name,
+            rust_type(&h.msg_ty),
+            variant_name(&h.msg_name)
+        ));
+    }
+    s.push_str("}\n\n");
+
+    s.push_str(&format!(
+        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<Self>) {{\n        let (tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let join = tokio::spawn(async move {{\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
+    ));
+    for h in &process.handlers {
+        s.push_str(&format!(
+            "                    {enum_name}::{}(m) => self.on_{}(m).await,\n",
+            variant_name(&h.msg_name),
+            h.msg_name
+        ));
+    }
+    s.push_str(&format!(
+        "                }};\n                if let Err(e) = r {{\n                    eprintln!(\"[{p}] handler error: {{e:?}}\");\n                }}\n            }}\n            self\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
+    ));
+    s
+}
+
+fn variant_name(msg_name: &str) -> String {
+    let mut c = msg_name.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }
 
 fn emit_handler(handler: &OnHandler, states: &[String]) -> String {
@@ -471,54 +579,154 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
         ""
     };
     format!(
-        "[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\"] }}\nsigil_rt = {{ path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\n\n[lib]\npath = \"src/lib.rs\"\n{bin_section}"
+        "[workspace]\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
     )
 }
 
-/// Emit a runnable main that drives one handler and prints process state.
+/// Emit a runnable main that stress-tests the process as a fleet of
+/// shared-nothing actors: SHARDS isolated instances, PRODUCERS concurrent
+/// tasks on a multi-threaded runtime, deterministic aggregate at the end.
+/// No locks appear anywhere in the generated program.
 pub fn emit_demo_main(program: &Program) -> String {
     if program.processes.is_empty() {
         return "fn main() {\n    println!(\"no process\");\n}\n".into();
     }
     let process = &program.processes[0];
-    let mut s = String::new();
-    s.push_str("// AUTO-GENERATED by sigilc — demo binary\n");
-    s.push_str("#[tokio::main]\n");
-    s.push_str("async fn main() {\n");
-    s.push_str(&format!("    let mut p = {}::new();\n", process.name));
-    if let Some(handler) = process.handlers.first() {
-        let ty = rust_type(&handler.msg_ty);
-        // Prefer a non-default message when the schema has a simple Int field named value
-        s.push_str(&format!("    let mut msg = {ty}::default();\n"));
-        if let Type::Named(name) = &handler.msg_ty {
-            if let Some(schema) = program.schemas.iter().find(|sc| sc.name == *name) {
-                for (fname, fty) in &schema.fields {
-                    if matches!(fty, Type::Int) && fname == "value" {
-                        s.push_str("    msg.value = 2;\n");
-                    }
-                    if matches!(fty, Type::String) && fname == "id" {
-                        s.push_str("    msg.id = \"demo-id\".to_string();\n");
-                    }
+    let p = &process.name;
+    let Some(handler) = process.handlers.first() else {
+        return "fn main() {\n    println!(\"no handler\");\n}\n".into();
+    };
+    let msg_ty = rust_type(&handler.msg_ty);
+
+    // Synthesize per-message field values so aggregates are checkable:
+    // Int fields = 1, Float fields = 1.0, Strings get unique ids.
+    let mut field_init = String::new();
+    if let Type::Named(name) = &handler.msg_ty {
+        if let Some(schema) = program.schemas.iter().find(|sc| sc.name == *name) {
+            for (fname, fty) in &schema.fields {
+                match fty {
+                    Type::Int => field_init.push_str(&format!(
+                        "                msg.{fname} = 1;\n"
+                    )),
+                    Type::Float => field_init.push_str(&format!(
+                        "                msg.{fname} = 1.0;\n"
+                    )),
+                    Type::String => field_init.push_str(&format!(
+                        "                msg.{fname} = format!(\"m-{{prod}}-{{i}}\");\n"
+                    )),
+                    Type::Bool => field_init.push_str(&format!(
+                        "                msg.{fname} = true;\n"
+                    )),
+                    _ => {}
                 }
             }
         }
-        s.push_str(&format!(
-            "    match p.on_{}(msg).await {{\n",
-            handler.msg_name
-        ));
-        s.push_str("        Ok(()) => {}\n");
-        s.push_str("        Err(e) => eprintln!(\"handler error: {e:?}\"),\n");
-        s.push_str("    }\n");
     }
-    s.push_str("    println!(\"=== Sigil demo output ===\");\n");
+
+    // Aggregate numeric states across shards.
+    let mut agg_decl = String::new();
+    let mut agg_add = String::new();
+    let mut agg_print = String::new();
+    let mut shard_print_fmt = String::new();
+    let mut shard_print_args = String::new();
     for st in &process.states {
-        s.push_str(&format!(
-            "    println!(\"{} = {{:?}}\", p.{});\n",
-            st.name, st.name
-        ));
+        match st.ty {
+            Type::Int => {
+                agg_decl.push_str(&format!("    let mut agg_{}: i64 = 0;\n", st.name));
+                agg_add.push_str(&format!("        agg_{} += st.{};\n", st.name, st.name));
+                agg_print.push_str(&format!(
+                    "    println!(\"aggregate {} = {{}}\", agg_{});\n",
+                    st.name, st.name
+                ));
+                shard_print_fmt.push_str(&format!(" {}={{}}", st.name));
+                shard_print_args.push_str(&format!(", st.{}", st.name));
+            }
+            Type::Float => {
+                agg_decl.push_str(&format!("    let mut agg_{}: f64 = 0.0;\n", st.name));
+                agg_add.push_str(&format!("        agg_{} += st.{};\n", st.name, st.name));
+                agg_print.push_str(&format!(
+                    "    println!(\"aggregate {} = {{:.1}}\", agg_{});\n",
+                    st.name, st.name
+                ));
+                shard_print_fmt.push_str(&format!(" {}={{:.1}}", st.name));
+                shard_print_args.push_str(&format!(", st.{}", st.name));
+            }
+            _ => {
+                shard_print_fmt.push_str(&format!(" {}={{:?}}", st.name));
+                shard_print_args.push_str(&format!(", st.{}", st.name));
+            }
+        }
     }
-    s.push_str("}\n");
-    s
+
+    let lib_name = "{{LIB}}"; // patched by caller via crate name? No: use crate path.
+    let _ = lib_name;
+
+    format!(
+        r#"// AUTO-GENERATED by sigilc — concurrent demo binary
+//
+// {shards} isolated `{p}` actors, {producers} producer tasks, {msgs} messages
+// on a multi-threaded runtime. Every counter below is exact — there is no
+// lock, no Arc, and no atomic in this program. State isolation is by
+// construction: each actor owns its state inside its own task.
+
+use sigil_gen::*;
+use std::time::Instant;
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {{
+    const SHARDS: usize = {shards};
+    const PRODUCERS: usize = {producers};
+    const MSGS_PER_PRODUCER: usize = {per_producer};
+    const TOTAL: usize = PRODUCERS * MSGS_PER_PRODUCER;
+
+    let mut handles = Vec::new();
+    let mut joins = Vec::new();
+    for _ in 0..SHARDS {{
+        let (h, j) = {p}::new().spawn(1024);
+        handles.push(h);
+        joins.push(j);
+    }}
+
+    let t0 = Instant::now();
+    let mut producers = Vec::new();
+    for prod in 0..PRODUCERS {{
+        let hs = handles.clone();
+        producers.push(tokio::spawn(async move {{
+            for i in 0..MSGS_PER_PRODUCER {{
+                let mut msg = {msg_ty}::default();
+{field_init}                let shard = (prod + i) % hs.len();
+                if hs[shard].send(msg).await.is_err() {{
+                    break;
+                }}
+            }}
+        }}));
+    }}
+    for t in producers {{
+        let _ = t.await;
+    }}
+    drop(handles); // close all channels → actors drain and return their state
+
+    println!("=== {p} concurrent demo ===");
+    println!(
+        "{{}} shards x {{}} producers, {{}} messages, {{}} worker threads",
+        SHARDS,
+        PRODUCERS,
+        TOTAL,
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    );
+{agg_decl}    for (idx, j) in joins.into_iter().enumerate() {{
+        let st = j.await.expect("actor task panicked");
+        println!("shard {{idx}}:{shard_print_fmt}"{shard_print_args});
+{agg_add}    }}
+{agg_print}    println!("expected messages   = {{TOTAL}}");
+    println!("elapsed = {{:?}} (locks used: 0)", t0.elapsed());
+}}
+"#,
+        shards = 8,
+        producers = 64,
+        per_producer = 250,
+        msgs = 64 * 250,
+    )
 }
 
 /// Compute a relative path from `out_dir` to the workspace `sigil_rt` crate.
