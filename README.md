@@ -75,11 +75,30 @@ cargo run -p sigilc -- examples/proofs/type_mismatch.sigil /tmp/nope
 
 Integration tests assert both programs are rejected with Level-1 / signature diagnostics.
 
+## Level 2
+
+Temporal / path obligations on a Level-1-legal graph:
+
+| Check | Meaning |
+|-------|---------|
+| Per-step recovery | Every `@timeout` has `@recover` on the **same** pipeline step |
+| `require path_timeout_sum <= N.ms` | Sum of timed stages on the process path must not exceed N |
+| `hold <expr>` | Recorded invariant (full symbolic discharge is residual when externals involved) |
+| `extinct [...]` | Assumptions listed in residual risk |
+
+```sigil
+spec OrderSlo {
+  require path_timeout_sum <= 500.ms
+  extinct [null]
+  hold total_charged >= 0.0
+}
+```
+
 ## Compiler Pipeline
 
 ```
-parse → lower (Graph IR) → level1_check → check_transform_signatures
-      → residual_risk_report → emit (Rust + Cargo.toml)
+parse → lower → level1_check → check_transform_signatures → level2_check
+      → residual_risk_report → emit
 ```
 
 ## Language Grammar

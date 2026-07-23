@@ -40,3 +40,10 @@ process OrderPipeline {
     total_charged := total_charged + order.amount
   }
 }
+
+
+spec OrderSlo {
+  require path_timeout_sum <= 500.ms
+  extinct [null]
+  hold total_charged >= 0.0
+}

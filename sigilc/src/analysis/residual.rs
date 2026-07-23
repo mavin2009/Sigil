@@ -1,6 +1,7 @@
 //! Residual risk reporting from the Graph IR and declared transforms.
 
 use crate::analysis::ir::GraphIR;
+use crate::analysis::level2::Level2Report;
 use crate::frontend::ast::{Program, Type};
 
 fn type_name(ty: &Type) -> String {
@@ -17,7 +18,7 @@ fn type_name(ty: &Type) -> String {
 }
 
 /// Build the residual risk report using IR analysis and declared transform signatures.
-pub fn residual_risk_report(program: &Program, ir: &GraphIR) -> String {
+pub fn residual_risk_report(program: &Program, ir: &GraphIR, level2: Option<&Level2Report>) -> String {
     let mut declared = Vec::new();
     let mut external = Vec::new();
     let mut compiled = Vec::new();
@@ -105,6 +106,28 @@ pub fn residual_risk_report(program: &Program, ir: &GraphIR) -> String {
             .join("\n")
     };
 
+    let level2_section = match level2 {
+        Some(l2) => {
+            let mut lines = vec![
+                format!("- path_timeout_sum: {}ms", l2.path_timeout_sum_ms),
+            ];
+            if let Some(b) = l2.path_timeout_bound_ms {
+                lines.push(format!("- path_timeout bound: {}ms", b));
+            }
+            for d in &l2.discharged {
+                lines.push(format!("- discharged: {d}"));
+            }
+            for a in &l2.residual_assumptions {
+                lines.push(format!("- assumption: {a}"));
+            }
+            if lines.len() == 1 {
+                lines.push("- (no specs)".into());
+            }
+            lines.join("\n")
+        }
+        None => "- (level2 not run)".into(),
+    };
+
     format!(
         r#"# Residual Risk Report
 
@@ -132,11 +155,15 @@ pub fn residual_risk_report(program: &Program, ir: &GraphIR) -> String {
 ### Undeclared uses
 {undeclared}
 
+## Level-2
+{level2_section}
+
 ## Residual Risk
 - External transforms (empty bodies) are assumed to match their declared schemas and to terminate. Their internal failure modes are residual.
 - Undeclared transforms are residual until given signatures.
 - Tokio runtime, OS scheduler, and wall-clock latency are outside the model.
 - Functional correctness of business logic inside external transforms is residual (Level-1 only).
+- Level-2 holds that depend on external transforms remain residual assumptions.
 "#,
         process = ir.process_name,
         states = if ir.local_states.is_empty() {
@@ -158,6 +185,7 @@ pub fn residual_risk_report(program: &Program, ir: &GraphIR) -> String {
         compiled = compiled_section,
         external = external_section,
         undeclared = undeclared_section,
+        level2_section = level2_section,
     )
 }
 
@@ -168,7 +196,9 @@ pub fn residual_risk_report_ir(ir: &GraphIR) -> String {
             schemas: vec![],
             processes: vec![],
             transforms: vec![],
+            specs: vec![],
         },
         ir,
+        None,
     )
 }

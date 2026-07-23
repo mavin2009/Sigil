@@ -2,5 +2,6 @@
 pub mod ast;
 
 pub use ast::{
-    parse, BinOp, Expr, Literal, Process, Program, Schema, Span, Stmt, Tag, TransformDecl, Type,
+    parse, BinOp, Expr, Literal, Process, Program, Schema, Span, Stmt, Tag, TransformDecl,
+    SpecDecl, SpecItem, Type,
 };

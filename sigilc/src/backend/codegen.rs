@@ -255,6 +255,11 @@ fn emit_expr(expr: &Expr, states: &[String], msg: &str) -> String {
                 BinOp::Sub => "-",
                 BinOp::Mul => "*",
                 BinOp::Div => "/",
+                BinOp::Le => "<=",
+                BinOp::Ge => ">=",
+                BinOp::Lt => "<",
+                BinOp::Gt => ">",
+                BinOp::Eq => "==",
             };
             format!(
                 "({} {} {})",

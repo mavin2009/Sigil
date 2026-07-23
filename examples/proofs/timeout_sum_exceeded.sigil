@@ -1,0 +1,18 @@
+// PROOF (negative): path_timeout_sum exceeds declared bound.
+// Expected: Level-2 violation ... path_timeout_sum is 300ms but require ... <= 100.ms
+
+schema Msg { id: String }
+transform work(m: Msg) -> Msg {}
+transform fb(m: Msg) -> Msg {}
+
+process P {
+  state last: String = "none"
+  on msg: Msg {
+    let out = msg ~> work @timeout(300.ms) @recover(with: fb)
+    last := out.id
+  }
+}
+
+spec TooTight {
+  require path_timeout_sum <= 100.ms
+}

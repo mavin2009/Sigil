@@ -1,5 +1,4 @@
-
-// Sigil grammar with basic arithmetic
+// Sigil grammar
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
@@ -20,9 +19,9 @@ process_body = { (state_decl | on_handler)* }
 state_decl = { "state" ~ ident ~ ":" ~ type_ ~ "=" ~ expr }
 on_handler = { "on" ~ ident ~ ":" ~ type_ ~ "{" ~ stmt* ~ "}" }
 
-transform_def = { 
-    "transform" ~ ident ~ "(" ~ ident ~ ":" ~ type_ ~ ")" ~ "->" ~ type_ 
-    ~ "{" ~ stmt* ~ "}" 
+transform_def = {
+    "transform" ~ ident ~ "(" ~ ident ~ ":" ~ type_ ~ ")" ~ "->" ~ type_
+    ~ "{" ~ stmt* ~ "}"
 }
 
 spec_def = { "spec" ~ ident ~ "{" ~ spec_item* ~ "}" }
@@ -36,8 +35,10 @@ let_stmt = { "let" ~ ident ~ "=" ~ expr }
 assign_stmt = { ident ~ ":=" ~ expr }
 expr_stmt = { expr }
 
-// Expressions with basic arithmetic + pipelines
-expr = { sum }
+// Comparisons bind looser than + - * /
+expr = { comparison }
+comparison = { sum ~ (cmp_op ~ sum)? }
+cmp_op = { "<=" | ">=" | "==" | "<" | ">" }
 sum = { product ~ (sum_op ~ product)* }
 sum_op = { "+" | "-" }
 product = { pipeline ~ (product_op ~ pipeline)* }
@@ -46,13 +47,13 @@ product_op = { "*" | "/" }
 pipeline = { atom ~ (pipe_tail)* }
 pipe_tail = { "~>" ~ atom ~ tag* }
 
-tag = { 
-    "@timeout" ~ "(" ~ expr ~ ")" 
-  | "@recover" ~ "(" ~ "with" ~ ":" ~ expr ~ ")" 
-  | "@error" 
+tag = {
+    "@timeout" ~ "(" ~ expr ~ ")"
+  | "@recover" ~ "(" ~ "with" ~ ":" ~ expr ~ ")"
+  | "@error"
 }
 
-atom = { 
+atom = {
     if_expr
   | schema_lit
   | call

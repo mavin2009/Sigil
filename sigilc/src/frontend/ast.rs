@@ -29,6 +29,21 @@ pub struct Program {
     pub schemas: Vec<Schema>,
     pub processes: Vec<Process>,
     pub transforms: Vec<TransformDecl>,
+    pub specs: Vec<SpecDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpecDecl {
+    pub name: String,
+    pub items: Vec<SpecItem>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum SpecItem {
+    Extinct { names: Vec<String>, span: Span },
+    Require { expr: Expr, span: Span },
+    Hold { expr: Expr, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +112,7 @@ pub enum Expr {
 #[derive(Debug, Clone)]
 pub enum BinOp {
     Add, Sub, Mul, Div,
+    Le, Ge, Lt, Gt, Eq,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +145,7 @@ pub fn parse(source: &str) -> Result<Program> {
         schemas: vec![],
         processes: vec![],
         transforms: vec![],
+        specs: vec![],
     };
 
     for pair in pairs {
@@ -137,7 +154,8 @@ pub fn parse(source: &str) -> Result<Program> {
                 Rule::schema_def => program.schemas.push(parse_schema(inner)?),
                 Rule::process_def => program.processes.push(parse_process(inner)?),
                 Rule::transform_def => program.transforms.push(parse_transform(inner)?),
-                Rule::EOI | Rule::spec_def => {}
+                Rule::spec_def => program.specs.push(parse_spec(inner)?),
+                Rule::EOI => {}
                 r => eprintln!("skipping top-level {:?}", r),
             }
         }
@@ -166,6 +184,49 @@ fn parse_transform(pair: pest::iterators::Pair<Rule>) -> Result<TransformDecl> {
         body,
         span,
     })
+}
+
+
+fn parse_spec(pair: pest::iterators::Pair<Rule>) -> Result<SpecDecl> {
+    let span = Span::from_pest(pair.as_span());
+    let mut inner = pair.into_inner();
+    let name = inner.next().ok_or_else(|| anyhow!("spec name"))?.as_str().to_string();
+    let mut items = vec![];
+    for item in inner {
+        if item.as_rule() != Rule::spec_item {
+            continue;
+        }
+        let item_span = Span::from_pest(item.as_span());
+        let mut parts = item.into_inner();
+        let head = parts.next().ok_or_else(|| anyhow!("spec item"))?;
+        match head.as_rule() {
+            Rule::extinct_clause => {
+                let mut names = vec![];
+                for p in head.into_inner() {
+                    if p.as_rule() == Rule::ident {
+                        names.push(p.as_str().to_string());
+                    }
+                }
+                items.push(SpecItem::Extinct { names, span: item_span });
+            }
+            Rule::require_clause => {
+                let expr_pair = head.into_inner().next().ok_or_else(|| anyhow!("require expr"))?;
+                items.push(SpecItem::Require {
+                    expr: parse_expr(expr_pair)?,
+                    span: item_span,
+                });
+            }
+            Rule::hold_clause => {
+                let expr_pair = head.into_inner().next().ok_or_else(|| anyhow!("hold expr"))?;
+                items.push(SpecItem::Hold {
+                    expr: parse_expr(expr_pair)?,
+                    span: item_span,
+                });
+            }
+            r => bail!("unknown spec item {:?}", r),
+        }
+    }
+    Ok(SpecDecl { name, items, span })
 }
 
 fn parse_schema(pair: pest::iterators::Pair<Rule>) -> Result<Schema> {
@@ -260,7 +321,7 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
             let inner = pair.into_inner().next().unwrap();
             parse_stmt(inner)
         }
-        Rule::expr | Rule::sum | Rule::product | Rule::pipeline => {
+        Rule::expr | Rule::comparison | Rule::sum | Rule::product | Rule::pipeline => {
             Ok(Stmt::Expr { expr: parse_expr(pair)?, span })
         }
         other => bail!("unexpected stmt rule: {:?}", other),
@@ -272,6 +333,30 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
         Rule::expr => {
             let inner = pair.into_inner().next().unwrap();
             parse_expr(inner)
+        }
+        Rule::comparison => {
+            let span = Span::from_pest(pair.as_span());
+            let mut inner = pair.into_inner();
+            let left = parse_expr(inner.next().unwrap())?;
+            if let Some(op_pair) = inner.next() {
+                let op = match op_pair.as_str() {
+                    "<=" => BinOp::Le,
+                    ">=" => BinOp::Ge,
+                    "==" => BinOp::Eq,
+                    "<" => BinOp::Lt,
+                    ">" => BinOp::Gt,
+                    _ => bail!("bad cmp op {}", op_pair.as_str()),
+                };
+                let right = parse_expr(inner.next().unwrap())?;
+                Ok(Expr::Binary {
+                    op,
+                    lhs: Box::new(left),
+                    rhs: Box::new(right),
+                    span,
+                })
+            } else {
+                Ok(left)
+            }
         }
         Rule::sum => {
             let span = Span::from_pest(pair.as_span());
@@ -360,7 +445,7 @@ fn parse_atom(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             let inner = pair.into_inner().next().unwrap();
             parse_atom(inner)
         }
-        Rule::expr | Rule::sum | Rule::product | Rule::pipeline => parse_expr(pair),
+        Rule::expr | Rule::comparison | Rule::sum | Rule::product | Rule::pipeline => parse_expr(pair),
         other => bail!("unexpected atom rule: {:?}", other),
     }
 }

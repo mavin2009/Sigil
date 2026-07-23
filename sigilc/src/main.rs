@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use sigilc::{
-    check_transform_signatures, emit, emit_cargo_toml, emit_demo_main, level1_check, lower,
+    check_transform_signatures, emit, emit_cargo_toml, emit_demo_main, level1_check, level2_check, lower,
     parse, relative_sigil_rt_path, residual_risk_report,
 };
 
@@ -48,7 +48,11 @@ fn main() -> Result<()> {
     let graph = lower(&program).context("lowering to Graph IR")?;
     level1_check(&graph).context("Level-1 checks")?;
     check_transform_signatures(&program).context("transform signature checks")?;
-    println!("Level-1 checks passed.");
+    let l2 = level2_check(&program, &graph).context("Level-2 checks")?;
+    println!("Level-1 and Level-2 checks passed.");
+    if l2.path_timeout_sum_ms > 0 {
+        println!("path_timeout_sum = {}ms", l2.path_timeout_sum_ms);
+    }
 
     fs::create_dir_all(out.join("src"))?;
 
@@ -78,7 +82,7 @@ fn main() -> Result<()> {
         rt_path
     );
 
-    let risk = residual_risk_report(&program, &graph);
+    let risk = residual_risk_report(&program, &graph, Some(&l2));
     fs::write(out.join("RESIDUAL_RISK.md"), &risk)?;
     println!("[risk]    Wrote {}", out.join("RESIDUAL_RISK.md").display());
 
@@ -92,7 +96,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod integration {
     use sigilc::{
-        check_transform_signatures, emit, emit_demo_main, level1_check, lower, parse,
+        check_transform_signatures, emit, emit_demo_main, level1_check, level2_check, lower, parse,
         residual_risk_report, GraphIR,
     };
 
@@ -102,7 +106,7 @@ mod integration {
         level1_check(&graph).expect("level1");
         check_transform_signatures(&program).expect("signatures");
         let rust = emit(&program, &graph);
-        let risk = residual_risk_report(&program, &graph);
+        let risk = residual_risk_report(&program, &graph, Some(&l2));
         (rust, risk, graph)
     }
 
@@ -134,6 +138,19 @@ mod integration {
     fn proof_rejects_unhandled_timeout() {
         let source = include_str!("../../examples/proofs/unhandled_timeout.sigil");
         expect_reject(source, "@timeout");
+    }
+
+    #[test]
+    fn proof_rejects_timeout_sum_exceeded() {
+        let source = include_str!("../../examples/proofs/timeout_sum_exceeded.sigil");
+        let program = parse(source).expect("parse");
+        let graph = lower(&program).expect("lower");
+        level1_check(&graph).expect("level1 should pass");
+        check_transform_signatures(&program).expect("signatures should pass");
+        let err = level2_check(&program, &graph).expect_err("level2 must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("Level-2"), "{msg}");
+        assert!(msg.contains("path_timeout_sum") || msg.contains("300"), "{msg}");
     }
 
     #[test]

@@ -1,12 +1,12 @@
-
-//! Analysis: Graph IR lowering, Level-1 checks, and residual risk.
+//! Analysis: Graph IR lowering, Level-1/2 checks, types, residual risk.
 pub mod ir;
 pub mod check;
 pub mod residual;
 pub mod types;
+pub mod level2;
 
 pub use ir::{lower, GraphIR, Node, Edge, EffectSet};
 pub use check::{level1_check, check_transform_signatures};
 pub use residual::residual_risk_report;
-
 pub use types::{infer_program, type_name, TypeEnv, TransformTypes};
+pub use level2::{level2_check, Level2Report};
