@@ -31,7 +31,7 @@ process Audit {
 }
 ```
 
-That compiles to **439 lines** of Rust (`314` in the library, `125` in the
+That compiles to **479 lines** of Rust (`342` in the library, `137` in the
 runnable driver). The ratio is not the point. The point is *which* 439 lines,
 and what happens if any one of them is wrong.
 
@@ -62,7 +62,9 @@ pub async fn on_request(&mut self, request: Request) -> Result<()> {
     };
     self.recorded = (self.recorded + 1);
     match self.vault_out.as_mut() {
-        Some(out) => out.round_robin().send(logged).await?,
+        Some(out) => {
+            sigil_rt::backpressure::block(out.round_robin().raw(), logged).await?;
+        }
         None => return Err(sigil_rt::SigilError::Transform("outbox to Vault not connected".into())),
     }
     Ok(())
@@ -80,9 +82,12 @@ handler, forever:
 | the fallback is `deny_unaudited`, a **pure** transform | A fallback that can itself fail or hang reintroduces the failure it exists to absorb |
 | `recorded += 1` sits **above** the `send` | Audit-after-forward: a secret can be served with no audit record |
 | the send is matched, not `.unwrap()`ed | Panic in an actor task, silently killing a shard |
+| the send's queue-full behaviour is **declared** | An unbounded wait that quietly invalidates your latency SLO, or an unbounded queue that quietly becomes an outage |
 
-Sigil checks all six. The first four are Level-1 rules, the fifth is the
-Level-4 ORDERING obligation, and the sixth is simply not expressible.
+Sigil checks all seven. The first four are Level-1 rules, the fifth is the
+Level-4 ORDERING obligation, the sixth is simply not expressible, and the
+seventh is the declared back-pressure policy that `require path_latency`
+holds you to.
 
 ---
 
@@ -199,8 +204,9 @@ $ # move `recorded := recorded + 1` below the send
 $ cargo run -p sigilc -- examples/security/vault.sigil out --level 4
 
 error[Level 4 (system)]: Level-4 violation in spec 'ZeroTrust': ORDERING
-fails — `Audit` updates `recorded` AFTER sending; a message could reach
-`Vault` without being counted. Move the update above the send.
+fails — the `request` handler of `Audit` sends toward `Vault` BEFORE
+updating `recorded`; a message could arrive uncounted. Move the update
+above the send.
 ```
 
 ```
@@ -214,6 +220,13 @@ prevent — give it a pure body.
 Both mistakes are the kind that pass code review. Neither passes the build.
 
 ---
+
+## Where to go next
+
+- [Language Reference](LANGUAGE.md) — the complete surface
+- [Assurance Levels](ASSURANCE.md) — what each level proves, and the 25
+  programs that must fail to compile
+- [Runtime & Generated Code](RUNTIME.md) — the actor model in detail
 
 ## The honest part
 

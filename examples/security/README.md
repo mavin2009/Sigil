@@ -30,9 +30,9 @@ inequalities survive all of them.
 reach the vault with no audit record:
 
 ```
-error[Level 4 (system)]: ORDERING fails — `Audit` updates `recorded` AFTER
-sending; a message could reach `Vault` without being counted. Move the
-update above the send.
+error[Level 4 (system)]: ORDERING fails — the `request` handler of `Audit`
+sends toward `Vault` BEFORE updating `recorded`; a message could arrive
+uncounted. Move the update above the send.
 ```
 
 **2. A deny path that can itself fail.** If `deny_unauthorized` is an
