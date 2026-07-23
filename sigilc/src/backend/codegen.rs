@@ -1266,11 +1266,96 @@ fn demo_field_init(program: &Program, msg_ty: &Type, var: &str, indent: &str) ->
     out
 }
 
+/// Runtime checks for the invariants the compiler proved.
+///
+/// A proof is a claim about every execution; a demo is one execution. Making
+/// the demo ASSERT what was proven turns every run — including every chaos
+/// run — into a test of the prover itself. A proof unsoundness then shows up
+/// as a failed assertion in a program the compiler blessed, rather than as a
+/// number a human has to notice is wrong.
+#[derive(Default)]
+struct HoldChecks {
+    /// (process, state, cmp, bound) — checked per shard.
+    scalar: Vec<(String, String, String, f64)>,
+    /// (process, lo_state, cmp, hi_state) — same process, checked per shard.
+    relational: Vec<(String, String, String, String)>,
+    /// (lo_proc, lo_state, cmp, hi_proc, hi_state) — checked on aggregates.
+    system: Vec<(String, String, String, String, String)>,
+}
+
+fn cmp_str(op: &BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Le => Some("<="),
+        BinOp::Lt => Some("<"),
+        BinOp::Ge => Some(">="),
+        BinOp::Gt => Some(">"),
+        _ => None,
+    }
+}
+
+fn collect_hold_checks(program: &Program) -> HoldChecks {
+    use crate::frontend::ast::{Literal, SpecItem};
+    let mut hc = HoldChecks::default();
+    let is_proc = |n: &str| program.processes.iter().any(|p| p.name == n);
+    let owner_of = |state: &str| -> Option<String> {
+        program
+            .processes
+            .iter()
+            .find(|p| p.states.iter().any(|s| s.name == state))
+            .map(|p| p.name.clone())
+    };
+
+    for spec in &program.specs {
+        for item in &spec.items {
+            let SpecItem::Hold { expr, .. } = item else { continue };
+            let Expr::Binary { op, lhs, rhs, .. } = expr else { continue };
+            let Some(cmp) = cmp_str(op) else { continue };
+            match (lhs.as_ref(), rhs.as_ref()) {
+                // hold <state> <cmp> <literal>
+                (Expr::Ident { name, .. }, Expr::Literal { value, .. }) => {
+                    let bound = match value {
+                        Literal::Int(i) => *i as f64,
+                        Literal::Float(f) => *f,
+                        _ => continue,
+                    };
+                    if let Some(owner) = owner_of(name) {
+                        hc.scalar.push((owner, name.clone(), cmp.to_string(), bound));
+                    }
+                }
+                // hold <state> <cmp> <state>   (same process)
+                (Expr::Ident { name: a, .. }, Expr::Ident { name: b, .. }) => {
+                    if let (Some(oa), Some(ob)) = (owner_of(a), owner_of(b)) {
+                        if oa == ob {
+                            hc.relational.push((oa, a.clone(), cmp.to_string(), b.clone()));
+                        }
+                    }
+                }
+                // hold P.x <cmp> Q.y
+                (
+                    Expr::FieldAccess { base: lb, field: lf, .. },
+                    Expr::FieldAccess { base: rb, field: rf, .. },
+                ) if is_proc(lb) && is_proc(rb) => {
+                    hc.system.push((
+                        lb.clone(),
+                        lf.clone(),
+                        cmp.to_string(),
+                        rb.clone(),
+                        rf.clone(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    hc
+}
+
 /// Multi-stage demo: spawn each process as a shard fleet in reverse
 /// topological order, wire outboxes, feed the entry stage from concurrent
 /// producers, then shut down stage by stage and print per-stage accounting.
 fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topology) -> String {
     use std::fmt::Write as _;
+    let checks = collect_hold_checks(program);
     let entry_name = topo
         .order
         .first()
@@ -1415,13 +1500,49 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
                 _ => {}
             }
         }
+        // Per-shard checks of everything proven about THIS process.
+        let mut shard_asserts = String::new();
+        for (proc_name, state, cmp, bound) in &checks.scalar {
+            if proc_name != pname {
+                continue;
+            }
+            let _ = write!(
+                shard_asserts,
+                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {pname}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});\n"
+            );
+        }
+        for (proc_name, a, cmp, b) in &checks.relational {
+            if proc_name != pname {
+                continue;
+            }
+            let _ = write!(
+                shard_asserts,
+                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {pname}.{a} {cmp} {pname}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});\n"
+            );
+        }
+
         let _ = write!(out, "\n    // ---- stage shutdown: {pname} ----\n");
         let _ = write!(out, "    drop({lc}_handles);\n");
         let _ = write!(out, "{agg_decl}");
         let _ = write!(out, "    let mut {lc}_handled: u64 = 0;\n    let mut {lc}_dropped: u64 = 0;\n    let mut {lc}_shed: u64 = 0;\n");
-        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = j.await.expect(\"actor task panicked\");\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n        {lc}_shed += stats.shed;\n    }}\n");
+        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = j.await.expect(\"actor task panicked\");\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}{shard_asserts}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n        {lc}_shed += stats.shed;\n    }}\n");
         let _ = write!(out, "{agg_print}");
         let _ = write!(out, "    println!(\"[{pname}] handled + dropped = {{}} + {{}} = {{}}, shed downstream = {{}}\", {lc}_handled, {lc}_dropped, {lc}_handled + {lc}_dropped, {lc}_shed);\n");
+    }
+
+    // System invariants relate different processes, whose shards do not
+    // correspond (routing differs), so they are checked on the aggregates.
+    // Summing a per-shard inequality preserves it.
+    if !checks.system.is_empty() {
+        let _ = write!(out, "\n    // ---- proven system invariants, checked at runtime ----\n");
+        for (lp, ls, cmp, hp, hs) in &checks.system {
+            let (llc, hlc) = (lp.to_lowercase(), hp.to_lowercase());
+            let _ = write!(
+                out,
+                "    assert!(({llc}_agg_{ls} as f64) {cmp} ({hlc}_agg_{hs} as f64), \"PROVEN INVARIANT VIOLATED: {lp}.{ls} {cmp} {hp}.{hs} ({{}} vs {{}})\", {llc}_agg_{ls}, {hlc}_agg_{hs});\n"
+            );
+        }
+        let _ = write!(out, "    println!(\"all {} proven invariant(s) verified at runtime\");\n", checks.system.len() + checks.scalar.len() + checks.relational.len());
     }
 
     let _ = write!(out, "\n    assert_eq!({entry_lc}_handled + {entry_lc}_dropped, total as u64, \"entry-stage message conservation violated\");\n");
@@ -1484,6 +1605,32 @@ pub fn emit_demo_main(program: &Program) -> String {
                     _ => {}
                 }
             }
+        }
+    }
+
+    // Runtime checks of everything proven about this process, applied per
+    // shard as its state comes back from join().
+    let checks = collect_hold_checks(program);
+    let mut fleet_asserts = String::new();
+    {
+        use std::fmt::Write as _;
+        for (proc_name, state, cmp, bound) in &checks.scalar {
+            if proc_name != &process.name {
+                continue;
+            }
+            let _ = write!(
+                fleet_asserts,
+                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {p}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});\n"
+            );
+        }
+        for (proc_name, a, cmp, b) in &checks.relational {
+            if proc_name != &process.name {
+                continue;
+            }
+            let _ = write!(
+                fleet_asserts,
+                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {p}.{a} {cmp} {p}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});\n"
+            );
         }
     }
 
@@ -1587,7 +1734,7 @@ async fn main() {{
     for (idx, j) in joins.into_iter().enumerate() {{
         let (st, stats) = j.await.expect("actor task panicked");
         println!("shard {{idx}}:{shard_print_fmt} handled={{}} dropped={{}}"{shard_print_args}, stats.handled, stats.dropped);
-{agg_add}        agg_handled += stats.handled;
+{fleet_asserts}{agg_add}        agg_handled += stats.handled;
         agg_dropped += stats.dropped;
     }}
 {agg_print}    println!("handled + dropped   = {{}} + {{}} = {{}}", agg_handled, agg_dropped, agg_handled + agg_dropped);

@@ -352,6 +352,48 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Generated demos assert the invariants the compiler proved, so every
+    /// run — including every chaos run — is a test of the prover.
+    ///
+    /// This is what closes the loop: a proof is a claim about all executions,
+    /// and this makes one execution check it. The guard-correlation
+    /// unsoundness reproduces as an assertion failure under this harness.
+    #[test]
+    fn demos_check_their_own_proofs() {
+        // Multi-process: per-shard checks for same-process holds, aggregate
+        // checks for cross-process ones.
+        let src = include_str!("../../examples/clearinghouse/clearing.sigil");
+        let program = parse(src).expect("parse");
+        let main_rs = sigilc::emit_demo_main(&program);
+        assert!(main_rs.contains("PROVEN INVARIANT VIOLATED"));
+        // scalar (per shard)
+        assert!(main_rs.contains("RiskEngine.exposure >= 0"));
+        // relational, same process (per shard)
+        assert!(main_rs.contains("RiskEngine.cleared <= RiskEngine.assessed"));
+        // system, cross process (aggregate)
+        assert!(main_rs.contains("Settlement.settled <= RiskEngine.cleared"));
+        assert!(main_rs.contains("riskengine_agg_cleared"));
+
+        // Single-process programs are checked too — they use a different
+        // demo shape, and asserting only in the topology demo left them
+        // silently unverified.
+        let src = include_str!("../../examples/level3/proven_ledger.sigil");
+        let program = parse(src).expect("parse");
+        let main_rs = sigilc::emit_demo_main(&program);
+        assert!(main_rs.contains("Ledger.posted >= 0"), "fleet demo must assert: {main_rs}");
+        assert!(main_rs.contains("Ledger.total_amount >= 0"));
+
+        // The known-unsound shape still emits its (false) invariant as a
+        // runtime check, which is how the harness catches this class.
+        let src = include_str!("../../examples/proofs/guard_mutated_state.sigil");
+        let program = parse(src).expect("parse");
+        let main_rs = sigilc::emit_demo_main(&program);
+        assert!(
+            main_rs.contains("Down.got <= Up.cnt"),
+            "the harness must check even holds the prover rejects"
+        );
+    }
+
     /// Metamorphic property, from fuzzing: if the compiler ACCEPTS a
     /// program, the Rust it emits must compile. Five of eight fuzz-generated
     /// programs violated this before these checks existed.
