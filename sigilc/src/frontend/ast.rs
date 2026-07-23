@@ -1,4 +1,3 @@
-
 //! AST for Sigil — pest-driven structured representation with arithmetic
 
 use anyhow::{anyhow, bail, Result};
@@ -17,7 +16,10 @@ pub struct Span {
 
 impl Span {
     pub fn from_pest(span: pest::Span<'_>) -> Self {
-        Self { start: span.start(), end: span.end() }
+        Self {
+            start: span.start(),
+            end: span.end(),
+        }
     }
     pub fn is_valid(&self) -> bool {
         self.start < self.end
@@ -136,7 +138,14 @@ pub struct Schema {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
-    Int, Float, String, Bool, UUID, Bytes, Duration, Named(String),
+    Int,
+    Float,
+    String,
+    Bool,
+    UUID,
+    Bytes,
+    Duration,
+    Named(String),
 }
 
 #[derive(Debug, Clone)]
@@ -165,8 +174,16 @@ pub struct OnHandler {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Let { name: String, expr: Expr, span: Span },
-    Assign { name: String, expr: Expr, span: Span },
+    Let {
+        name: String,
+        expr: Expr,
+        span: Span,
+    },
+    Assign {
+        name: String,
+        expr: Expr,
+        span: Span,
+    },
     /// `send <expr> to <Process> [by <key>|broadcast] [@block|@shed|@deadline(N.ms)]`
     /// — typed, routed, back-pressured message to another process's fleet.
     Send {
@@ -181,7 +198,10 @@ pub enum Stmt {
         guard: Option<Expr>,
         span: Span,
     },
-    Expr { expr: Expr, span: Span },
+    Expr {
+        expr: Expr,
+        span: Span,
+    },
 }
 
 /// What a `send` does when the destination's queue is full.
@@ -191,8 +211,8 @@ pub enum Stmt {
 /// back an end-to-end latency claim: `@block` waits for an unbounded time.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Backpressure {
-    /// Await capacity. Propagates backpressure upstream; cannot deadlock
-    /// because the process graph is proven acyclic — but has no time bound.
+    /// Await capacity. An acyclic graph rules out generated channel-wait
+    /// cycles, but external code can still prevent downstream progress.
     #[default]
     Block,
     /// Never wait: if the queue is full, drop the message and count it.
@@ -236,12 +256,35 @@ pub enum Route {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Ident { name: String, span: Span },
-    FieldAccess { base: String, field: String, span: Span },
-    Literal { value: Literal, span: Span },
-    Pipeline { base: Box<Expr>, steps: Vec<PipeStep>, span: Span },
-    Call { name: String, args: Vec<Expr>, span: Span },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
+    Ident {
+        name: String,
+        span: Span,
+    },
+    FieldAccess {
+        base: String,
+        field: String,
+        span: Span,
+    },
+    Literal {
+        value: Literal,
+        span: Span,
+    },
+    Pipeline {
+        base: Box<Expr>,
+        steps: Vec<PipeStep>,
+        span: Span,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
     /// `if cond { a } else { b }` — both branches are expressions of the
     /// same type. Provers evaluate branches under the narrowed condition,
     /// which is what makes clamping provable.
@@ -261,8 +304,15 @@ pub enum Expr {
 
 #[derive(Debug, Clone)]
 pub enum BinOp {
-    Add, Sub, Mul, Div,
-    Le, Ge, Lt, Gt, Eq,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Le,
+    Ge,
+    Lt,
+    Gt,
+    Eq,
 }
 
 #[derive(Debug, Clone)]
@@ -273,12 +323,23 @@ pub struct PipeStep {
 
 #[derive(Debug, Clone)]
 pub enum Tag {
-    Timeout { expr: Expr, span: Span },
-    Recover { with: Expr, span: Span },
+    Timeout {
+        expr: Expr,
+        span: Span,
+    },
+    Recover {
+        with: Expr,
+        span: Span,
+    },
     /// Re-attempt the stage up to N extra times before taking the failure
     /// path. Requires @recover or @error on the same step.
-    Retry { expr: Expr, span: Span },
-    Error { span: Span },
+    Retry {
+        expr: Expr,
+        span: Span,
+    },
+    Error {
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -352,8 +413,8 @@ fn check_nesting_depth(source: &str) -> Result<()> {
 
 pub fn parse(source: &str) -> Result<Program> {
     check_nesting_depth(source)?;
-    let pairs = SigilParser::parse(Rule::file, source)
-        .map_err(|e| anyhow!("parse error:\n{}", e))?;
+    let pairs =
+        SigilParser::parse(Rule::file, source).map_err(|e| anyhow!("parse error:\n{}", e))?;
 
     let mut program = Program {
         extern_crates: vec![],
@@ -371,16 +432,27 @@ pub fn parse(source: &str) -> Result<Program> {
                 Rule::extern_crate => {
                     let espan = Span::from_pest(inner.as_span());
                     let mut it = inner.into_inner();
-                    let name = it.next().ok_or_else(|| anyhow!("extern crate name"))?.as_str().to_string();
+                    let name = it
+                        .next()
+                        .ok_or_else(|| anyhow!("extern crate name"))?
+                        .as_str()
+                        .to_string();
                     let src_pair = it.next().ok_or_else(|| anyhow!("extern crate source"))?;
                     let source = match src_pair.as_rule() {
                         Rule::path_dep => {
-                            let sp = src_pair.into_inner().next().ok_or_else(|| anyhow!("path"))?;
+                            let sp = src_pair
+                                .into_inner()
+                                .next()
+                                .ok_or_else(|| anyhow!("path"))?;
                             CrateSource::Path(sp.as_str().trim_matches('"').to_string())
                         }
                         _ => CrateSource::Version(src_pair.as_str().trim_matches('"').to_string()),
                     };
-                    program.extern_crates.push(ExternCrate { name, source, span: espan });
+                    program.extern_crates.push(ExternCrate {
+                        name,
+                        source,
+                        span: espan,
+                    });
                 }
                 Rule::transform_def => program.transforms.push(parse_transform(inner)?),
                 Rule::spec_def => program.specs.push(parse_spec(inner)?),
@@ -395,10 +467,26 @@ pub fn parse(source: &str) -> Result<Program> {
 fn parse_transform(pair: pest::iterators::Pair<Rule>) -> Result<TransformDecl> {
     let span = Span::from_pest(pair.as_span());
     let mut inner = pair.into_inner();
-    let name = inner.next().ok_or_else(|| anyhow!("transform name"))?.as_str().to_string();
-    let param = inner.next().ok_or_else(|| anyhow!("transform param"))?.as_str().to_string();
-    let param_ty = parse_type(inner.next().ok_or_else(|| anyhow!("transform param type"))?)?;
-    let return_ty = parse_type(inner.next().ok_or_else(|| anyhow!("transform return type"))?)?;
+    let name = inner
+        .next()
+        .ok_or_else(|| anyhow!("transform name"))?
+        .as_str()
+        .to_string();
+    let param = inner
+        .next()
+        .ok_or_else(|| anyhow!("transform param"))?
+        .as_str()
+        .to_string();
+    let param_ty = parse_type(
+        inner
+            .next()
+            .ok_or_else(|| anyhow!("transform param type"))?,
+    )?;
+    let return_ty = parse_type(
+        inner
+            .next()
+            .ok_or_else(|| anyhow!("transform return type"))?,
+    )?;
     let mut body = vec![];
     let mut binding = None;
     for item in inner {
@@ -419,7 +507,11 @@ fn parse_transform(pair: pest::iterators::Pair<Rule>) -> Result<TransformDecl> {
                     other => bail!("unexpected binding part: {other:?}"),
                 }
             }
-            binding = Some(Binding { kind, path, span: bspan });
+            binding = Some(Binding {
+                kind,
+                path,
+                span: bspan,
+            });
             continue;
         }
         if item.as_rule() == Rule::stmt {
@@ -437,11 +529,14 @@ fn parse_transform(pair: pest::iterators::Pair<Rule>) -> Result<TransformDecl> {
     })
 }
 
-
 fn parse_spec(pair: pest::iterators::Pair<Rule>) -> Result<SpecDecl> {
     let span = Span::from_pest(pair.as_span());
     let mut inner = pair.into_inner();
-    let name = inner.next().ok_or_else(|| anyhow!("spec name"))?.as_str().to_string();
+    let name = inner
+        .next()
+        .ok_or_else(|| anyhow!("spec name"))?
+        .as_str()
+        .to_string();
     let mut items = vec![];
     for item in inner {
         if item.as_rule() != Rule::spec_item {
@@ -458,17 +553,26 @@ fn parse_spec(pair: pest::iterators::Pair<Rule>) -> Result<SpecDecl> {
                         names.push(p.as_str().to_string());
                     }
                 }
-                items.push(SpecItem::Extinct { names, span: item_span });
+                items.push(SpecItem::Extinct {
+                    names,
+                    span: item_span,
+                });
             }
             Rule::require_clause => {
-                let expr_pair = head.into_inner().next().ok_or_else(|| anyhow!("require expr"))?;
+                let expr_pair = head
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| anyhow!("require expr"))?;
                 items.push(SpecItem::Require {
                     expr: parse_expr(expr_pair)?,
                     span: item_span,
                 });
             }
             Rule::hold_clause => {
-                let expr_pair = head.into_inner().next().ok_or_else(|| anyhow!("hold expr"))?;
+                let expr_pair = head
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| anyhow!("hold expr"))?;
                 items.push(SpecItem::Hold {
                     expr: parse_expr(expr_pair)?,
                     span: item_span,
@@ -501,7 +605,12 @@ fn parse_schema(pair: pest::iterators::Pair<Rule>) -> Result<Schema> {
             }
         }
     }
-    Ok(Schema { name, binding, fields, span })
+    Ok(Schema {
+        name,
+        binding,
+        fields,
+        span,
+    })
 }
 
 fn parse_type(pair: pest::iterators::Pair<Rule>) -> Result<Type> {
@@ -531,7 +640,12 @@ fn parse_process(pair: pest::iterators::Pair<Rule>) -> Result<Process> {
             _ => {}
         }
     }
-    Ok(Process { name, states, handlers, span })
+    Ok(Process {
+        name,
+        states,
+        handlers,
+        span,
+    })
 }
 
 fn parse_state(pair: pest::iterators::Pair<Rule>) -> Result<StateDecl> {
@@ -540,7 +654,12 @@ fn parse_state(pair: pest::iterators::Pair<Rule>) -> Result<StateDecl> {
     let name = inner.next().unwrap().as_str().to_string();
     let ty = parse_type(inner.next().unwrap())?;
     let init = parse_expr(inner.next().unwrap())?;
-    Ok(StateDecl { name, ty, init, span })
+    Ok(StateDecl {
+        name,
+        ty,
+        init,
+        span,
+    })
 }
 
 fn parse_handler(pair: pest::iterators::Pair<Rule>) -> Result<OnHandler> {
@@ -552,7 +671,12 @@ fn parse_handler(pair: pest::iterators::Pair<Rule>) -> Result<OnHandler> {
     for item in inner {
         body.push(parse_stmt(item)?);
     }
-    Ok(OnHandler { msg_name, msg_ty, body, span })
+    Ok(OnHandler {
+        msg_name,
+        msg_ty,
+        body,
+        span,
+    })
 }
 
 fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
@@ -615,18 +739,31 @@ fn parse_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Stmt> {
                     other => bail!("unexpected send clause: {:?}", other),
                 }
             }
-            Ok(Stmt::Send { target, expr, route, backpressure, guard, span })
+            Ok(Stmt::Send {
+                target,
+                expr,
+                route,
+                backpressure,
+                guard,
+                span,
+            })
         }
         Rule::expr_stmt => {
             let inner = pair.into_inner().next().unwrap();
-            Ok(Stmt::Expr { expr: parse_expr(inner)?, span })
+            Ok(Stmt::Expr {
+                expr: parse_expr(inner)?,
+                span,
+            })
         }
         Rule::stmt => {
             let inner = pair.into_inner().next().unwrap();
             parse_stmt(inner)
         }
         Rule::expr | Rule::comparison | Rule::sum | Rule::product | Rule::pipeline => {
-            Ok(Stmt::Expr { expr: parse_expr(pair)?, span })
+            Ok(Stmt::Expr {
+                expr: parse_expr(pair)?,
+                span,
+            })
         }
         other => bail!("unexpected stmt rule: {:?}", other),
     }
@@ -673,7 +810,12 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                     _ => bail!("bad sum op"),
                 };
                 let right = parse_expr(inner.next().unwrap())?;
-                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span };
+                left = Expr::Binary {
+                    op,
+                    lhs: Box::new(left),
+                    rhs: Box::new(right),
+                    span,
+                };
             }
             Ok(left)
         }
@@ -688,7 +830,12 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                     _ => bail!("bad product op"),
                 };
                 let right = parse_expr(inner.next().unwrap())?;
-                left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right), span };
+                left = Expr::Binary {
+                    op,
+                    lhs: Box::new(left),
+                    rhs: Box::new(right),
+                    span,
+                };
             }
             Ok(left)
         }
@@ -714,7 +861,11 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             if steps.is_empty() {
                 Ok(base)
             } else {
-                Ok(Expr::Pipeline { base: Box::new(base), steps, span })
+                Ok(Expr::Pipeline {
+                    base: Box::new(base),
+                    steps,
+                    span,
+                })
             }
         }
         _ => parse_atom(pair),
@@ -725,8 +876,11 @@ fn parse_atom(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     match pair.as_rule() {
         Rule::ident => {
             let span = Span::from_pest(pair.as_span());
-            Ok(Expr::Ident { name: pair.as_str().to_string(), span })
-        },
+            Ok(Expr::Ident {
+                name: pair.as_str().to_string(),
+                span,
+            })
+        }
         Rule::field_access => {
             let span = Span::from_pest(pair.as_span());
             let mut inner = pair.into_inner();
@@ -775,7 +929,9 @@ fn parse_atom(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
             let inner = pair.into_inner().next().unwrap();
             parse_atom(inner)
         }
-        Rule::expr | Rule::comparison | Rule::sum | Rule::product | Rule::pipeline => parse_expr(pair),
+        Rule::expr | Rule::comparison | Rule::sum | Rule::product | Rule::pipeline => {
+            parse_expr(pair)
+        }
         other => bail!("unexpected atom rule: {:?}", other),
     }
 }
@@ -805,21 +961,36 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
         Rule::duration => {
             let s = inner.as_str();
             let num: u64 = s.trim_end_matches(".ms").parse()?;
-            Ok(Expr::Literal { value: Literal::DurationMs(num), span })
+            Ok(Expr::Literal {
+                value: Literal::DurationMs(num),
+                span,
+            })
         }
         Rule::string => {
             let s = inner.as_str();
-            Ok(Expr::Literal { value: Literal::String(s[1..s.len()-1].to_string()), span })
+            Ok(Expr::Literal {
+                value: Literal::String(s[1..s.len() - 1].to_string()),
+                span,
+            })
         }
         Rule::number => {
             let s = inner.as_str();
             if s.contains('.') {
-                Ok(Expr::Literal { value: Literal::Float(s.parse()?), span })
+                Ok(Expr::Literal {
+                    value: Literal::Float(s.parse()?),
+                    span,
+                })
             } else {
-                Ok(Expr::Literal { value: Literal::Int(s.parse()?), span })
+                Ok(Expr::Literal {
+                    value: Literal::Int(s.parse()?),
+                    span,
+                })
             }
         }
-        Rule::boolean => Ok(Expr::Literal { value: Literal::Bool(inner.as_str() == "true"), span }),
+        Rule::boolean => Ok(Expr::Literal {
+            value: Literal::Bool(inner.as_str() == "true"),
+            span,
+        }),
         _ => bail!("bad literal"),
     }
 }
@@ -836,7 +1007,7 @@ mod tests {
         assert_eq!(prog.processes.len(), 1);
         let p = &prog.processes[0];
         assert_eq!(p.name, "Ingest");
-        assert!(p.states.len() >= 1);
+        assert!(!p.states.is_empty());
         assert_eq!(p.states[0].name, "last");
         assert_eq!(p.handlers.len(), 1);
         assert_eq!(p.handlers[0].msg_name, "packet");
@@ -849,7 +1020,7 @@ mod tests {
         let prog = parse(src).expect("should parse counter");
         assert_eq!(prog.processes.len(), 1);
         assert_eq!(prog.processes[0].name, "Counter");
-        assert!(prog.processes[0].states.len() >= 1);
+        assert!(!prog.processes[0].states.is_empty());
         assert_eq!(prog.processes[0].handlers.len(), 1);
     }
 
@@ -858,22 +1029,20 @@ mod tests {
         let src = include_str!("../../../examples/ingest/ingest.sigil");
         let prog = parse(src).expect("parse");
         assert!(!prog.schemas.is_empty());
-        assert!(prog.schemas[0].span.is_valid(), "schema should have a valid span");
+        assert!(
+            prog.schemas[0].span.is_valid(),
+            "schema should have a valid span"
+        );
         assert!(!prog.processes.is_empty());
-        assert!(prog.processes[0].span.is_valid(), "process should have a valid span");
+        assert!(
+            prog.processes[0].span.is_valid(),
+            "process should have a valid span"
+        );
         assert!(prog.processes[0].span.start < prog.processes[0].span.end);
         assert!(!prog.processes[0].states.is_empty());
         assert!(prog.processes[0].states[0].span.is_valid());
         assert!(!prog.processes[0].handlers.is_empty());
         assert!(prog.processes[0].handlers[0].span.is_valid());
-    }
-
-    #[test]
-    fn span_extraction_works() {
-        let src = "let x = 1 + 2";
-        // Just ensure the parser can still run; full span attachment is incremental
-        let _ = src;
-        assert!(true);
     }
 
     #[test]
@@ -893,14 +1062,24 @@ process P {
         let mut found_binary = false;
         for handler in &process.handlers {
             for stmt in &handler.body {
-                if let Stmt::Let { expr: Expr::Binary { span, .. }, .. } = stmt {
+                if let Stmt::Let {
+                    expr: Expr::Binary { span, .. },
+                    ..
+                } = stmt
+                {
                     assert!(span.is_valid(), "Binary span should be valid (start < end)");
-                    assert!(span.end - span.start > 1, "Binary span should cover more than one character");
+                    assert!(
+                        span.end - span.start > 1,
+                        "Binary span should cover more than one character"
+                    );
                     found_binary = true;
                 }
             }
         }
-        assert!(found_binary, "expected a Binary expression with a valid span");
+        assert!(
+            found_binary,
+            "expected a Binary expression with a valid span"
+        );
     }
 
     #[test]
@@ -920,7 +1099,7 @@ process P {
         let prog = parse(src).expect("should parse resilient.sigil");
         assert_eq!(prog.processes.len(), 1);
         assert_eq!(prog.processes[0].name, "ResilientProcessor");
-        assert!(prog.processes[0].states.len() >= 1);
+        assert!(!prog.processes[0].states.is_empty());
         assert_eq!(prog.processes[0].states[0].name, "last_ok");
         assert_eq!(prog.processes[0].handlers.len(), 1);
         assert!(prog.processes[0].handlers[0].body.len() >= 3);
@@ -989,9 +1168,11 @@ process P {
                 }
             }
         }
-        assert!(found_timeout || found_ident_or_call, "expected Timeout or Ident/Call with valid span");
+        assert!(
+            found_timeout || found_ident_or_call,
+            "expected Timeout or Ident/Call with valid span"
+        );
     }
-
 
     #[test]
     fn parse_pipeline_example() {
@@ -1001,5 +1182,4 @@ process P {
         assert_eq!(prog.processes[0].states.len(), 2);
         assert!(!prog.processes[0].handlers[0].body.is_empty());
     }
-
 }

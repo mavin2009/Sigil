@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum SigilError {
     #[error("timeout")]
     Timeout,
@@ -10,6 +10,14 @@ pub enum SigilError {
     Transform(String),
     #[error("schema or validation failure")]
     Schema,
+    #[error("invalid runtime configuration: {0}")]
+    Configuration(String),
+    #[error("actor stopped before accepting the message")]
+    ActorStopped,
+    #[error("actor task panicked")]
+    ActorPanicked,
+    #[error("actor task was cancelled")]
+    ActorCancelled,
 }
 
 pub type Result<T> = std::result::Result<T, SigilError>;
@@ -18,15 +26,15 @@ pub type Result<T> = std::result::Result<T, SigilError>;
 ///
 /// `Shed` is not an error: it is the policy doing exactly what was declared.
 /// It is counted so the loss is always visible in the run report.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
     Delivered,
     Shed,
 }
 
-/// Per-actor message accounting, returned alongside final state at join().
-/// handled + dropped equals every message the actor ever received, so
-/// system-wide conservation checks stay exact even under fault injection.
+/// Per-actor message accounting, returned alongside final state after a
+/// normal actor exit. If the actor panics, no final state or accounting
+/// snapshot is available and `join_actor` returns `ActorPanicked`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ActorStats {
     pub handled: u64,
@@ -43,8 +51,17 @@ pub struct Router<H> {
 }
 
 impl<H> Router<H> {
-    pub fn new(shards: Vec<H>) -> Self {
-        Self { shards, rr: 0 }
+    /// Construct a router with at least one destination shard.
+    ///
+    /// Keeping the shard vector non-empty is the invariant that makes
+    /// `round_robin` and `by_key` panic-free.
+    pub fn new(shards: Vec<H>) -> Result<Self> {
+        if shards.is_empty() {
+            return Err(SigilError::Configuration(
+                "a router requires at least one destination shard".into(),
+            ));
+        }
+        Ok(Self { shards, rr: 0 })
     }
 
     /// Even distribution: successive calls walk the shard ring.
@@ -57,15 +74,53 @@ impl<H> Router<H> {
     /// Key affinity: identical keys always land on the same shard, so
     /// per-key ordering and shard-local state remain coherent.
     pub fn by_key<K: std::hash::Hash + ?Sized>(&self, key: &K) -> &H {
-        use std::hash::{BuildHasher, Hasher};
-        let mut hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().build_hasher();
-        key.hash(&mut hasher);
-        &self.shards[(hasher.finish() as usize) % self.shards.len()]
+        use std::hash::BuildHasher;
+        let state =
+            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        &self.shards[(state.hash_one(key) as usize) % self.shards.len()]
     }
 
     /// Every shard, for broadcast delivery.
     pub fn shards(&self) -> &[H] {
         &self.shards
+    }
+}
+
+/// Validate a capacity before calling Tokio's bounded-channel constructor.
+///
+/// Tokio panics for zero and overlarge capacities. Generated code calls this
+/// first so deployment configuration errors are returned as typed errors.
+pub fn validate_channel_capacity(capacity: usize) -> Result<()> {
+    if capacity == 0 {
+        return Err(SigilError::Configuration(
+            "actor inbox capacity must be at least 1".into(),
+        ));
+    }
+    if capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(SigilError::Configuration(format!(
+            "actor inbox capacity {capacity} exceeds the runtime maximum {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(())
+}
+
+/// Await an actor without turning a task panic into another panic.
+///
+/// Tokio already catches task panics and reports them through `JoinHandle`.
+/// This helper preserves that distinction as a typed Sigil error.
+pub async fn join_actor<T>(
+    join: tokio::task::JoinHandle<(T, ActorStats)>,
+) -> Result<(T, ActorStats)> {
+    join_task(join).await
+}
+
+/// Await any Tokio task and retain panic versus cancellation in the error.
+pub async fn join_task<T>(join: tokio::task::JoinHandle<T>) -> Result<T> {
+    match join.await {
+        Ok(done) => Ok(done),
+        Err(err) if err.is_panic() => Err(SigilError::ActorPanicked),
+        Err(_) => Err(SigilError::ActorCancelled),
     }
 }
 
@@ -85,7 +140,7 @@ pub mod backpressure {
         tx.send(msg)
             .await
             .map(|_| SendOutcome::Delivered)
-            .map_err(|_| SigilError::Transform("actor stopped".into()))
+            .map_err(|_| SigilError::ActorStopped)
     }
 
     pub fn shed<T>(tx: &Sender<T>, msg: T) -> crate::Result<SendOutcome> {
@@ -93,20 +148,14 @@ pub mod backpressure {
         match tx.try_send(msg) {
             Ok(()) => Ok(SendOutcome::Delivered),
             Err(TrySendError::Full(_)) => Ok(SendOutcome::Shed),
-            Err(TrySendError::Closed(_)) => {
-                Err(SigilError::Transform("actor stopped".into()))
-            }
+            Err(TrySendError::Closed(_)) => Err(SigilError::ActorStopped),
         }
     }
 
-    pub async fn deadline<T>(
-        tx: &Sender<T>,
-        msg: T,
-        ms: u64,
-    ) -> crate::Result<SendOutcome> {
+    pub async fn deadline<T>(tx: &Sender<T>, msg: T, ms: u64) -> crate::Result<SendOutcome> {
         match tokio::time::timeout(Duration::from_millis(ms), tx.send(msg)).await {
             Ok(Ok(())) => Ok(SendOutcome::Delivered),
-            Ok(Err(_)) => Err(SigilError::Transform("actor stopped".into())),
+            Ok(Err(_)) => Err(SigilError::ActorStopped),
             Err(_) => Ok(SendOutcome::Shed), // deadline expired: declared loss
         }
     }
@@ -167,12 +216,15 @@ pub mod chaos {
         CALLS.fetch_add(1, Relaxed);
         let lat = max_latency_ms();
         if lat > 0 && next() % 100 < slow_pct() {
-            tokio::time::sleep(Duration::from_millis(next() % (lat + 1))).await;
+            let range = lat.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(next() % range)).await;
         }
         let pct = fail_pct();
         if pct > 0 && next() % 100 < pct {
             FAULTS.fetch_add(1, Relaxed);
-            return Err(crate::SigilError::Transform(format!("{name}: injected fault")));
+            return Err(crate::SigilError::Transform(format!(
+                "{name}: injected fault"
+            )));
         }
         Ok(())
     }
@@ -211,5 +263,69 @@ pub mod chaos {
             fail_pct(),
             max_latency_ms()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_rejects_an_empty_shard_set() {
+        let err = Router::<u8>::new(Vec::new())
+            .err()
+            .expect("an empty router must be rejected");
+        assert!(matches!(err, SigilError::Configuration(_)));
+    }
+
+    #[test]
+    fn router_round_robin_and_affinity_are_stable() {
+        let mut router = Router::new(vec![10, 20, 30]).expect("non-empty router");
+        assert_eq!(*router.round_robin(), 10);
+        assert_eq!(*router.round_robin(), 20);
+        assert_eq!(*router.round_robin(), 30);
+        assert_eq!(*router.round_robin(), 10);
+        assert_eq!(router.by_key("account-7"), router.by_key("account-7"));
+    }
+
+    #[test]
+    fn channel_capacity_is_checked_without_panicking() {
+        assert!(matches!(
+            validate_channel_capacity(0),
+            Err(SigilError::Configuration(_))
+        ));
+        assert!(matches!(
+            validate_channel_capacity(tokio::sync::Semaphore::MAX_PERMITS + 1),
+            Err(SigilError::Configuration(_))
+        ));
+        assert_eq!(validate_channel_capacity(1), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn backpressure_reports_closed_channels() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<u8>(1);
+        drop(rx);
+        assert_eq!(
+            backpressure::block(&tx, 1).await,
+            Err(SigilError::ActorStopped)
+        );
+        assert_eq!(backpressure::shed(&tx, 1), Err(SigilError::ActorStopped));
+        assert_eq!(
+            backpressure::deadline(&tx, 1, 1).await,
+            Err(SigilError::ActorStopped)
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_panics_are_typed_join_errors() {
+        let join = tokio::spawn(async move {
+            panic!("test panic");
+            #[allow(unreachable_code)]
+            ((), ActorStats::default())
+        });
+        assert!(matches!(
+            join_actor(join).await,
+            Err(SigilError::ActorPanicked)
+        ));
     }
 }

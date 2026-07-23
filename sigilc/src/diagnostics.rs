@@ -99,9 +99,15 @@ mod tests {
         let msg = format!("Level-1 violation at bytes {}..{}: bad thing", idx, idx + 5);
         let rendered = render(&msg, SRC, "demo.sigil");
         assert!(rendered.contains("at demo.sigil:3:3"), "got: {rendered}");
-        assert!(rendered.contains("state n: Int = 0"), "snippet missing: {rendered}");
+        assert!(
+            rendered.contains("state n: Int = 0"),
+            "snippet missing: {rendered}"
+        );
         assert!(rendered.contains('^'), "caret missing: {rendered}");
-        assert!(!rendered.contains("at bytes"), "raw offsets remain: {rendered}");
+        assert!(
+            !rendered.contains("at bytes"),
+            "raw offsets remain: {rendered}"
+        );
     }
 
     #[test]
@@ -116,6 +122,9 @@ mod tests {
         let b = SRC.find("state").unwrap();
         let msg = format!("first at bytes {a}..{} then at bytes {b}..{}", a + 7, b + 5);
         let r = render(&msg, SRC, "f.sigil");
-        assert!(r.contains("at f.sigil:2:1") && r.contains("at f.sigil:3:3"), "got: {r}");
+        assert!(
+            r.contains("at f.sigil:2:1") && r.contains("at f.sigil:3:3"),
+            "got: {r}"
+        );
     }
 }

@@ -26,7 +26,7 @@ formatting.
 | Proven invariants | the holds discharged, and by which argument |
 | Proof assumptions | input contracts — each one enforced by a generated runtime guard |
 | Process topology | verified edges, message types, acyclicity |
-| Back-pressure policies | per send, plus the deadlock-freedom argument |
+| Back-pressure policies | per send, plus the generated channel-cycle argument |
 | External (residual) transforms | the real I/O the proofs do **not** cover |
 
 The last row is the important one. Everything else describes what was

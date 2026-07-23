@@ -44,8 +44,10 @@ out_dir/
   RESIDUAL_RISK.md    what was proven, assumed, and skipped
 ```
 
-Generated code contains **no `Mutex`, no `Arc`, no atomics, and no
-`unsafe`** — asserted by an integration test, not by convention.
+Sigil-emitted code contains **no `Mutex`, no `RwLock`, no `Arc`, no atomics,
+and no `unsafe`** — asserted by an integration test, not by convention. This
+is a source-level shared-nothing guarantee, not a claim that Tokio's bounded
+channel, the allocator, or the operating system is lock-free internally.
 
 ## The actor model
 
@@ -58,8 +60,9 @@ pub struct LedgerHandle {
 
 impl Ledger {
     pub fn spawn(mut self, capacity: usize)
-        -> (LedgerHandle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)
+        -> Result<(LedgerHandle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)>
     {
+        sigil_rt::validate_channel_capacity(capacity)?;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Payment>(capacity);
         let join = tokio::spawn(async move {
             let mut stats = sigil_rt::ActorStats::default();
@@ -72,7 +75,7 @@ impl Ledger {
             stats.shed = self.__shed;
             (self, stats)
         });
-        (LedgerHandle { tx }, join)
+        Ok((LedgerHandle { tx }, join))
     }
 }
 ```
@@ -81,8 +84,13 @@ impl Ledger {
 except by message; it comes back at `join()`. Data races are not prevented
 by discipline — they are unrepresentable.
 
-`ActorStats` gives exact accounting: `handled + dropped` is every message the
-actor received, and `shed` counts outbound messages dropped by policy.
+On a normal actor exit, `ActorStats` gives exact accounting:
+`handled + dropped` is every message the actor completed or rejected, and
+`shed` counts outbound messages dropped by policy. A panic is fail-stop:
+Tokio catches it at the task boundary and returns a `JoinError`; Sigil's
+`join_actor` converts that to `SigilError::ActorPanicked`. State and final
+statistics are unavailable after a panic, so callers must monitor and treat
+that error as component failure rather than claiming conservation.
 
 **Multi-handler processes** get a typed dispatch enum:
 
@@ -118,8 +126,9 @@ nothing hangs waiting on a stage that will never drain.
 Shutdown ordering is where hand-written actor systems deadlock. Here it is
 derived from the graph the compiler already proved acyclic.
 
-`Router<H>` lives inside a single actor's task, so round-robin needs no
-atomics and hashing needs no locks.
+`Router<H>` lives inside a single actor's task, so Sigil's round-robin and
+hashing logic needs no atomics or locks. `Router::new` rejects an empty shard
+set as a typed configuration error.
 
 ## sigil_rt
 
@@ -127,10 +136,12 @@ The runtime is deliberately small:
 
 | Item | Purpose |
 | ---- | ------- |
-| `SigilError` | `Timeout`, `Transform(String)`, `Schema` |
+| `SigilError` | typed timeout, transform, schema, configuration, stopped, panicked, and cancelled failures |
 | `ActorStats` | `{ handled, dropped, shed }` |
 | `Router<H>` | shard ring: `round_robin`, `by_key`, `shards` |
 | `SendOutcome` | `Delivered` \| `Shed` |
+| `validate_channel_capacity` | rejects capacities that would make Tokio panic |
+| `join_actor` / `join_task` | converts Tokio panic/cancellation joins to typed Sigil errors |
 | `backpressure::{block, shed, deadline}` | the three declared policies |
 | `chaos` | fault injection and counters |
 

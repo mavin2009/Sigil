@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps
+      - name: Unit, integration, generated-crate, and chaos tests
+        run: cargo test --workspace --all-targets
+      - name: Compiler panic smoke campaign
+        run: ./fuzz/run.sh 1 10
+      - name: Accepted implies generated Rust compiles
+        run: ./fuzz/metamorphic.sh 1 10
+      - name: Prover soundness smoke campaign
+        run: ./fuzz/prover_soundness.sh 1 10

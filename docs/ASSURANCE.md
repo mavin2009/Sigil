@@ -158,6 +158,7 @@ right reason.
 | `hold_bad_init.sigil` | init violates its own invariant |
 | `hold_not_inductive.sigil` | update can escape the invariant |
 | `one_sided_clamp.sigil` | clamping only the upper bound |
+| `guard_mutated_state.sigil` | correlating a send guard with state mutated in the same handler |
 | `mixed_numeric_types.sigil` | `Int` and `Float` mixed in arithmetic |
 | `system_ordering.sigil` | counting after forwarding |
 | `system_leak.sigil` | a second entry bypassing the counter |
@@ -184,7 +185,7 @@ crate, containing:
 - the assurance level, and everything **not** established at it
 - proven invariants, and which assumptions are runtime-enforced
 - the verified topology, with message types per edge
-- back-pressure policies per send, and the deadlock-freedom argument
+- back-pressure policies per send, and the generated channel-cycle argument
 - external (residual) transforms — the real I/O the proofs do not cover
 
 This is the honest core of the design. Sigil does not claim your component

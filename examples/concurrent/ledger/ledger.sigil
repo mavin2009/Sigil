@@ -3,7 +3,7 @@
 // Every external stage carries a recovery path, and every recovery path is a
 // PURE transform (compiled, infallible). Under fault injection this pipeline
 // loses ZERO messages: handled == total, dropped == 0, aggregates exact,
-// with no locks anywhere in the generated program.
+// with no explicit locks in the code emitted by Sigil.
 
 schema Payment {
   id: String,

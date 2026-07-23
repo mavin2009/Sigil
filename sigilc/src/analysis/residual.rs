@@ -40,7 +40,9 @@ pub fn residual_risk_report(
         if t.body.is_empty() {
             external.push(format!("- {sig} (no body — external residual)"));
         } else {
-            compiled.push(format!("- {sig} (body present — compiled into generated crate)"));
+            compiled.push(format!(
+                "- {sig} (body present — compiled into generated crate)"
+            ));
         }
     }
 
@@ -48,11 +50,38 @@ pub fn residual_risk_report(
     let declared_names: std::collections::BTreeSet<_> =
         program.transforms.iter().map(|t| t.name.as_str()).collect();
     let skip = [
-        "packet", "v", "d", "m", "last", "event", "req", "request", "validated",
-        "processed", "stored", "result", "final", "checked", "fetched", "recorded",
-        "next", "y", "s", "auth", "reserved", "charged", "receipt", "enriched",
-        "order", "count", "total_charged", "last_order", "last_ok", "failures",
-        "last_status", "open",
+        "packet",
+        "v",
+        "d",
+        "m",
+        "last",
+        "event",
+        "req",
+        "request",
+        "validated",
+        "processed",
+        "stored",
+        "result",
+        "final",
+        "checked",
+        "fetched",
+        "recorded",
+        "next",
+        "y",
+        "s",
+        "auth",
+        "reserved",
+        "charged",
+        "receipt",
+        "enriched",
+        "order",
+        "count",
+        "total_charged",
+        "last_order",
+        "last_ok",
+        "failures",
+        "last_status",
+        "open",
     ];
     let mut undeclared: Vec<_> = ir
         .external_calls
@@ -114,9 +143,7 @@ pub fn residual_risk_report(
 
     let level2_section = match level2 {
         Some(l2) => {
-            let mut lines = vec![
-                format!("- path_timeout_sum: {}ms", l2.path_timeout_sum_ms),
-            ];
+            let mut lines = vec![format!("- path_timeout_sum: {}ms", l2.path_timeout_sum_ms)];
             if let Some(b) = l2.path_timeout_bound_ms {
                 lines.push(format!("- path_timeout bound: {}ms", b));
             }
@@ -153,7 +180,12 @@ pub fn residual_risk_report(
     for proc in &program.processes {
         for h in &proc.handlers {
             for stmt in &h.body {
-                if let crate::frontend::ast::Stmt::Send { target, backpressure, .. } = stmt {
+                if let crate::frontend::ast::Stmt::Send {
+                    target,
+                    backpressure,
+                    ..
+                } = stmt
+                {
                     if matches!(backpressure, crate::frontend::ast::Backpressure::Block) {
                         any_block = true;
                     }
@@ -181,9 +213,9 @@ pub fn residual_risk_report(
         let mut out = String::from("## Back-Pressure Policies\n");
         out.push_str(&bp_lines.join("\n"));
         out.push_str(
-            "\n\nDeadlock freedom: blocking sends cannot deadlock because the process \
-             graph is proven ACYCLIC at Level 1 and handlers terminate (bounded retries \
-             over bounded timeouts), so every sink always drains.\n",
+            "\n\nGenerated channel-wait cycles are ruled out because the process graph \
+             is proven ACYCLIC at Level 1. This does not establish global deadlock freedom \
+             or handler termination; external code and unbounded waits remain residual.\n",
         );
         if any_block {
             out.push_str(
@@ -201,9 +233,14 @@ pub fn residual_risk_report(
         Ok(t) if t.is_pipeline() => {
             let mut lines = vec!["## Process Topology (verified)".to_string()];
             for e in &t.edges {
-                lines.push(format!("- `{}` → `{}` carrying `{}` (typed, acyclic, bounded channel)", e.from, e.to, e.msg_type));
+                lines.push(format!(
+                    "- `{}` → `{}` carrying `{}` (typed, acyclic, bounded channel)",
+                    e.from, e.to, e.msg_type
+                ));
             }
-            lines.push("- Residual: channel capacity/backpressure tuning is a runtime concern".into());
+            lines.push(
+                "- Residual: channel capacity/backpressure tuning is a runtime concern".into(),
+            );
             lines.join("\n") + "\n\n"
         }
         _ => String::new(),

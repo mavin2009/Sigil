@@ -8,18 +8,23 @@
 //! automatic: skipping a level never fails the build silently — every skipped
 //! guarantee is surfaced in the residual-risk report.
 
-use crate::analysis::check::{check_failure_paths, check_handler_wellformedness, check_numeric_types, check_recover_signatures, check_transform_purity, check_transform_signatures, fallible_fallbacks, level1_check};
+use crate::analysis::check::{
+    check_failure_paths, check_handler_wellformedness, check_numeric_types,
+    check_recover_signatures, check_transform_purity, check_transform_signatures,
+    fallible_fallbacks, level1_check,
+};
 use crate::analysis::ir::GraphIR;
 use crate::analysis::level2::{level2_check, Level2Report};
 use crate::analysis::topology::derive_topology;
 use crate::frontend::ast::Program;
 use anyhow::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum AssuranceLevel {
     /// Level 0 — exploratory sketch. Parses and lowers; no safety checks run.
     Sketch = 0,
     /// Level 1 — safe default. Extinct-by-design checks + transform signatures.
+    #[default]
     Safe = 1,
     /// Level 2 — contracts. Spec obligations checked on a Level-1-legal graph.
     Contracts = 2,
@@ -54,12 +59,6 @@ impl AssuranceLevel {
     }
 }
 
-impl Default for AssuranceLevel {
-    fn default() -> Self {
-        Self::Safe
-    }
-}
-
 /// Result of running checks at a chosen assurance level.
 #[derive(Debug)]
 pub struct CheckOutcome {
@@ -79,7 +78,11 @@ pub struct CheckOutcome {
 /// Run all checks appropriate for `level`. Failing a check at or below the
 /// chosen level fails the build; guarantees above the chosen level are
 /// recorded as skipped so the residual report can surface them.
-pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> Result<CheckOutcome> {
+pub fn run_checks(
+    program: &Program,
+    irs: &[GraphIR],
+    level: AssuranceLevel,
+) -> Result<CheckOutcome> {
     let mut skipped = Vec::new();
     let mut notes = Vec::new();
     let mut level2 = None;
@@ -130,7 +133,10 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
                 "Level-3 requires infallible recovery: {} used as a @recover target but \
                  declared external (empty body). A fallback that can fail or hang \
                  reintroduces the loss it exists to prevent — give it a pure body.",
-                ff.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+                ff.iter()
+                    .map(|f| format!("`{f}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         let l3 = crate::analysis::level3::level3_prove(program)?;
@@ -153,14 +159,18 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
             notes.push(format!(
                 "fallible recovery paths (external @recover targets): {} — these can fail \
                  or hang; Level 3 rejects them",
-                ff.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+                ff.iter()
+                    .map(|f| format!("`{f}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
-            skipped.push(
-                "infallible-recovery guarantee (some @recover targets are external)".into(),
-            );
+            skipped
+                .push("infallible-recovery guarantee (some @recover targets are external)".into());
         }
         let has_holds = program.specs.iter().any(|sp| {
-            sp.items.iter().any(|i| matches!(i, crate::frontend::ast::SpecItem::Hold { .. }))
+            sp.items
+                .iter()
+                .any(|i| matches!(i, crate::frontend::ast::SpecItem::Hold { .. }))
         });
         if has_holds {
             skipped.push(
@@ -184,10 +194,7 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
 /// inclusion at the top of RESIDUAL_RISK.md.
 pub fn level_banner(outcome: &CheckOutcome) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "## Assurance Level: {}\n\n",
-        outcome.level.name()
-    ));
+    out.push_str(&format!("## Assurance Level: {}\n\n", outcome.level.name()));
     if outcome.skipped.is_empty() {
         out.push_str("All guarantees available at this level were established.\n\n");
     } else {
@@ -199,7 +206,9 @@ pub fn level_banner(outcome: &CheckOutcome) -> String {
     }
     if let Some(l4) = &outcome.level4 {
         if !l4.proven.is_empty() {
-            out.push_str("**Proven SYSTEM invariants (Level 4, structural over the topology):**\n\n");
+            out.push_str(
+                "**Proven SYSTEM invariants (Level 4, structural over the topology):**\n\n",
+            );
             for p in &l4.proven {
                 out.push_str(&format!("- {p}\n"));
             }
@@ -300,14 +309,13 @@ spec S {
             .iter()
             .any(|n| n.contains("NOT checked") && n.contains("--level 2")));
 
-        let outcome2 =
-            run_checks(&program, &irs, AssuranceLevel::Contracts).expect("l2 ok");
+        let outcome2 = run_checks(&program, &irs, AssuranceLevel::Contracts).expect("l2 ok");
         assert!(outcome2.level2.is_some());
         // At Level 2, the only remaining skip is the Level-3 proof of the hold.
         assert!(outcome2.skipped.iter().all(|s| s.contains("Level 3")));
 
-        let outcome3 =
-            run_checks(&program, &irs, AssuranceLevel::Proofs).expect("hold total >= 0 is provable");
+        let outcome3 = run_checks(&program, &irs, AssuranceLevel::Proofs)
+            .expect("hold total >= 0 is provable");
         assert!(outcome3.skipped.is_empty());
         assert!(outcome3.level3.is_some());
     }

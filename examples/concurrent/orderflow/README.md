@@ -55,7 +55,8 @@ cascading a clean shutdown with no message stranded in a closed channel.
 [Audit]      mirrored = 12800  (= 3200 × 4 shards — broadcast exact)
 ```
 
-Every message accounted for at every stage, exact float totals, zero locks.
+Every message accounted for at every stage, exact float totals, and zero
+explicit locks in Sigil-emitted code.
 Hand-writing this in Rust means: channel wiring, shutdown ordering (a
 notorious deadlock source), per-stage timeout/fallback plumbing, and shared
 accumulators — none of it compiler-checked.

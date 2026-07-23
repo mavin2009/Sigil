@@ -8,6 +8,7 @@ document covers the parts that are not obvious.
 - [Wiring external transforms](#wiring-external-transforms)
 - [Capacity and back-pressure tuning](#capacity-and-back-pressure-tuning)
 - [Lifecycle: startup and graceful shutdown](#lifecycle-startup-and-graceful-shutdown)
+- [Panics and task supervision](#panics-and-task-supervision)
 - [Observability](#observability)
 - [Performance characterization](#performance-characterization)
 - [CI integration](#ci-integration)
@@ -50,8 +51,10 @@ assumed and cannot check for you:
 1. **It must be cancel-safe.** Timed stages run inside `tokio::time::timeout`,
    so the future can be dropped at any await point. If your implementation
    holds a half-completed write when cancelled, the compiler's failure model
-   does not cover that. Prefer idempotent operations, or complete writes
-   inside a `spawn` the timeout cannot cancel.
+   does not cover that. Prefer idempotent operations, transactional APIs, or
+   an operation-specific idempotency key. Detaching work in a spawned task
+   merely to evade cancellation also detaches its outcome from Sigil's
+   failure accounting and is not a general fix.
 2. **It must terminate.** Untimed stages have no bound. A transform that
    blocks forever stalls one actor permanently; the Level-2 budget only
    covers stages you actually annotated with `@timeout`.
@@ -68,15 +71,18 @@ on their infallibility.
 
 ## Capacity and back-pressure tuning
 
-`spawn(self, capacity)` sets the per-actor inbox size. Memory is
-**analytically bounded**, which is the point of bounded channels:
+`spawn(self, capacity)` validates and sets the per-actor inbox size. The
+number of queued message slots is bounded, which is the point of bounded
+channels:
 
 ```
-peak queued bytes  ≈  stages × shards × capacity × sizeof(message)
+queued slots  =  sum over actors(capacity)
 ```
 
-There is no unbounded buffer anywhere in generated code, so this is a
-ceiling, not an average.
+This is not a byte-exact memory ceiling: heap-owned fields such as `String`,
+in-flight handler values, producer tasks, runtime bookkeeping, foreign
+libraries, and allocator overhead are additional. Sigil emits no unbounded
+channel.
 
 Choosing the policy per edge matters more than choosing the number:
 
@@ -105,7 +111,7 @@ handle:
 let mut sinks = Vec::new();
 let mut sink_joins = Vec::new();
 for _ in 0..shards {
-    let (h, j) = Settlement::new().spawn(capacity);
+    let (h, j) = Settlement::new().spawn(capacity)?;
     sinks.push(h);
     sink_joins.push(j);
 }
@@ -113,8 +119,8 @@ for _ in 0..shards {
 let mut gateways = Vec::new();
 for _ in 0..shards {
     let mut g = Gateway::new();
-    g.connect_settlement(sinks.clone());
-    gateways.push(g.spawn(capacity));
+    g.connect_settlement(sinks.clone())?;
+    gateways.push(g.spawn(capacity)?);
 }
 ```
 
@@ -124,14 +130,37 @@ cascades downstream:
 
 ```rust
 drop(gateway_handles);
-for j in gateway_joins { let (state, stats) = j.await?; }
+for j in gateway_joins {
+    let (state, stats) = sigil_rt::join_actor(j).await?;
+}
 drop(sink_handles);
-for j in sink_joins { let (state, stats) = j.await?; }
+for j in sink_joins {
+    let (state, stats) = sigil_rt::join_actor(j).await?;
+}
 ```
 
 Shutting down out of order is where hand-written actor systems hang. The
 order is derivable from `topology.mmd`, and the graph is proven acyclic, so
 one exists.
+
+## Panics and task supervision
+
+Rust and Tokio do handle task panics: Tokio catches a panic at the spawned
+task boundary and returns it as a `JoinError`. Sigil's `join_actor` maps that
+to `SigilError::ActorPanicked` without panicking again.
+
+The policy is deliberately **fail-stop**, not restart-and-continue. A panic
+may occur after part of a handler changed state or sent a message, so
+continuing the same actor or automatically replaying the input could violate
+an invariant or duplicate an effect. After a panic, final state and
+`ActorStats` are unavailable. Production integration must retain and monitor
+every join handle, fail the component or isolate the affected traffic, and
+reconcile from a durable source before restarting. Dropping a `JoinHandle`
+detaches the task and discards this supervision signal.
+
+Ordinary transform errors, validation failures, timeouts, and declared
+shedding are not panics; those remain typed and accounted for. Panic freedom
+of foreign Rust code and arithmetic is not currently proven.
 
 ## Observability
 
@@ -153,9 +182,11 @@ let (state, stats) = join.await?;
 // stats.shed     — outbound messages dropped by back-pressure policy
 ```
 
-`handled + dropped` is every message the actor received. Export all three;
-`shed` in particular is the signal that a `@shed` edge is doing its job, and
-a rising `dropped` means input guards are rejecting traffic.
+On normal actor completion, `handled + dropped` accounts for every completed
+or rejected input. Export all three; `shed` in particular is the signal that
+a `@shed` edge is doing its job, and a rising `dropped` means input guards are
+rejecting traffic. If `join_actor` returns an error there is no final
+accounting snapshot; alert on that separately.
 
 **Suggested alerts**
 

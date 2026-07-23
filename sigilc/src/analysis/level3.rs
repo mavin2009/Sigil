@@ -27,18 +27,27 @@ pub struct Interval {
 }
 
 impl Interval {
-    pub const TOP: Interval = Interval { lo: f64::NEG_INFINITY, hi: f64::INFINITY };
+    pub const TOP: Interval = Interval {
+        lo: f64::NEG_INFINITY,
+        hi: f64::INFINITY,
+    };
 
     fn point(v: f64) -> Self {
         Interval { lo: v, hi: v }
     }
 
     fn add(self, o: Self) -> Self {
-        Interval { lo: self.lo + o.lo, hi: self.hi + o.hi }
+        Interval {
+            lo: self.lo + o.lo,
+            hi: self.hi + o.hi,
+        }
     }
 
     fn sub(self, o: Self) -> Self {
-        Interval { lo: self.lo - o.hi, hi: self.hi - o.lo }
+        Interval {
+            lo: self.lo - o.hi,
+            hi: self.hi - o.lo,
+        }
     }
 
     /// Smallest interval containing both — the join of two branches.
@@ -86,10 +95,22 @@ impl Pred {
     /// The region this predicate admits, as an interval.
     fn region(&self) -> Interval {
         match self.op {
-            BinOp::Ge => Interval { lo: self.bound, hi: f64::INFINITY },
-            BinOp::Gt => Interval { lo: self.bound, hi: f64::INFINITY }, // sound over-approx of assumption
-            BinOp::Le => Interval { lo: f64::NEG_INFINITY, hi: self.bound },
-            BinOp::Lt => Interval { lo: f64::NEG_INFINITY, hi: self.bound },
+            BinOp::Ge => Interval {
+                lo: self.bound,
+                hi: f64::INFINITY,
+            },
+            BinOp::Gt => Interval {
+                lo: self.bound,
+                hi: f64::INFINITY,
+            }, // sound over-approx of assumption
+            BinOp::Le => Interval {
+                lo: f64::NEG_INFINITY,
+                hi: self.bound,
+            },
+            BinOp::Lt => Interval {
+                lo: f64::NEG_INFINITY,
+                hi: self.bound,
+            },
             _ => Interval::TOP,
         }
     }
@@ -150,10 +171,15 @@ fn lit_value(l: &Literal) -> Option<f64> {
 }
 
 fn cmp_pred(op: &BinOp, bound: &Expr) -> Option<Pred> {
-    let Expr::Literal { value, .. } = bound else { return None };
+    let Expr::Literal { value, .. } = bound else {
+        return None;
+    };
     let bound = lit_value(value)?;
     match op {
-        BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt => Some(Pred { op: op.clone(), bound }),
+        BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt => Some(Pred {
+            op: op.clone(),
+            bound,
+        }),
         _ => None,
     }
 }
@@ -164,10 +190,18 @@ pub fn input_preconditions(program: &Program) -> Vec<InputPrecondition> {
     let mut out = Vec::new();
     for spec in &program.specs {
         for item in &spec.items {
-            let SpecItem::Require { expr, .. } = item else { continue };
-            let Expr::Binary { op, lhs, rhs, .. } = expr else { continue };
-            let Expr::FieldAccess { base, field, .. } = lhs.as_ref() else { continue };
-            let Some(pred) = cmp_pred(op, rhs) else { continue };
+            let SpecItem::Require { expr, .. } = item else {
+                continue;
+            };
+            let Expr::Binary { op, lhs, rhs, .. } = expr else {
+                continue;
+            };
+            let Expr::FieldAccess { base, field, .. } = lhs.as_ref() else {
+                continue;
+            };
+            let Some(pred) = cmp_pred(op, rhs) else {
+                continue;
+            };
             for process in &program.processes {
                 for handler in &process.handlers {
                     if handler.msg_name == *base {
@@ -202,7 +236,9 @@ pub fn level3_prove(program: &Program) -> Result<Level3Report> {
     let mut relational: Vec<(String, BinOp, String, String)> = Vec::new();
     for spec in &program.specs {
         for item in &spec.items {
-            let SpecItem::Hold { expr, span } = item else { continue };
+            let SpecItem::Hold { expr, span } = item else {
+                continue;
+            };
             let Expr::Binary { op, lhs, rhs, .. } = expr else {
                 report.residual.push(format!(
                     "spec `{}` hold at bytes {}..{} — not in the provable fragment (need `state <cmp> literal`)",
@@ -230,9 +266,17 @@ pub fn level3_prove(program: &Program) -> Result<Level3Report> {
                     continue;
                 }
             }
-            if let Expr::Ident { name: rhs_state, .. } = rhs.as_ref() {
+            if let Expr::Ident {
+                name: rhs_state, ..
+            } = rhs.as_ref()
+            {
                 // Relational hold within a process: proven separately.
-                relational.push((name.clone(), op.clone(), rhs_state.clone(), spec.name.clone()));
+                relational.push((
+                    name.clone(),
+                    op.clone(),
+                    rhs_state.clone(),
+                    spec.name.clone(),
+                ));
                 continue;
             }
             let Some(pred) = cmp_pred(op, rhs) else {
@@ -255,7 +299,13 @@ pub fn level3_prove(program: &Program) -> Result<Level3Report> {
     }
     for (a, op, b, spec_name) in &relational {
         prove_relational(program, a, op, b, spec_name, &holds, &preconds)?;
-        let op_s = match op { BinOp::Le => "<=", BinOp::Lt => "<", BinOp::Ge => ">=", BinOp::Gt => ">", _ => "?" };
+        let op_s = match op {
+            BinOp::Le => "<=",
+            BinOp::Lt => "<",
+            BinOp::Ge => ">=",
+            BinOp::Gt => ">",
+            _ => "?",
+        };
         report.proven.push(format!(
             "hold `{a} {op_s} {b}` (spec `{spec_name}`): init ordering + per-handler delta argument \
              (sound at handler boundaries because actors are shared-nothing: no interleaving \
@@ -315,17 +365,33 @@ fn prove_one(
             if let Stmt::Let { name, expr, .. } = stmt {
                 let mut scratch = Vec::new();
                 let v = eval_interval(
-                    expr, owner, &handler.msg_name, holds, preconds, &lets, &mut scratch,
+                    expr,
+                    owner,
+                    &handler.msg_name,
+                    holds,
+                    preconds,
+                    &lets,
+                    &mut scratch,
                 );
                 lets.insert(name.clone(), v);
                 continue;
             }
-            let Stmt::Assign { name, expr, .. } = stmt else { continue };
+            let Stmt::Assign { name, expr, .. } = stmt else {
+                continue;
+            };
             if name != state {
                 continue;
             }
             let mut why = Vec::new();
-            let v = eval_interval(expr, owner, &handler.msg_name, holds, preconds, &lets, &mut why);
+            let v = eval_interval(
+                expr,
+                owner,
+                &handler.msg_name,
+                holds,
+                preconds,
+                &lets,
+                &mut why,
+            );
             if !pred.admits(v) {
                 let hints = if why.is_empty() {
                     String::new()
@@ -376,15 +442,33 @@ fn same_expr(a: &Expr, b: &Expr) -> bool {
     match (a, b) {
         (Expr::Ident { name: x, .. }, Expr::Ident { name: y, .. }) => x == y,
         (
-            Expr::FieldAccess { base: b1, field: f1, .. },
-            Expr::FieldAccess { base: b2, field: f2, .. },
+            Expr::FieldAccess {
+                base: b1,
+                field: f1,
+                ..
+            },
+            Expr::FieldAccess {
+                base: b2,
+                field: f2,
+                ..
+            },
         ) => b1 == b2 && f1 == f2,
         (Expr::Literal { value: v1, .. }, Expr::Literal { value: v2, .. }) => {
             format!("{v1:?}") == format!("{v2:?}")
         }
         (
-            Expr::Binary { op: o1, lhs: l1, rhs: r1, .. },
-            Expr::Binary { op: o2, lhs: l2, rhs: r2, .. },
+            Expr::Binary {
+                op: o1,
+                lhs: l1,
+                rhs: r1,
+                ..
+            },
+            Expr::Binary {
+                op: o2,
+                lhs: l2,
+                rhs: r2,
+                ..
+            },
         ) => format!("{o1:?}") == format!("{o2:?}") && same_expr(l1, l2) && same_expr(r1, r2),
         _ => false,
     }
@@ -403,7 +487,12 @@ fn free_names(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
             free_names(lhs, out);
             free_names(rhs, out);
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             free_names(cond, out);
             free_names(then_branch, out);
             free_names(else_branch, out);
@@ -455,7 +544,12 @@ fn guard_is_stable(guard: &Expr, handler: &crate::frontend::ast::OnHandler) -> b
 /// what `send ... when G` relies on, so it is resolved syntactically.
 fn simplify_under_guard(expr: &Expr, guard: &Expr) -> Expr {
     match expr {
-        Expr::If { cond, then_branch, else_branch, span } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            span,
+        } => {
             if same_expr(cond, guard) {
                 simplify_under_guard(then_branch, guard)
             } else {
@@ -477,6 +571,7 @@ fn simplify_under_guard(expr: &Expr, guard: &Expr) -> Expr {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the proof environment is intentionally explicit
 pub(crate) fn handler_delta_under(
     state: &str,
     handler: &crate::frontend::ast::OnHandler,
@@ -501,12 +596,16 @@ pub(crate) fn handler_delta_under(
     };
     let mut delta: Option<Interval> = None;
     for stmt in &handler.body {
-        let Stmt::Assign { name, expr, .. } = stmt else { continue };
+        let Stmt::Assign { name, expr, .. } = stmt else {
+            continue;
+        };
         if name != state {
             continue;
         }
         if delta.is_some() {
-            why.push(format!("state `{state}` assigned more than once in a handler"));
+            why.push(format!(
+                "state `{state}` assigned more than once in a handler"
+            ));
             return None;
         }
         let simplified;
@@ -518,8 +617,7 @@ pub(crate) fn handler_delta_under(
             None => expr,
         };
         match expr {
-            Expr::Binary { op, lhs, rhs, .. }
-                if matches!(lhs.as_ref(), Expr::Ident { name: n, .. } if n == state) =>
+            Expr::Binary { op, lhs, rhs, .. } if matches!(lhs.as_ref(), Expr::Ident { name: n, .. } if n == state) =>
             {
                 let e = eval_interval(rhs, owner, &handler.msg_name, holds, preconds, lets, why);
                 delta = match op {
@@ -532,7 +630,9 @@ pub(crate) fn handler_delta_under(
                 };
             }
             _ => {
-                why.push(format!("`{state}` update is not of the form `{state} := {state} ± e`"));
+                why.push(format!(
+                    "`{state}` update is not of the form `{state} := {state} ± e`"
+                ));
                 return None;
             }
         }
@@ -559,9 +659,11 @@ fn prove_relational(
         .processes
         .iter()
         .find(|p| p.states.iter().any(|s| s.name == a))
-        .ok_or_else(|| anyhow::anyhow!(
-            "Level-3 violation in spec '{spec_name}': hold refers to unknown state '{a}'"
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Level-3 violation in spec '{spec_name}': hold refers to unknown state '{a}'"
+            )
+        })?;
     if !owner.states.iter().any(|s| s.name == b) {
         bail!(
             "Level-3 violation in spec '{spec_name}': relational hold `{a} .. {b}` spans \
@@ -571,9 +673,9 @@ fn prove_relational(
     let lit_init = |st: &str| -> Result<f64> {
         let d = owner.states.iter().find(|s| s.name == st).unwrap();
         match &d.init {
-            Expr::Literal { value, .. } => lit_value(value).ok_or_else(|| anyhow::anyhow!(
-                "Level-3 violation in spec '{spec_name}': `{st}` init not numeric"
-            )),
+            Expr::Literal { value, .. } => lit_value(value).ok_or_else(|| {
+                anyhow::anyhow!("Level-3 violation in spec '{spec_name}': `{st}` init not numeric")
+            }),
             _ => bail!("Level-3 violation in spec '{spec_name}': `{st}` init not a literal"),
         }
     };
@@ -597,7 +699,15 @@ fn prove_relational(
         for stmt in &handler.body {
             if let Stmt::Let { name, expr, .. } = stmt {
                 let mut scratch = Vec::new();
-                let v = eval_interval(expr, owner, &handler.msg_name, holds, preconds, &lets, &mut scratch);
+                let v = eval_interval(
+                    expr,
+                    owner,
+                    &handler.msg_name,
+                    holds,
+                    preconds,
+                    &lets,
+                    &mut scratch,
+                );
                 lets.insert(name.clone(), v);
             }
         }
@@ -620,13 +730,19 @@ fn prove_relational(
             _ => false,
         };
         if !ok {
-            let hints = if why.is_empty() { String::new() } else { format!("\n  unbounded because: {}", why.join("; ")) };
+            let hints = if why.is_empty() {
+                String::new()
+            } else {
+                format!("\n  unbounded because: {}", why.join("; "))
+            };
             bail!(
                 "Level-3 violation in spec '{spec_name}': INDUCTIVE STEP fails — in process \
                  '{}', per-message deltas allow d({b})−d({a}) in [{}, {}], which can shrink \
                  the `{a}` vs `{b}` gap{hints}\n  fix: guard the inputs so every message \
                  changes `{b}` at least as much as `{a}`",
-                owner.name, gap.lo, gap.hi
+                owner.name,
+                gap.lo,
+                gap.hi
             );
         }
     }
@@ -655,7 +771,9 @@ pub(crate) fn eval_interval(
                 why.push(format!("state `{name}` has no hold of its own"));
                 Interval::TOP
             } else {
-                why.push(format!("`{name}` is an untracked binding (flows through transforms)"));
+                why.push(format!(
+                    "`{name}` is an untracked binding (flows through transforms)"
+                ));
                 Interval::TOP
             }
         }
@@ -677,12 +795,13 @@ pub(crate) fn eval_interval(
                     ));
                     Interval::TOP
                 } else {
-                    bounds
-                        .iter()
-                        .fold(Interval::TOP, |acc, pc| {
-                            let r = pc.pred.region();
-                            Interval { lo: acc.lo.max(r.lo), hi: acc.hi.min(r.hi) }
-                        })
+                    bounds.iter().fold(Interval::TOP, |acc, pc| {
+                        let r = pc.pred.region();
+                        Interval {
+                            lo: acc.lo.max(r.lo),
+                            hi: acc.hi.min(r.hi),
+                        }
+                    })
                 }
             } else {
                 why.push(format!(
@@ -713,13 +832,30 @@ pub(crate) fn eval_interval(
         // flooring, capping). Evaluating each branch under the NARROWED
         // condition — rather than taking a blind hull — is what makes those
         // patterns provable.
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             let (then_env, else_env) = narrow(cond, lets, owner, msg_name, holds, preconds);
             let t = eval_interval(
-                then_branch, owner, msg_name, holds, preconds, &then_env, why,
+                then_branch,
+                owner,
+                msg_name,
+                holds,
+                preconds,
+                &then_env,
+                why,
             );
             let e = eval_interval(
-                else_branch, owner, msg_name, holds, preconds, &else_env, why,
+                else_branch,
+                owner,
+                msg_name,
+                holds,
+                preconds,
+                &else_env,
+                why,
             );
             t.hull(e)
         }
@@ -764,20 +900,44 @@ pub(crate) fn narrow(
     // Regions admitted by the comparison and by its negation.
     let (t_region, e_region) = match op {
         BinOp::Gt => (
-            Interval { lo: bound, hi: f64::INFINITY },
-            Interval { lo: f64::NEG_INFINITY, hi: bound },
+            Interval {
+                lo: bound,
+                hi: f64::INFINITY,
+            },
+            Interval {
+                lo: f64::NEG_INFINITY,
+                hi: bound,
+            },
         ),
         BinOp::Ge => (
-            Interval { lo: bound, hi: f64::INFINITY },
-            Interval { lo: f64::NEG_INFINITY, hi: bound },
+            Interval {
+                lo: bound,
+                hi: f64::INFINITY,
+            },
+            Interval {
+                lo: f64::NEG_INFINITY,
+                hi: bound,
+            },
         ),
         BinOp::Lt => (
-            Interval { lo: f64::NEG_INFINITY, hi: bound },
-            Interval { lo: bound, hi: f64::INFINITY },
+            Interval {
+                lo: f64::NEG_INFINITY,
+                hi: bound,
+            },
+            Interval {
+                lo: bound,
+                hi: f64::INFINITY,
+            },
         ),
         BinOp::Le => (
-            Interval { lo: f64::NEG_INFINITY, hi: bound },
-            Interval { lo: bound, hi: f64::INFINITY },
+            Interval {
+                lo: f64::NEG_INFINITY,
+                hi: bound,
+            },
+            Interval {
+                lo: bound,
+                hi: f64::INFINITY,
+            },
         ),
         _ => return (then_env, else_env),
     };
@@ -792,7 +952,12 @@ pub(crate) fn describe_expr_pub(e: &Expr) -> String {
 
 fn describe_expr(e: &Expr) -> String {
     match e {
-        Expr::If { cond, then_branch, else_branch, .. } => format!(
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => format!(
             "if {} {{ {} }} else {{ {} }}",
             describe_expr(cond),
             describe_expr(then_branch),
@@ -927,18 +1092,27 @@ spec Rel {
         // refund guarded to exactly 0 → delta(charged) − delta(refunded) ≥ 0.
         let program = parse(RELATIONAL).expect("parse");
         let report = level3_prove(&program).expect("gap cannot shrink");
-        assert!(report.proven.iter().any(|p| p.contains("refunded <= charged")));
+        assert!(report
+            .proven
+            .iter()
+            .any(|p| p.contains("refunded <= charged")));
     }
 
     #[test]
     fn relational_hold_fails_when_gap_can_shrink() {
         // Remove the upper guard: refund can exceed charge → gap can shrink.
-        let src = RELATIONAL.replace("  require tx.refund <= 0.0
-", "");
+        let src = RELATIONAL.replace(
+            "  require tx.refund <= 0.0
+",
+            "",
+        );
         let program = parse(&src).expect("parse");
         let err = level3_prove(&program).expect_err("gap can shrink");
         let msg = format!("{err}");
-        assert!(msg.contains("INDUCTIVE STEP fails") && msg.contains("gap"), "got: {msg}");
+        assert!(
+            msg.contains("INDUCTIVE STEP fails") && msg.contains("gap"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -951,8 +1125,14 @@ spec Rel {
 
     #[test]
     fn interval_arithmetic_is_sound_on_corners() {
-        let a = Interval { lo: 0.0, hi: f64::INFINITY };
-        let b = Interval { lo: 0.0, hi: f64::INFINITY };
+        let a = Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        };
+        let b = Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        };
         let s = a.add(b);
         assert_eq!(s.lo, 0.0);
         let d = a.sub(b);

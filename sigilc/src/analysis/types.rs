@@ -111,7 +111,12 @@ fn collect_field_uses(stmt: &Stmt, uses: &mut BTreeMap<String, BTreeSet<String>>
 
 fn walk_field_uses(expr: &Expr, uses: &mut BTreeMap<String, BTreeSet<String>>) {
     match expr {
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_field_uses(cond, uses);
             walk_field_uses(then_branch, uses);
             walk_field_uses(else_branch, uses);
@@ -161,7 +166,7 @@ fn best_schema_for_fields(
             let is_pref = schema == preferred;
             let take = match &best {
                 None => true,
-                Some((b_extra, b_pref, _)) if extra < *b_extra => true,
+                Some((b_extra, _, _)) if extra < *b_extra => true,
                 Some((b_extra, b_pref, _)) if extra == *b_extra && *b_pref && !is_pref => true,
                 _ => false,
             };
@@ -170,7 +175,8 @@ fn best_schema_for_fields(
             }
         }
     }
-    best.map(|(_, _, s)| s).unwrap_or_else(|| preferred.to_string())
+    best.map(|(_, _, s)| s)
+        .unwrap_or_else(|| preferred.to_string())
 }
 
 fn infer_expr_type(
@@ -183,24 +189,35 @@ fn infer_expr_type(
 ) -> String {
     match expr {
         Expr::SchemaLit { name, .. } => name.clone(),
-        Expr::If { then_branch, else_branch, .. } => {
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
             // Both branches must agree; prefer the then-branch and fall back
             // to the else-branch when the first is uninformative.
             let t = infer_expr_type(
-                then_branch, env, msg_ty, schema_fields, binding_fields, transforms,
+                then_branch,
+                env,
+                msg_ty,
+                schema_fields,
+                binding_fields,
+                transforms,
             );
             if t == msg_ty {
                 infer_expr_type(
-                    else_branch, env, msg_ty, schema_fields, binding_fields, transforms,
+                    else_branch,
+                    env,
+                    msg_ty,
+                    schema_fields,
+                    binding_fields,
+                    transforms,
                 )
             } else {
                 t
             }
         }
-        Expr::Ident { name, .. } => env
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| msg_ty.to_string()),
+        Expr::Ident { name, .. } => env.get(name).cloned().unwrap_or_else(|| msg_ty.to_string()),
         Expr::FieldAccess { base, .. } => {
             // Field access yields a primitive-ish value; callers rarely need this for transforms.
             let _ = env.get(base);
@@ -219,7 +236,7 @@ fn infer_expr_type(
             lt
         }
         Expr::Call { name, args, .. } => {
-            if let Some((in_ty, out_ty)) = transforms.get(name) {
+            if let Some((_, out_ty)) = transforms.get(name) {
                 return out_ty.clone();
             }
             let in_ty = args
@@ -255,12 +272,14 @@ fn infer_expr_type(
                 }
                 // Recover fallbacks share the stage input type unless declared.
                 for tag in &step.tags {
-                    if let crate::frontend::ast::Tag::Recover { with, .. } = tag {
-                        if let Expr::Ident { name, .. } = with {
-                            transforms
-                                .entry(name.clone())
-                                .or_insert_with(|| (cur.clone(), cur.clone()));
-                        }
+                    if let crate::frontend::ast::Tag::Recover {
+                        with: Expr::Ident { name, .. },
+                        ..
+                    } = tag
+                    {
+                        transforms
+                            .entry(name.clone())
+                            .or_insert_with(|| (cur.clone(), cur.clone()));
                     }
                 }
                 cur = out_ty;
@@ -269,7 +288,6 @@ fn infer_expr_type(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -280,16 +298,24 @@ mod tests {
     fn pipeline_propagates_order_and_receipt() {
         let src = include_str!("../../../examples/pipeline/pipeline.sigil");
         let prog = parse(src).expect("parse");
-        assert_eq!(prog.transforms.len(), 7, "expected explicit transform decls");
+        assert_eq!(
+            prog.transforms.len(),
+            7,
+            "expected explicit transform decls"
+        );
         let (env, transforms) = infer_program(&prog);
         assert_eq!(env.get("order").map(String::as_str), Some("Order"));
         assert_eq!(
-            transforms.get("confirm").map(|(i, o)| (i.as_str(), o.as_str())),
+            transforms
+                .get("confirm")
+                .map(|(i, o)| (i.as_str(), o.as_str())),
             Some(("Order", "Receipt")),
             "declared confirm: Order -> Receipt; got {transforms:?}"
         );
         assert_eq!(
-            transforms.get("authorize").map(|(i, o)| (i.as_str(), o.as_str())),
+            transforms
+                .get("authorize")
+                .map(|(i, o)| (i.as_str(), o.as_str())),
             Some(("Order", "Order")),
         );
         assert_eq!(env.get("receipt").map(String::as_str), Some("Receipt"));

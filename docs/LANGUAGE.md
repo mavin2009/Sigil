@@ -169,8 +169,9 @@ process Ledger {
 
 State is **process-local, always**. A write to a slot the process does not
 declare is a Level-1 error. Each process compiles to a shared-nothing actor:
-`spawn(self, capacity)` moves the state into an isolated task, and the only
-way in afterwards is a message.
+`spawn(self, capacity)` validates the capacity, moves the state into an
+isolated task, and returns a `Result`; the only way in afterwards is a
+message.
 
 A process may declare **several handlers** for different message types:
 
@@ -348,9 +349,11 @@ All three preserve downstream-counting invariants, because shedding only
 *decreases* the downstream count. Only the bounded policies can back an
 end-to-end latency claim — see [`require path_latency`](#specs).
 
-Blocking sends cannot deadlock: the process graph is proven acyclic, and
-handlers terminate (bounded retries over bounded timeouts), so every sink
-always drains and back-pressure propagates cleanly upstream.
+An acyclic process graph rules out **cycles of generated channel waits**.
+That is narrower than global deadlock freedom or liveness: an untimed
+external transform can still hang, a blocking foreign call can still wedge
+its own library, and an `@block` sender can then wait indefinitely behind
+it. These are reported as residual operational risks.
 
 Shed counts appear per actor in `ActorStats.shed` and in the run report.
 
@@ -362,9 +365,9 @@ hardest to anticipate:
 | Protection | Why |
 | ---------- | --- |
 | `#![forbid(unsafe_code)]` | not merely unused — unrepresentable |
-| `overflow-checks = true` in **all** profiles | silent wrapping past `i64::MAX` would break a proven invariant; overflow aborts the message instead, counted as a drop |
-| finiteness guards on every `Float` field | `+inf` satisfies `>= 0.0` and poisons accumulators; `NaN` fails every comparison. Both are outside the interval model the proofs are stated over, so both are refused at handler entry |
-| no `Mutex`, `Arc`, or atomics | asserted by test, so data races are unrepresentable rather than merely avoided |
+| `overflow-checks = true` in **all** profiles | silent wrapping past `i64::MAX` would break a proven invariant; overflow is fail-stop and is surfaced as `ActorPanicked` when the task is joined. It is **not** counted as an ordinary dropped message |
+| finiteness guards on every input `Float` field | rejects `NaN` and infinities at handler entry. Arithmetic on finite values can still overflow to infinity; closing that numeric-model gap is a pre-production checklist item |
+| no `Mutex`, `RwLock`, `Arc`, or atomics in Sigil-emitted code | asserted by test; this is a shared-nothing source guarantee, not a lock-freedom claim about Tokio or the platform |
 
 Values are **moved on their last use** and cloned only when genuinely needed
 again — a last-use analysis over each handler. Getting that wrong cannot
@@ -416,7 +419,10 @@ reported; it does not itself discharge an obligation.
 ## Reserved names
 
 `path_timeout_sum` and `path_latency` are compiler-provided quantities in
-`require` clauses. Everything else is user-defined.
+`require` clauses. Rust keywords, built-in/generated type names, duplicate
+declarations, case-colliding process names, ambiguous compilation-unit state
+names, and actor-bookkeeping field names are rejected at Level 1 rather than
+being emitted as invalid or ambiguous Rust.
 
 ---
 

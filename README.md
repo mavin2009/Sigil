@@ -1,8 +1,9 @@
 # Sigil
 
 **A small language for high-assurance concurrent components.** You write the
-pipeline; the compiler proves the properties, generates lock-free Rust, and
-tells you exactly what it could not prove.
+pipeline; the compiler proves the properties, generates shared-nothing Rust
+with no locks in Sigil-emitted code, and tells you exactly what it could not
+prove.
 
 ```
 process Audit {
@@ -69,8 +70,8 @@ Building the two flagship examples found five real bugs *in the compiler
 itself* — the kind that only surface when you write real programs against it.
 Every one now has a test. And the claim is more specific than "safer": under
 20% fault injection, with 1,757 injected faults, the security pipeline held
-`served ≤ recorded ≤ granted ≤ verified` exactly — zero messages lost, no
-locks anywhere in the generated code.
+`served ≤ recorded ≤ granted ≤ verified` exactly — zero messages lost, and
+no `Mutex`, `RwLock`, `Arc`, or atomics emitted by Sigil.
 
 **"This will just make everything slower and more annoying."** Sometimes yes,
 and it should. The first draft of the clearing example declared a 400 ms SLO
@@ -114,9 +115,10 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 | --- | ------------ |
 | **[Why Sigil](docs/WHY_SIGIL.md)** | one component walked from 51 lines of Sigil to 479 lines of generated Rust, and the seven decisions per handler the compiler checks so a reviewer doesn't have to |
 | **[Language Reference](docs/LANGUAGE.md)** | complete surface syntax and semantics |
-| **[Assurance Levels](docs/ASSURANCE.md)** | what each level proves, the proof obligations, and all 25 must-fail programs |
+| **[Assurance Levels](docs/ASSURANCE.md)** | what each level proves, the proof obligations, and all 27 must-fail programs |
 | **[Runtime & Generated Code](docs/RUNTIME.md)** | the actor model, topology wiring, `sigil_rt`, fault injection, tuning |
 | **[Production](docs/PRODUCTION.md)** | wiring external transforms, capacity tuning, shutdown, observability, measured performance, CI |
+| **[Production-Readiness Gate](docs/PRODUCTION_READINESS.md)** | prioritized blockers, acceptance criteria, and the release gate |
 | **[Residual Risk Process](docs/RESIDUAL_RISK_PROCESS.md)** | turning `RESIDUAL_RISK.md` into a review gate, with control mappings and a PR template |
 | **[Versioning & Proof Stability](docs/VERSIONING.md)** | what a proof is allowed to stop meaning, and the supply-chain story |
 
@@ -131,7 +133,7 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 | [`examples/trading/`](examples/trading/) | **exchange order gateway** — multi-handler; cancels are risk-checked, provably |
 | [`examples/level4/`](examples/level4/) | system conservation across a topology |
 | [`examples/level3/`](examples/level3/) | inductive invariants with runtime-guarded assumptions |
-| [`examples/concurrent/`](examples/concurrent/) | lock-free actor fleets, routing policies, chaos runs |
+| [`examples/concurrent/`](examples/concurrent/) | shared-nothing actor fleets, routing policies, chaos runs |
 | [`examples/proofs/`](examples/proofs/) | 27 programs that **must fail to compile** |
 
 ## What it rules out
@@ -162,7 +164,7 @@ sigilc/src/
   backend/        Rust codegen
   diagnostics.rs  byte spans → line:col with caret snippets
 sigil_rt/         runtime: errors, actor stats, router, back-pressure, chaos
-examples/         runnable programs, including 25 negative proofs
+examples/         runnable programs, including 27 negative proofs
 docs/             language reference, assurance levels, runtime, rationale
 ```
 
@@ -172,9 +174,10 @@ docs/             language reference, assurance levels, runtime, rationale
 cargo test
 ```
 
-87 tests: parser, per-level checks, both provers, topology and routing,
-codegen shape, and end-to-end compilation of every example. Every rule has a
-program in `examples/proofs/` asserted to fail *for the right reason*.
+103 tests: runtime, CLI, parser, per-level checks, both provers, topology and
+routing, codegen shape, end-to-end generated crates, and default-on chaos
+regressions. Every rule has a program in `examples/proofs/` asserted to fail
+*for the right reason*.
 
 ## Production readiness
 
@@ -182,7 +185,7 @@ Honest status, because this is the question that matters:
 
 | Area | State |
 | ---- | ----- |
-| Compiler correctness | 83 unit tests, 27 must-fail programs, 3 end-to-end chaos regressions, a fuzzer, and a harness where generated demos assert their own proofs. Four real defects found and fixed this way — including one unsound proof. |
+| Compiler correctness | 95 compiler tests, 5 runtime tests, 3 default-on end-to-end chaos regressions, 27 must-fail programs, fuzz/property scripts, and generated demos that assert their own proofs. Multiple real defects were found this way, including a proof unsoundness. |
 | Residual risk process | Documented with a review gate, control mappings and a PR template |
 | Integration | Documented; generated crates are ordinary Rust with no build script |
 | Observability | Optional `tracing` spans, `ActorStats`, `--emit-graph` topology export |
@@ -195,8 +198,8 @@ testing; that row is the evidence that does not yet exist.
 
 ## Status
 
-**v0.7** — Five assurance levels; shared-nothing actor codegen (lock-free by
-construction, enforced by test); compiler-wired multi-process topologies with
+**v0.7** — Five assurance levels; shared-nothing actor codegen (no explicit
+locks or shared state emitted, enforced by test); compiler-wired multi-process topologies with
 hash / round-robin / broadcast routing; multi-handler processes with
 type-directed dispatch; total failure-path coverage via
 `@retry`/`@recover`/`@error`; declared back-pressure with provable

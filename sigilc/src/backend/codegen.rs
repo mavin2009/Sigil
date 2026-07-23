@@ -17,8 +17,8 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     out.push_str("//   #![forbid(unsafe_code)]  — no escape hatch exists here\n");
     out.push_str("//   overflow-checks = true   — in EVERY profile (see Cargo.toml).\n");
     out.push_str("//     Silent wrapping would let an attacker roll a counter past\n");
-    out.push_str("//     i64::MAX and break a proven invariant; overflow aborts the\n");
-    out.push_str("//     message instead, which the actor counts as a drop.\n");
+    out.push_str("//     i64::MAX and silently break a proven invariant. An overflow is\n");
+    out.push_str("//     fail-stop: Tokio reports the task panic through its JoinHandle.\n");
     out.push_str("#![forbid(unsafe_code)]\n");
     out.push_str("#![deny(clippy::mem_forget)]\n\n");
     out.push_str("//\n");
@@ -157,7 +157,10 @@ fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
         let chaos = if matches!(b.kind, BindKind::Infallible) {
             String::new()
         } else {
-            format!("    sigil_rt::chaos::external_stage(\"{}\").await?;\n", t.name)
+            format!(
+                "    sigil_rt::chaos::external_stage(\"{}\").await?;\n",
+                t.name
+            )
         };
         return format!(
             "// bound to `{path}` ({})\nasync fn {}(input: {in_ty}) -> Result<{out_ty}> {{\n{chaos}{body}\n}}\n",
@@ -234,7 +237,6 @@ fn emit_schema(schema: &Schema) -> String {
     s
 }
 
-
 /// Processes this process sends to, in declaration order (deduped).
 fn process_send_targets(process: &Process) -> Vec<String> {
     let mut targets: Vec<String> = Vec::new();
@@ -272,7 +274,9 @@ fn build_input_guards(
     // the numeric model the proofs assume is the model the code executes.
     for process in &program.processes {
         for handler in &process.handlers {
-            let Type::Named(schema_name) = &handler.msg_ty else { continue };
+            let Type::Named(schema_name) = &handler.msg_ty else {
+                continue;
+            };
             let Some(schema) = program.schemas.iter().find(|sc| sc.name == *schema_name) else {
                 continue;
             };
@@ -373,7 +377,7 @@ fn emit_process(
     s.push_str("        }\n    }\n\n");
     for t in &targets {
         s.push_str(&format!(
-            "    pub fn connect_{}(&mut self, shards: Vec<{t}Handle>) {{\n        self.{}_out = Some(sigil_rt::Router::new(shards));\n    }}\n\n",
+            "    pub fn connect_{}(&mut self, shards: Vec<{t}Handle>) -> Result<()> {{\n        self.{}_out = Some(sigil_rt::Router::new(shards)?);\n        Ok(())\n    }}\n\n",
             t.to_lowercase(),
             t.to_lowercase()
         ));
@@ -391,7 +395,6 @@ fn emit_process(
     s
 }
 
-
 /// Emit shared-nothing actor machinery for a process.
 ///
 /// `__shed_of` is emitted per process so the spawn loop can report shed
@@ -403,6 +406,7 @@ fn emit_process(
 ///     no reference to it can exist anywhere else in the program.
 ///   - The only way in is a message via a Clone-able `Handle` (an mpsc Sender).
 ///   - The only way out is `join()` after the channel closes.
+///
 /// There is no `Arc`, no `Mutex`, and no way to observe state concurrently.
 fn emit_actor(process: &Process) -> String {
     if process.handlers.is_empty() {
@@ -420,7 +424,12 @@ fn emit_actor(process: &Process) -> String {
     };
     let drop_outboxes: String = process_send_targets(process)
         .iter()
-        .map(|t| format!("            self.{}_out = None; // release downstream channel\n", t.to_lowercase()))
+        .map(|t| {
+            format!(
+                "            self.{}_out = None; // release downstream channel\n",
+                t.to_lowercase()
+            )
+        })
         .collect();
     if process.handlers.len() == 1 {
         let h = &process.handlers[0];
@@ -442,14 +451,15 @@ fn emit_actor(process: &Process) -> String {
              \x20       self.tx\n\
              \x20           .send(msg)\n\
              \x20           .await\n\
-             \x20           .map_err(|_| sigil_rt::SigilError::Transform(\"actor stopped\".into()))\n\
+             \x20           .map_err(|_| sigil_rt::SigilError::ActorStopped)\n\
              \x20   }}\n\
              }}\n\n\
              impl {p} {{\n\
              \x20   /// Move this process's state into an isolated task.\n\
              \x20   /// After `spawn`, the state is unreachable except via messages;\n\
              \x20   /// it is returned intact when the last Handle is dropped.\n\
-             \x20   pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>) {{\n\
+             \x20   pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)> {{\n\
+             \x20       sigil_rt::validate_channel_capacity(capacity)?;\n\
              \x20       let (tx, mut rx) = tokio::sync::mpsc::channel::<{msg_ty}>(capacity);\n\
              \x20       let join = tokio::spawn(async move {{\n\
              \x20           let mut stats = sigil_rt::ActorStats::default();\n\
@@ -463,7 +473,7 @@ fn emit_actor(process: &Process) -> String {
              \x20           stats.shed = {shed_expr};\n\
              \x20           (self, stats)\n\
              \x20       }});\n\
-             \x20       ({p}Handle {{ tx }}, join)\n\
+             \x20       Ok(({p}Handle {{ tx }}, join))\n\
              \x20   }}\n\
              }}\n"
         ));
@@ -487,7 +497,7 @@ fn emit_actor(process: &Process) -> String {
     ));
     for h in &process.handlers {
         s.push_str(&format!(
-            "    pub async fn send_{}(&self, msg: {}) -> Result<()> {{\n        self.tx.send({enum_name}::{}(msg)).await.map_err(|_| sigil_rt::SigilError::Transform(\"actor stopped\".into()))\n    }}\n",
+            "    pub async fn send_{}(&self, msg: {}) -> Result<()> {{\n        self.tx.send({enum_name}::{}(msg)).await.map_err(|_| sigil_rt::SigilError::ActorStopped)\n    }}\n",
             h.msg_name,
             rust_type(&h.msg_ty),
             variant_name(&h.msg_name)
@@ -496,7 +506,7 @@ fn emit_actor(process: &Process) -> String {
     s.push_str("}\n\n");
 
     s.push_str(&format!(
-        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> ({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>) {{\n        let (tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let join = tokio::spawn(async move {{\n            let mut stats = sigil_rt::ActorStats::default();\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
+        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)> {{\n        sigil_rt::validate_channel_capacity(capacity)?;\n        let (tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let join = tokio::spawn(async move {{\n            let mut stats = sigil_rt::ActorStats::default();\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
     ));
     for h in &process.handlers {
         s.push_str(&format!(
@@ -506,7 +516,7 @@ fn emit_actor(process: &Process) -> String {
         ));
     }
     s.push_str(&format!(
-        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n{drop_outboxes}            stats.shed = {shed_expr};\n            (self, stats)\n        }});\n        ({p}Handle {{ tx }}, join)\n    }}\n}}\n"
+        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n{drop_outboxes}            stats.shed = {shed_expr};\n            (self, stats)\n        }});\n        Ok(({p}Handle {{ tx }}, join))\n    }}\n}}\n"
     ));
     s
 }
@@ -552,7 +562,14 @@ fn emit_handler(
     }
 
     for stmt in &handler.body {
-        s.push_str(&emit_stmt(stmt, "        ", states, &handler.msg_name, routes, moves));
+        s.push_str(&emit_stmt(
+            stmt,
+            "        ",
+            states,
+            &handler.msg_name,
+            routes,
+            moves,
+        ));
     }
 
     s.push_str("        Ok(())\n");
@@ -614,7 +631,12 @@ fn count_reads(e: &Expr, out: &mut std::collections::BTreeMap<String, usize>) {
             count_reads(lhs, out);
             count_reads(rhs, out);
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             count_reads(cond, out);
             count_reads(then_branch, out);
             count_reads(else_branch, out);
@@ -714,7 +736,9 @@ fn build_send_routes(program: &Program) -> SendRoutes {
     for process in &program.processes {
         for handler in &process.handlers {
             for stmt in &handler.body {
-                let Stmt::Send { target, span, .. } = stmt else { continue };
+                let Stmt::Send { target, span, .. } = stmt else {
+                    continue;
+                };
                 let Some(dest) = program.processes.iter().find(|p| p.name == *target) else {
                     continue;
                 };
@@ -756,14 +780,15 @@ fn resolve_send_handler(
     stmt: &Stmt,
     dest: &Process,
 ) -> Option<String> {
-    let Stmt::Send { expr, .. } = stmt else { return None };
+    let Stmt::Send { expr, .. } = stmt else {
+        return None;
+    };
     let sigs: std::collections::BTreeMap<&str, String> = program
         .transforms
         .iter()
         .map(|t| (t.name.as_str(), type_name_of(&t.return_ty)))
         .collect();
-    let mut env: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     env.insert(handler.msg_name.clone(), type_name_of(&handler.msg_ty));
     for st in &handler.body {
         if let Stmt::Let { name, expr, .. } = st {
@@ -827,12 +852,16 @@ fn emit_stmt(
             }
         }
         Stmt::Assign { name, expr, .. } => {
-            format!(
-                "{indent}self.{name} = {};\n",
-                emit_expr(expr, states, msg)
-            )
+            format!("{indent}self.{name} = {};\n", emit_expr(expr, states, msg))
         }
-        Stmt::Send { target, expr, route, backpressure, guard, span } => {
+        Stmt::Send {
+            target,
+            expr,
+            route,
+            backpressure,
+            guard,
+            span,
+        } => {
             let target_lc = target.to_lowercase();
             // Fan-out sends the SAME binding to several targets. Clone only
             // when the value is still needed afterwards; the last reader moves.
@@ -955,11 +984,9 @@ fn emit_stmt(
 
 fn is_timed_pipeline(expr: &Expr) -> bool {
     match expr {
-        Expr::Pipeline { steps, .. } => steps.iter().any(|s| {
-            s.tags
-                .iter()
-                .any(|t| matches!(t, Tag::Timeout { .. }))
-        }),
+        Expr::Pipeline { steps, .. } => steps
+            .iter()
+            .any(|s| s.tags.iter().any(|t| matches!(t, Tag::Timeout { .. }))),
         _ => false,
     }
 }
@@ -1008,7 +1035,12 @@ fn emit_expr(expr: &Expr, states: &[String], msg: &str) -> String {
                 emit_expr(rhs, states, msg)
             )
         }
-        Expr::If { cond, then_branch, else_branch, .. } => format!(
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => format!(
             "if {} {{ {} }} else {{ {} }}",
             emit_expr(cond, states, msg),
             emit_expr(then_branch, states, msg),
@@ -1028,9 +1060,7 @@ fn emit_expr(expr: &Expr, states: &[String], msg: &str) -> String {
 
 fn emit_expr_multiline(expr: &Expr, states: &[String], msg: &str, indent: &str) -> String {
     match expr {
-        Expr::Pipeline { base, steps, .. } => {
-            emit_pipeline(base, steps, states, msg, true, indent)
-        }
+        Expr::Pipeline { base, steps, .. } => emit_pipeline(base, steps, states, msg, true, indent),
         other => emit_expr(other, states, msg),
     }
 }
@@ -1058,13 +1088,14 @@ fn emit_pipeline(
         };
 
         let timeout_ms = step.tags.iter().find_map(|t| match t {
-            Tag::Timeout { expr, .. } => match expr {
-                Expr::Literal {
-                    value: Literal::DurationMs(ms),
-                    ..
-                } => Some(*ms),
-                _ => None,
-            },
+            Tag::Timeout {
+                expr:
+                    Expr::Literal {
+                        value: Literal::DurationMs(ms),
+                        ..
+                    },
+                ..
+            } => Some(*ms),
             _ => None,
         });
         let recover = step.tags.iter().find_map(|t| match t {
@@ -1080,9 +1111,14 @@ fn emit_pipeline(
             .tags
             .iter()
             .find_map(|t| match t {
-                Tag::Retry { expr: Expr::Literal { value: Literal::Int(n), .. }, .. } => {
-                    Some((*n).max(0) as u64)
-                }
+                Tag::Retry {
+                    expr:
+                        Expr::Literal {
+                            value: Literal::Int(n),
+                            ..
+                        },
+                    ..
+                } => Some((*n).max(0) as u64),
                 _ => None,
             })
             .unwrap_or(0);
@@ -1210,8 +1246,7 @@ fn emit_external_stub(name: &str, in_ty: &str, out_ty: &str) -> String {
 fn collect_externals(program: &Program) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     for process in &program.processes {
-        let mut locals: BTreeSet<String> =
-            process.states.iter().map(|s| s.name.clone()).collect();
+        let mut locals: BTreeSet<String> = process.states.iter().map(|s| s.name.clone()).collect();
         for handler in &process.handlers {
             locals.insert(handler.msg_name.clone());
             for stmt in &handler.body {
@@ -1234,7 +1269,12 @@ fn collect_externals(program: &Program) -> BTreeSet<String> {
 
 fn walk_externals(expr: &Expr, set: &mut BTreeSet<String>) {
     match expr {
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_externals(cond, set);
             walk_externals(then_branch, set);
             walk_externals(else_branch, set);
@@ -1260,10 +1300,12 @@ fn walk_externals(expr: &Expr, set: &mut BTreeSet<String>) {
                     other => walk_externals(other, set),
                 }
                 for tag in &step.tags {
-                    if let Tag::Recover { with, .. } = tag {
-                        if let Expr::Ident { name, .. } = with {
-                            set.insert(name.clone());
-                        }
+                    if let Tag::Recover {
+                        with: Expr::Ident { name, .. },
+                        ..
+                    } = tag
+                    {
+                        set.insert(name.clone());
                     }
                 }
             }
@@ -1302,7 +1344,6 @@ fn emit_smoke_test(program: &Program) -> String {
     s
 }
 
-
 /// Field synthesis for a demo message: Int=1, Float=1.0, Bool=true, String
 /// gets a unique id. Keeps aggregates checkable by construction.
 fn demo_field_init(program: &Program, msg_ty: &Type, var: &str, indent: &str) -> String {
@@ -1312,12 +1353,21 @@ fn demo_field_init(program: &Program, msg_ty: &Type, var: &str, indent: &str) ->
         if let Some(schema) = program.schemas.iter().find(|sc| sc.name == *name) {
             for (fname, fty) in &schema.fields {
                 match fty {
-                    Type::Int => { let _ = writeln!(out, "{indent}{var}.{fname} = 1;"); }
-                    Type::Float => { let _ = writeln!(out, "{indent}{var}.{fname} = 1.0;"); }
-                    Type::String => {
-                        let _ = writeln!(out, "{indent}{var}.{fname} = format!(\"m-{{prod}}-{{i}}\");");
+                    Type::Int => {
+                        let _ = writeln!(out, "{indent}{var}.{fname} = 1;");
                     }
-                    Type::Bool => { let _ = writeln!(out, "{indent}{var}.{fname} = true;"); }
+                    Type::Float => {
+                        let _ = writeln!(out, "{indent}{var}.{fname} = 1.0;");
+                    }
+                    Type::String => {
+                        let _ = writeln!(
+                            out,
+                            "{indent}{var}.{fname} = format!(\"m-{{prod}}-{{i}}\");"
+                        );
+                    }
+                    Type::Bool => {
+                        let _ = writeln!(out, "{indent}{var}.{fname} = true;");
+                    }
                     _ => {}
                 }
             }
@@ -1367,8 +1417,12 @@ fn collect_hold_checks(program: &Program) -> HoldChecks {
 
     for spec in &program.specs {
         for item in &spec.items {
-            let SpecItem::Hold { expr, .. } = item else { continue };
-            let Expr::Binary { op, lhs, rhs, .. } = expr else { continue };
+            let SpecItem::Hold { expr, .. } = item else {
+                continue;
+            };
+            let Expr::Binary { op, lhs, rhs, .. } = expr else {
+                continue;
+            };
             let Some(cmp) = cmp_str(op) else { continue };
             match (lhs.as_ref(), rhs.as_ref()) {
                 // hold <state> <cmp> <literal>
@@ -1379,21 +1433,31 @@ fn collect_hold_checks(program: &Program) -> HoldChecks {
                         _ => continue,
                     };
                     if let Some(owner) = owner_of(name) {
-                        hc.scalar.push((owner, name.clone(), cmp.to_string(), bound));
+                        hc.scalar
+                            .push((owner, name.clone(), cmp.to_string(), bound));
                     }
                 }
                 // hold <state> <cmp> <state>   (same process)
                 (Expr::Ident { name: a, .. }, Expr::Ident { name: b, .. }) => {
                     if let (Some(oa), Some(ob)) = (owner_of(a), owner_of(b)) {
                         if oa == ob {
-                            hc.relational.push((oa, a.clone(), cmp.to_string(), b.clone()));
+                            hc.relational
+                                .push((oa, a.clone(), cmp.to_string(), b.clone()));
                         }
                     }
                 }
                 // hold P.x <cmp> Q.y
                 (
-                    Expr::FieldAccess { base: lb, field: lf, .. },
-                    Expr::FieldAccess { base: rb, field: rf, .. },
+                    Expr::FieldAccess {
+                        base: lb,
+                        field: lf,
+                        ..
+                    },
+                    Expr::FieldAccess {
+                        base: rb,
+                        field: rf,
+                        ..
+                    },
                 ) if is_proc(lb) && is_proc(rb) => {
                     hc.system.push((
                         lb.clone(),
@@ -1427,7 +1491,6 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         .find(|p| p.name == entry_name)
         .expect("entry process exists");
     let entry_handler = entry.handlers.first().expect("entry handler");
-    let msg_ty = rust_type(&entry_handler.msg_ty);
 
     // Message field synthesis (same policy as the fleet demo).
     let mut field_init = String::new();
@@ -1435,10 +1498,21 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         if let Some(schema) = program.schemas.iter().find(|sc| sc.name == *name) {
             for (fname, fty) in &schema.fields {
                 match fty {
-                    Type::Int => { let _ = writeln!(field_init, "                msg.{fname} = 1;"); }
-                    Type::Float => { let _ = writeln!(field_init, "                msg.{fname} = 1.0;"); }
-                    Type::String => { let _ = writeln!(field_init, "                msg.{fname} = format!(\"m-{{prod}}-{{i}}\");"); }
-                    Type::Bool => { let _ = writeln!(field_init, "                msg.{fname} = true;"); }
+                    Type::Int => {
+                        let _ = writeln!(field_init, "                msg.{fname} = 1;");
+                    }
+                    Type::Float => {
+                        let _ = writeln!(field_init, "                msg.{fname} = 1.0;");
+                    }
+                    Type::String => {
+                        let _ = writeln!(
+                            field_init,
+                            "                msg.{fname} = format!(\"m-{{prod}}-{{i}}\");"
+                        );
+                    }
+                    Type::Bool => {
+                        let _ = writeln!(field_init, "                msg.{fname} = true;");
+                    }
                     _ => {}
                 }
             }
@@ -1453,45 +1527,61 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         .join(", ");
 
     let mut out = String::new();
-    let _ = write!(out, "// AUTO-GENERATED by sigilc — multi-stage topology demo\n");
+    let _ = writeln!(
+        out,
+        "// AUTO-GENERATED by sigilc — multi-stage topology demo"
+    );
     let _ = write!(out, "//\n// Topology: {edge_list}\n");
-    let _ = write!(out, "// Each stage is a fleet of shared-nothing actors; the compiler wired the\n");
-    let _ = write!(out, "// outboxes, verified message types along every edge, proved the graph\n");
-    let _ = write!(out, "// acyclic, and staged the shutdown so no message is ever lost in a closed\n// channel. No locks anywhere.\n\n");
+    let _ = writeln!(
+        out,
+        "// Each stage is a fleet of shared-nothing actors; the compiler wired the"
+    );
+    let _ = writeln!(
+        out,
+        "// outboxes, verified message types along every edge, proved the graph"
+    );
+    let _ = write!(out, "// acyclic, and staged the shutdown so no message is ever lost in a closed\n// channel. Sigil emits no explicit locks or shared mutable state.\n\n");
     out.push_str("use sigil_gen::*;\nuse std::time::Instant;\n\n");
-    out.push_str("#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() {\n");
+    out.push_str(
+        "#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() -> sigil_rt::Result<()> {\n",
+    );
     out.push_str("    fn env_usize(key: &str, default: usize) -> usize {\n        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)\n    }\n");
     out.push_str("    let shards: usize = env_usize(\"SIGIL_DEMO_SHARDS\", 8);\n");
     out.push_str("    let producers: usize = env_usize(\"SIGIL_DEMO_PRODUCERS\", 64);\n");
     out.push_str("    let msgs_per_producer: usize = env_usize(\"SIGIL_DEMO_MSGS\", 250);\n");
     out.push_str("    let capacity: usize = env_usize(\"SIGIL_DEMO_CAPACITY\", 1024);\n");
-    out.push_str("    let total = producers * msgs_per_producer;\n\n");
+    out.push_str(
+        "    if shards == 0 {\n        return Err(sigil_rt::SigilError::Configuration(\"SIGIL_DEMO_SHARDS must be at least 1\".into()));\n    }\n",
+    );
+    out.push_str(
+        "    let total = producers.checked_mul(msgs_per_producer).ok_or_else(|| sigil_rt::SigilError::Configuration(\"demo message count overflows usize\".into()))?;\n\n",
+    );
 
     // Spawn sinks first so upstream stages can be wired to live handles.
     for pname in topo.order.iter().rev() {
         let lc = pname.to_lowercase();
-        let _ = write!(out, "    // stage: {pname}\n");
-        let _ = write!(out, "    let mut {lc}_handles = Vec::new();\n    let mut {lc}_joins = Vec::new();\n");
-        let _ = write!(out, "    for _i in 0..shards {{\n");
+        let _ = writeln!(out, "    // stage: {pname}");
+        let _ = write!(
+            out,
+            "    let mut {lc}_handles = Vec::new();\n    let mut {lc}_joins = Vec::new();\n"
+        );
+        let _ = writeln!(out, "    for _i in 0..shards {{");
         let targets = topo.targets_of(pname);
         if targets.is_empty() {
-            let _ = write!(out, "        let inst = {pname}::new();\n");
+            let _ = writeln!(out, "        let inst = {pname}::new();");
         } else {
-            let _ = write!(out, "        let mut inst = {pname}::new();\n");
+            let _ = writeln!(out, "        let mut inst = {pname}::new();");
             for e in &targets {
                 let tlc = e.to.to_lowercase();
-                let _ = write!(
-                    out,
-                    "        inst.connect_{tlc}({tlc}_handles.clone());\n"
-                );
+                let _ = writeln!(out, "        inst.connect_{tlc}({tlc}_handles.clone())?;");
             }
         }
-        let _ = write!(out, "        let (h, j) = inst.spawn(capacity);\n        {lc}_handles.push(h);\n        {lc}_joins.push(j);\n    }}\n\n");
+        let _ = write!(out, "        let (h, j) = inst.spawn(capacity)?;\n        {lc}_handles.push(h);\n        {lc}_joins.push(j);\n    }}\n\n");
     }
 
     let entry_lc = entry_name.to_lowercase();
-    let _ = write!(out, "    let t0 = Instant::now();\n");
-    let _ = write!(out, "    let mut producer_tasks = Vec::new();\n");
+    let _ = writeln!(out, "    let t0 = Instant::now();");
+    let _ = writeln!(out, "    let mut producer_tasks = Vec::new();");
     let multi_entry = entry.handlers.len() > 1;
     // Producers cycle through EVERY handler of the entry process, so a
     // multi-handler entry is genuinely exercised (and the totals stay exact).
@@ -1506,7 +1596,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         };
         let _ = write!(
             feed_arms,
-            "                    {k} => {{\n                        let mut msg = {ty}::default();\n{init}                        if hs[shard].{method}(msg).await.is_err() {{ break; }}\n                    }}\n"
+            "                    {k} => {{\n                        let mut msg = {ty}::default();\n{init}                        hs[shard].{method}(msg).await?;\n                    }}\n"
         );
     }
     let n_handlers = entry.handlers.len();
@@ -1519,17 +1609,18 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         \x20               let shard = (prod + i) % hs.len();\n\
         \x20               match (prod + i) % {n_handlers} {{\n\
 {feed_arms}\
-        \x20                   _ => unreachable!(),\n\
+        \x20                   _ => return Err(sigil_rt::SigilError::Configuration(\"invalid generated handler dispatch\".into())),\n\
         \x20               }}\n\
         \x20           }}\n\
+        \x20           Ok::<(), sigil_rt::SigilError>(())\n\
         \x20       }}));\n\
         \x20   }}\n\
         \x20   for t in producer_tasks {{\n\
-        \x20       let _ = t.await;\n\
+        \x20       sigil_rt::join_task(t).await??;\n\
         \x20   }}\n\n"
     );
 
-    let _ = write!(out, "    println!(\"=== topology demo: {edge_list} ===\");\n");
+    let _ = writeln!(out, "    println!(\"=== topology demo: {edge_list} ===\");");
     out.push_str("    println!(\"{} shards/stage, {} producers, {} messages, {} worker threads\", shards, producers, total, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));\n");
 
     // Shut down and report stage by stage in topological order.
@@ -1544,16 +1635,24 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         for st in &process.states {
             match st.ty {
                 Type::Int => {
-                    let _ = write!(agg_decl, "    let mut {lc}_agg_{}: i64 = 0;\n", st.name);
-                    let _ = write!(agg_add, "        {lc}_agg_{} += st.{};\n", st.name, st.name);
-                    let _ = write!(agg_print, "    println!(\"[{pname}] aggregate {} = {{}}\", {lc}_agg_{});\n", st.name, st.name);
+                    let _ = writeln!(agg_decl, "    let mut {lc}_agg_{}: i64 = 0;", st.name);
+                    let _ = writeln!(agg_add, "        {lc}_agg_{} += st.{};", st.name, st.name);
+                    let _ = writeln!(
+                        agg_print,
+                        "    println!(\"[{pname}] aggregate {} = {{}}\", {lc}_agg_{});",
+                        st.name, st.name
+                    );
                     let _ = write!(shard_fmt, " {}={{}}", st.name);
                     let _ = write!(shard_args, ", st.{}", st.name);
                 }
                 Type::Float => {
-                    let _ = write!(agg_decl, "    let mut {lc}_agg_{}: f64 = 0.0;\n", st.name);
-                    let _ = write!(agg_add, "        {lc}_agg_{} += st.{};\n", st.name, st.name);
-                    let _ = write!(agg_print, "    println!(\"[{pname}] aggregate {} = {{:.1}}\", {lc}_agg_{});\n", st.name, st.name);
+                    let _ = writeln!(agg_decl, "    let mut {lc}_agg_{}: f64 = 0.0;", st.name);
+                    let _ = writeln!(agg_add, "        {lc}_agg_{} += st.{};", st.name, st.name);
+                    let _ = writeln!(
+                        agg_print,
+                        "    println!(\"[{pname}] aggregate {} = {{:.1}}\", {lc}_agg_{});",
+                        st.name, st.name
+                    );
                     let _ = write!(shard_fmt, " {}={{:.1}}", st.name);
                     let _ = write!(shard_args, ", st.{}", st.name);
                 }
@@ -1566,49 +1665,62 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
             if proc_name != pname {
                 continue;
             }
-            let _ = write!(
+            let _ = writeln!(
                 shard_asserts,
-                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {pname}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});\n"
+                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {pname}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});"
             );
         }
         for (proc_name, a, cmp, b) in &checks.relational {
             if proc_name != pname {
                 continue;
             }
-            let _ = write!(
+            let _ = writeln!(
                 shard_asserts,
-                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {pname}.{a} {cmp} {pname}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});\n"
+                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {pname}.{a} {cmp} {pname}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});"
             );
         }
 
         let _ = write!(out, "\n    // ---- stage shutdown: {pname} ----\n");
-        let _ = write!(out, "    drop({lc}_handles);\n");
+        let _ = writeln!(out, "    drop({lc}_handles);");
         let _ = write!(out, "{agg_decl}");
         let _ = write!(out, "    let mut {lc}_handled: u64 = 0;\n    let mut {lc}_dropped: u64 = 0;\n    let mut {lc}_shed: u64 = 0;\n");
-        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = j.await.expect(\"actor task panicked\");\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}{shard_asserts}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n        {lc}_shed += stats.shed;\n    }}\n");
+        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = sigil_rt::join_actor(j).await?;\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}{shard_asserts}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n        {lc}_shed += stats.shed;\n    }}\n");
         let _ = write!(out, "{agg_print}");
-        let _ = write!(out, "    println!(\"[{pname}] handled + dropped = {{}} + {{}} = {{}}, shed downstream = {{}}\", {lc}_handled, {lc}_dropped, {lc}_handled + {lc}_dropped, {lc}_shed);\n");
+        let _ = writeln!(out, "    println!(\"[{pname}] handled + dropped = {{}} + {{}} = {{}}, shed downstream = {{}}\", {lc}_handled, {lc}_dropped, {lc}_handled + {lc}_dropped, {lc}_shed);");
     }
 
     // System invariants relate different processes, whose shards do not
     // correspond (routing differs), so they are checked on the aggregates.
     // Summing a per-shard inequality preserves it.
     if !checks.system.is_empty() {
-        let _ = write!(out, "\n    // ---- proven system invariants, checked at runtime ----\n");
+        let _ = write!(
+            out,
+            "\n    // ---- proven system invariants, checked at runtime ----\n"
+        );
         for (lp, ls, cmp, hp, hs) in &checks.system {
             let (llc, hlc) = (lp.to_lowercase(), hp.to_lowercase());
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "    assert!(({llc}_agg_{ls} as f64) {cmp} ({hlc}_agg_{hs} as f64), \"PROVEN INVARIANT VIOLATED: {lp}.{ls} {cmp} {hp}.{hs} ({{}} vs {{}})\", {llc}_agg_{ls}, {hlc}_agg_{hs});\n"
+                "    assert!(({llc}_agg_{ls} as f64) {cmp} ({hlc}_agg_{hs} as f64), \"PROVEN INVARIANT VIOLATED: {lp}.{ls} {cmp} {hp}.{hs} ({{}} vs {{}})\", {llc}_agg_{ls}, {hlc}_agg_{hs});"
             );
         }
-        let _ = write!(out, "    println!(\"all {} proven invariant(s) verified at runtime\");\n", checks.system.len() + checks.scalar.len() + checks.relational.len());
+        let _ = writeln!(
+            out,
+            "    println!(\"all {} proven invariant(s) verified at runtime\");",
+            checks.system.len() + checks.scalar.len() + checks.relational.len()
+        );
     }
 
     let _ = write!(out, "\n    assert_eq!({entry_lc}_handled + {entry_lc}_dropped, total as u64, \"entry-stage message conservation violated\");\n");
-    let _ = write!(out, "    println!(\"expected messages   = {{total}}\");\n");
-    let _ = write!(out, "    println!(\"elapsed = {{:?}} (locks used: 0)\", t0.elapsed());\n");
-    let _ = write!(out, "    println!(\"{{}}\", sigil_rt::chaos::report());\n}}\n");
+    let _ = writeln!(out, "    println!(\"expected messages   = {{total}}\");");
+    let _ = writeln!(
+        out,
+        "    println!(\"elapsed = {{:?}} (locks emitted by Sigil: 0)\", t0.elapsed());"
+    );
+    let _ = write!(
+        out,
+        "    println!(\"{{}}\", sigil_rt::chaos::report());\n    Ok(())\n}}\n"
+    );
     out
 }
 
@@ -1619,6 +1731,27 @@ pub fn emit_cargo_toml_with_deps(
     externs: &[crate::frontend::ast::ExternCrate],
 ) -> String {
     use crate::frontend::ast::CrateSource;
+    fn toml_string(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len() + 2);
+        escaped.push('"');
+        for ch in value.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                ch if ch.is_control() => {
+                    use std::fmt::Write as _;
+                    let _ = write!(escaped, "\\u{:04X}", ch as u32);
+                }
+                ch => escaped.push(ch),
+            }
+        }
+        escaped.push('"');
+        escaped
+    }
+
     let base = emit_cargo_toml(package_name, sigil_rt_path, with_main);
     if externs.is_empty() {
         return base;
@@ -1627,10 +1760,10 @@ pub fn emit_cargo_toml_with_deps(
     for e in externs {
         match &e.source {
             CrateSource::Version(v) => {
-                extra.push_str(&format!("{} = \"{}\"\n", e.name, v));
+                extra.push_str(&format!("{} = {}\n", e.name, toml_string(v)));
             }
             CrateSource::Path(p) => {
-                extra.push_str(&format!("{} = {{ path = \"{}\" }}\n", e.name, p));
+                extra.push_str(&format!("{} = {{ path = {} }}\n", e.name, toml_string(p)));
             }
         }
     }
@@ -1641,13 +1774,43 @@ pub fn emit_cargo_toml_with_deps(
     match base.find(anchor) {
         Some(i) => {
             let at = i + anchor.len();
-            format!("{}{}{}", &base[..at], extra.trim_start_matches('\n'), &base[at..])
+            format!(
+                "{}{}{}",
+                &base[..at],
+                extra.trim_start_matches('\n'),
+                &base[at..]
+            )
         }
         None => format!("{base}{extra}"),
     }
 }
 
 pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool) -> String {
+    fn cargo_package_name(name: &str) -> String {
+        let sanitized: String = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() || !sanitized.chars().any(|ch| ch.is_ascii_alphanumeric()) {
+            "sigil_out".into()
+        } else {
+            sanitized
+        }
+    }
+
+    let package_name = cargo_package_name(package_name);
+    let sigil_rt_path = sigil_rt_path
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
     let bin_section = if with_main {
         "\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n"
     } else {
@@ -1661,7 +1824,7 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
 /// Emit a runnable main that stress-tests the process as a fleet of
 /// shared-nothing actors: SHARDS isolated instances, PRODUCERS concurrent
 /// tasks on a multi-threaded runtime, deterministic aggregate at the end.
-/// No locks appear anywhere in the generated program.
+/// No explicit locks appear in the code emitted by Sigil.
 pub fn emit_demo_main(program: &Program) -> String {
     if program.processes.is_empty() {
         return "fn main() {\n    println!(\"no process\");\n}\n".into();
@@ -1685,18 +1848,18 @@ pub fn emit_demo_main(program: &Program) -> String {
         if let Some(schema) = program.schemas.iter().find(|sc| sc.name == *name) {
             for (fname, fty) in &schema.fields {
                 match fty {
-                    Type::Int => field_init.push_str(&format!(
-                        "                msg.{fname} = 1;\n"
-                    )),
-                    Type::Float => field_init.push_str(&format!(
-                        "                msg.{fname} = 1.0;\n"
-                    )),
+                    Type::Int => {
+                        field_init.push_str(&format!("                msg.{fname} = 1;\n"))
+                    }
+                    Type::Float => {
+                        field_init.push_str(&format!("                msg.{fname} = 1.0;\n"))
+                    }
                     Type::String => field_init.push_str(&format!(
                         "                msg.{fname} = format!(\"m-{{prod}}-{{i}}\");\n"
                     )),
-                    Type::Bool => field_init.push_str(&format!(
-                        "                msg.{fname} = true;\n"
-                    )),
+                    Type::Bool => {
+                        field_init.push_str(&format!("                msg.{fname} = true;\n"))
+                    }
                     _ => {}
                 }
             }
@@ -1713,18 +1876,18 @@ pub fn emit_demo_main(program: &Program) -> String {
             if proc_name != &process.name {
                 continue;
             }
-            let _ = write!(
+            let _ = writeln!(
                 fleet_asserts,
-                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {p}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});\n"
+                "        assert!((st.{state} as f64) {cmp} {bound}f64, \"PROVEN INVARIANT VIOLATED: {p}.{state} {cmp} {bound} (shard {{idx}}, got {{}})\", st.{state});"
             );
         }
         for (proc_name, a, cmp, b) in &checks.relational {
             if proc_name != &process.name {
                 continue;
             }
-            let _ = write!(
+            let _ = writeln!(
                 fleet_asserts,
-                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {p}.{a} {cmp} {p}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});\n"
+                "        assert!((st.{a} as f64) {cmp} (st.{b} as f64), \"PROVEN INVARIANT VIOLATED: {p}.{a} {cmp} {p}.{b} (shard {{idx}}, {{}} vs {{}})\", st.{a}, st.{b});"
             );
         }
     }
@@ -1779,7 +1942,7 @@ use sigil_gen::*;
 use std::time::Instant;
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() {{
+async fn main() -> sigil_rt::Result<()> {{
     fn env_usize(key: &str, default: usize) -> usize {{
         std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     }}
@@ -1787,12 +1950,19 @@ async fn main() {{
     let producers: usize = env_usize("SIGIL_DEMO_PRODUCERS", {producers});
     let msgs_per_producer: usize = env_usize("SIGIL_DEMO_MSGS", {per_producer});
     let capacity: usize = env_usize("SIGIL_DEMO_CAPACITY", 1024);
-    let total = producers * msgs_per_producer;
+    if shards == 0 {{
+        return Err(sigil_rt::SigilError::Configuration(
+            "SIGIL_DEMO_SHARDS must be at least 1".into(),
+        ));
+    }}
+    let total = producers.checked_mul(msgs_per_producer).ok_or_else(|| {{
+        sigil_rt::SigilError::Configuration("demo message count overflows usize".into())
+    }})?;
 
     let mut handles = Vec::new();
     let mut joins = Vec::new();
     for _ in 0..shards {{
-        let (h, j) = {p}::new().spawn(capacity);
+        let (h, j) = {p}::new().spawn(capacity)?;
         handles.push(h);
         joins.push(j);
     }}
@@ -1805,14 +1975,13 @@ async fn main() {{
             for i in 0..msgs_per_producer {{
                 let mut msg = {msg_ty}::default();
 {field_init}                let shard = (prod + i) % hs.len();
-                if hs[shard].send(msg).await.is_err() {{
-                    break;
-                }}
+                hs[shard].send(msg).await?;
             }}
+            Ok::<(), sigil_rt::SigilError>(())
         }}));
     }}
     for t in producer_tasks {{
-        let _ = t.await;
+        sigil_rt::join_task(t).await??;
     }}
     drop(handles); // close all channels → actors drain and return their state
 
@@ -1827,7 +1996,7 @@ async fn main() {{
 {agg_decl}    let mut agg_dropped: u64 = 0;
     let mut agg_handled: u64 = 0;
     for (idx, j) in joins.into_iter().enumerate() {{
-        let (st, stats) = j.await.expect("actor task panicked");
+        let (st, stats) = sigil_rt::join_actor(j).await?;
         println!("shard {{idx}}:{shard_print_fmt} handled={{}} dropped={{}}"{shard_print_args}, stats.handled, stats.dropped);
 {fleet_asserts}{agg_add}        agg_handled += stats.handled;
         agg_dropped += stats.dropped;
@@ -1839,8 +2008,9 @@ async fn main() {{
         total as u64,
         "message conservation violated"
     );
-    println!("elapsed = {{:?}} (locks used: 0)", t0.elapsed());
+    println!("elapsed = {{:?}} (locks emitted by Sigil: 0)", t0.elapsed());
     println!("{{}}", sigil_rt::chaos::report());
+    Ok(())
 }}
 "#,
         shards = 8,
@@ -1852,14 +2022,66 @@ async fn main() {{
 
 /// Compute a relative path from `out_dir` to the workspace `sigil_rt` crate.
 pub fn relative_sigil_rt_path(out_dir: &std::path::Path) -> String {
-    for rel in ["../sigil_rt", "../../sigil_rt", "../../../sigil_rt"] {
-        if out_dir.join(rel).exists() {
-            return rel.to_string();
+    use std::path::{Path, PathBuf};
+
+    let out_abs = if out_dir.is_absolute() {
+        out_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(out_dir)
+    };
+
+    let mut candidates = Vec::new();
+    if let Ok(current) = std::env::current_dir() {
+        for ancestor in current.ancestors() {
+            candidates.push(ancestor.join("sigil_rt"));
         }
     }
-    if out_dir.file_name().and_then(|s| s.to_str()) == Some("generated") {
-        "../sigil_rt".into()
-    } else {
-        "../../sigil_rt".into()
+    for ancestor in out_abs.ancestors() {
+        candidates.push(ancestor.join("sigil_rt"));
+    }
+    if let Some(workspace) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        candidates.push(workspace.join("sigil_rt"));
+    }
+
+    for runtime in candidates {
+        if !runtime.join("Cargo.toml").is_file() {
+            continue;
+        }
+        if let Some(relative) = pathdiff::diff_paths(&runtime, &out_abs) {
+            return relative.to_string_lossy().replace('\\', "/");
+        }
+    }
+
+    // Keep the failure visible in the generated manifest. Cargo will report
+    // the missing runtime path instead of silently selecting another crate.
+    "../sigil_rt".into()
+}
+
+#[cfg(test)]
+mod cargo_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_values_cannot_inject_toml() {
+        let manifest = emit_cargo_toml("bad\"\nowned = true", "bad\"\npath", false);
+        assert!(!manifest.contains("\nowned = true"));
+        assert!(manifest.contains("name = \"bad__owned___true\""));
+        assert!(manifest.contains("path = \"bad\\\"\\npath\""));
+    }
+
+    #[test]
+    fn runtime_path_resolution_is_not_limited_by_directory_depth() {
+        let deep = std::env::current_dir()
+            .expect("current directory")
+            .join("target/a/b/c/generated");
+        let relative = relative_sigil_rt_path(&deep);
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let expected =
+            pathdiff::diff_paths(workspace.join("sigil_rt"), &deep).expect("relative path");
+        assert_eq!(relative, expected.to_string_lossy().replace('\\', "/"));
     }
 }

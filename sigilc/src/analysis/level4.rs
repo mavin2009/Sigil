@@ -25,7 +25,9 @@
 //! actor model plus mandatory failure paths: the system-level proof needs
 //! no fairness or liveness assumptions at all.
 
-use crate::analysis::level3::{eval_interval, handler_delta, handler_delta_under, input_preconditions, Interval};
+use crate::analysis::level3::{
+    eval_interval, handler_delta, handler_delta_under, input_preconditions, Interval,
+};
 use crate::analysis::topology::derive_topology;
 use crate::frontend::ast::{BinOp, Expr, Program, Route, SpecItem, Stmt};
 use anyhow::{bail, Result};
@@ -50,10 +52,24 @@ fn collect_system_holds(program: &Program) -> Result<Vec<SystemHold>> {
     let mut out = Vec::new();
     for spec in &program.specs {
         for item in &spec.items {
-            let SpecItem::Hold { expr, .. } = item else { continue };
-            let Expr::Binary { op, lhs, rhs, .. } = expr else { continue };
-            let (Expr::FieldAccess { base: lb, field: lf, .. }, Expr::FieldAccess { base: rb, field: rf, .. }) =
-                (lhs.as_ref(), rhs.as_ref())
+            let SpecItem::Hold { expr, .. } = item else {
+                continue;
+            };
+            let Expr::Binary { op, lhs, rhs, .. } = expr else {
+                continue;
+            };
+            let (
+                Expr::FieldAccess {
+                    base: lb,
+                    field: lf,
+                    ..
+                },
+                Expr::FieldAccess {
+                    base: rb,
+                    field: rf,
+                    ..
+                },
+            ) = (lhs.as_ref(), rhs.as_ref())
             else {
                 continue;
             };
@@ -111,7 +127,12 @@ pub fn level4_prove(program: &Program) -> Result<Level4Report> {
 fn sends_to(handler: &crate::frontend::ast::OnHandler, target: &str) -> Option<u64> {
     let mut n = 0u64;
     for stmt in &handler.body {
-        let Stmt::Send { target: t, route, .. } = stmt else { continue };
+        let Stmt::Send {
+            target: t, route, ..
+        } = stmt
+        else {
+            continue;
+        };
         if t != target {
             continue;
         }
@@ -134,7 +155,15 @@ fn sends_by_guard<'a>(
 ) -> Option<Vec<(Option<&'a Expr>, u64)>> {
     let mut groups: Vec<(Option<&Expr>, u64)> = Vec::new();
     for stmt in &handler.body {
-        let Stmt::Send { target: t, route, guard, .. } = stmt else { continue };
+        let Stmt::Send {
+            target: t,
+            route,
+            guard,
+            ..
+        } = stmt
+        else {
+            continue;
+        };
         if t != target {
             continue;
         }
@@ -230,35 +259,54 @@ fn prove_system_hold(
         .processes
         .iter()
         .find(|p| p.name == h.hi_proc)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Level-4 violation in spec '{spec}': unknown process `{}`", h.hi_proc
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Level-4 violation in spec '{spec}': unknown process `{}`",
+                h.hi_proc
+            )
+        })?;
     let b = program
         .processes
         .iter()
         .find(|p| p.name == h.lo_proc)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Level-4 violation in spec '{spec}': unknown process `{}`", h.lo_proc
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Level-4 violation in spec '{spec}': unknown process `{}`",
+                h.lo_proc
+            )
+        })?;
     if a.name == b.name {
         bail!(
             "Level-4 violation in spec '{spec}': `{}` and `{}` are the same process — \
              use a Level-3 relational hold (`hold {} <= {}`)",
-            h.hi_proc, h.lo_proc, h.lo_state, h.hi_state
+            h.hi_proc,
+            h.lo_proc,
+            h.lo_state,
+            h.hi_state
         );
     }
-    let sa = a.states.iter().find(|s| s.name == h.hi_state).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Level-4 violation in spec '{spec}': `{}` has no state `{}`",
-            h.hi_proc, h.hi_state
-        )
-    })?;
-    let sb = b.states.iter().find(|s| s.name == h.lo_state).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Level-4 violation in spec '{spec}': `{}` has no state `{}`",
-            h.lo_proc, h.lo_state
-        )
-    })?;
+    let sa = a
+        .states
+        .iter()
+        .find(|s| s.name == h.hi_state)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Level-4 violation in spec '{spec}': `{}` has no state `{}`",
+                h.hi_proc,
+                h.hi_state
+            )
+        })?;
+    let sb = b
+        .states
+        .iter()
+        .find(|s| s.name == h.lo_state)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Level-4 violation in spec '{spec}': `{}` has no state `{}`",
+                h.lo_proc,
+                h.lo_state
+            )
+        })?;
 
     // ---- BASE ----
     let lit = |e: &Expr| -> Option<f64> {
@@ -271,7 +319,12 @@ fn prove_system_hold(
         (Some(x), Some(y)) => (x, y),
         _ => bail!("Level-4 violation in spec '{spec}': inits must be numeric literals"),
     };
-    if (h.strict && !(ib < ia)) || (!h.strict && !(ib <= ia)) {
+    let base_holds = match ib.partial_cmp(&ia) {
+        Some(std::cmp::Ordering::Less) => true,
+        Some(std::cmp::Ordering::Equal) => !h.strict,
+        Some(std::cmp::Ordering::Greater) | None => false,
+    };
+    if !base_holds {
         bail!(
             "Level-4 violation in spec '{spec}': BASE CASE fails — init {}.{} = {ib} vs {}.{} = {ia}",
             h.lo_proc, h.lo_state, h.hi_proc, h.hi_state
@@ -288,7 +341,15 @@ fn prove_system_hold(
         for stmt in &handler.body {
             if let Stmt::Let { name, expr, .. } = stmt {
                 let mut scratch = Vec::new();
-                let v = eval_interval(expr, p, &handler.msg_name, &empty, preconds, &lets, &mut scratch);
+                let v = eval_interval(
+                    expr,
+                    p,
+                    &handler.msg_name,
+                    &empty,
+                    preconds,
+                    &lets,
+                    &mut scratch,
+                );
                 lets.insert(name.clone(), v);
             }
         }
@@ -297,7 +358,9 @@ fn prove_system_hold(
             anyhow::anyhow!(
                 "Level-4 violation in spec '{spec}': `{st}` update in `{}`'s `{}` handler \
                  leaves the additive fragment: {}",
-                p.name, handler.msg_name, why.join("; ")
+                p.name,
+                handler.msg_name,
+                why.join("; ")
             )
         })
     };
@@ -331,7 +394,12 @@ fn prove_system_hold(
                 "Level-4 violation in spec '{spec}': FLOW fails — `{}` is fed from outside \
                  the system and reaches `{}` without passing through `{}`, so `{}.{}` \
                  counts messages `{}` never saw",
-                p.name, h.lo_proc, h.hi_proc, h.lo_proc, h.lo_state, h.hi_proc
+                p.name,
+                h.lo_proc,
+                h.hi_proc,
+                h.lo_proc,
+                h.lo_state,
+                h.hi_proc
             );
         }
     }
@@ -340,7 +408,8 @@ fn prove_system_hold(
         bail!(
             "Level-4 violation in spec '{spec}': FLOW fails — `{}` has no inbound edges; \
              it is fed from outside the system and is not bounded by `{}`",
-            h.lo_proc, h.hi_proc
+            h.lo_proc,
+            h.hi_proc
         );
     }
 
@@ -349,7 +418,11 @@ fn prove_system_hold(
     let reachable_b: Vec<&crate::frontend::ast::OnHandler> = b
         .handlers
         .iter()
-        .filter(|hh| topo.edges.iter().any(|e| e.to == b.name && e.to_handler == hh.msg_name))
+        .filter(|hh| {
+            topo.edges
+                .iter()
+                .any(|e| e.to == b.name && e.to_handler == hh.msg_name)
+        })
         .collect();
     if reachable_b.is_empty() {
         bail!(
@@ -366,7 +439,9 @@ fn prove_system_hold(
                 "Level-4 violation in spec '{spec}': `{}.{}` has no upper bound per message \
                  in the `{}` handler — guard the increment (e.g. `require` an upper bound, \
                  or use a literal counter)",
-                h.lo_proc, h.lo_state, hh.msg_name
+                h.lo_proc,
+                h.lo_state,
+                hh.msg_name
             );
         }
         db_max = db_max.max(d.hi.max(0.0));
@@ -382,7 +457,10 @@ fn prove_system_hold(
                 "Level-4 violation in spec '{spec}': `{}.{}` can DECREASE in the `{}` \
                  handler (delta lo = {}) — the counting argument needs every handler to be \
                  non-decreasing",
-                h.hi_proc, h.hi_state, ha.msg_name, da.lo
+                h.hi_proc,
+                h.hi_state,
+                ha.msg_name,
+                da.lo
             );
         }
 
@@ -433,7 +511,9 @@ fn prove_system_hold(
                 "Level-4 violation in spec '{spec}': FLOW fails — the `{}` handler of `{}` \
                  broadcasts onto a path reaching `{}`; broadcast multiplies by the runtime \
                  shard count, which has no static bound",
-                ha.msg_name, h.hi_proc, h.lo_proc
+                ha.msg_name,
+                h.hi_proc,
+                h.lo_proc
             );
         };
         if m_h == 0 {
@@ -451,7 +531,10 @@ fn prove_system_hold(
             bail!(
                 "Level-4 violation in spec '{spec}': the `{}` handler of `{}` sends toward \
                  `{}` but never updates `{}` — those messages are unbounded",
-                ha.msg_name, h.hi_proc, h.lo_proc, h.hi_state
+                ha.msg_name,
+                h.hi_proc,
+                h.lo_proc,
+                h.hi_state
             );
         }
 
@@ -468,7 +551,10 @@ fn prove_system_hold(
                             "Level-4 violation in spec '{spec}': ORDERING fails — the `{}` \
                              handler of `{}` sends toward `{}` BEFORE updating `{}`; a \
                              message could arrive uncounted. Move the update above the send.",
-                            ha.msg_name, h.hi_proc, h.lo_proc, h.hi_state
+                            ha.msg_name,
+                            h.hi_proc,
+                            h.lo_proc,
+                            h.hi_state
                         );
                     }
                 }
@@ -479,7 +565,10 @@ fn prove_system_hold(
             bail!(
                 "Level-4 violation in spec '{spec}': the `{}` handler of `{}` sends toward \
                  `{}` but never updates `{}` — those messages are unbounded",
-                ha.msg_name, h.hi_proc, h.lo_proc, h.hi_state
+                ha.msg_name,
+                h.hi_proc,
+                h.lo_proc,
+                h.hi_state
             );
         }
 
@@ -493,19 +582,29 @@ fn prove_system_hold(
             for stmt in &ha.body {
                 if let Stmt::Let { name, expr, .. } = stmt {
                     let mut scratch = Vec::new();
-                    let v = eval_interval(
-                        expr, a, &ha.msg_name, &empty, preconds, &lets, &mut scratch,
-                    );
+                    let v =
+                        eval_interval(expr, a, &ha.msg_name, &empty, preconds, &lets, &mut scratch);
                     lets.insert(name.clone(), v);
                 }
             }
             let mut why = Vec::new();
             let da_g = handler_delta_under(
-                &h.hi_state, ha, a, &empty, preconds, &lets, *guard, &mut why,
+                &h.hi_state,
+                ha,
+                a,
+                &empty,
+                preconds,
+                &lets,
+                *guard,
+                &mut why,
             )
             .unwrap_or(da);
             let need = (*mult as f64) * db_max;
-            let ok = if h.strict { need < da_g.lo } else { need <= da_g.lo };
+            let ok = if h.strict {
+                need < da_g.lo
+            } else {
+                need <= da_g.lo
+            };
             if !ok {
                 let cond = match guard {
                     Some(g) => format!(" when `{}`", crate::analysis::level3::describe_expr_pub(g)),
@@ -517,7 +616,12 @@ fn prove_system_hold(
                      add {db_max} to `{}`, but only guarantees +{} to `{}` in that case. \
                      Either forward conditionally (`send ... when <cond>`) or make the \
                      counter unconditional.",
-                    ha.msg_name, h.hi_proc, h.lo_proc, h.lo_state, da_g.lo, h.hi_state
+                    ha.msg_name,
+                    h.hi_proc,
+                    h.lo_proc,
+                    h.lo_state,
+                    da_g.lo,
+                    h.hi_state
                 );
             }
         }
@@ -526,7 +630,8 @@ fn prove_system_hold(
         bail!(
             "Level-4 violation in spec '{spec}': no handler of `{}` reaches `{}` in the \
              topology — the bound is vacuous",
-            h.hi_proc, h.lo_proc
+            h.hi_proc,
+            h.lo_proc
         );
     }
     Ok(())

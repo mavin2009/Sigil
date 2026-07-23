@@ -6,9 +6,7 @@
 //! - `extinct` assumptions recorded for residual risk
 
 use crate::analysis::ir::GraphIR;
-use crate::frontend::ast::{
-    BinOp, Expr, Literal, Program, SpecItem, StateDecl, Stmt, Tag, Type,
-};
+use crate::frontend::ast::{BinOp, Expr, Literal, Program, SpecItem, StateDecl, Stmt, Tag, Type};
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
 
@@ -85,14 +83,22 @@ pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> 
                 SpecItem::Extinct { names, .. } => {
                     for n in names {
                         report.extinct.push(n.clone());
-                        report.residual_assumptions.push(format!(
-                            "spec `{}` assumes extinct: {}",
-                            spec.name, n
-                        ));
+                        report
+                            .residual_assumptions
+                            .push(format!("spec `{}` assumes extinct: {}", spec.name, n));
                     }
                 }
                 SpecItem::Require { expr, span } => {
-                    check_require(expr, sum, latency, &blockers_snapshot, &mut report, &spec.name, span.start, span.end)?;
+                    check_require(
+                        expr,
+                        sum,
+                        latency,
+                        &blockers_snapshot,
+                        &mut report,
+                        &spec.name,
+                        span.start,
+                        span.end,
+                    )?;
                 }
                 SpecItem::Hold { expr, span } => {
                     report.holds.push(format_expr(expr));
@@ -191,7 +197,10 @@ fn discharge_hold(
     let owner = owner.expect("state owner exists when state_decl matched");
     for handler in &owner.handlers {
         for stmt in &handler.body {
-            if let Stmt::Assign { name, expr: rhs, .. } = stmt {
+            if let Stmt::Assign {
+                name, expr: rhs, ..
+            } = stmt
+            {
                 if *name != state_name {
                     continue;
                 }
@@ -240,11 +249,7 @@ enum RhsKind {
     Impure,
 }
 
-fn classify_rhs(
-    expr: &Expr,
-    pure_transforms: &BTreeSet<String>,
-    states: &[StateDecl],
-) -> RhsKind {
+fn classify_rhs(expr: &Expr, pure_transforms: &BTreeSet<String>, states: &[StateDecl]) -> RhsKind {
     let state_names: BTreeSet<_> = states.iter().map(|s| s.name.as_str()).collect();
     fn walk(
         expr: &Expr,
@@ -254,7 +259,12 @@ fn classify_rhs(
         impure: &mut bool,
     ) {
         match expr {
-            Expr::If { cond, then_branch, else_branch, .. } => {
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 walk(cond, pure_transforms, state_names, saw_msg, impure);
                 walk(then_branch, pure_transforms, state_names, saw_msg, impure);
                 walk(else_branch, pure_transforms, state_names, saw_msg, impure);
@@ -265,10 +275,7 @@ fn classify_rhs(
                 }
             }
             Expr::Ident { name, .. } => {
-                if !state_names.contains(name.as_str())
-                    && name != "true"
-                    && name != "false"
-                {
+                if !state_names.contains(name.as_str()) && name != "true" && name != "false" {
                     // could be message or local — treat non-state as msg-ish
                     if !pure_transforms.contains(name) {
                         *saw_msg = true;
@@ -309,7 +316,13 @@ fn classify_rhs(
     }
     let mut saw_msg = false;
     let mut impure = false;
-    walk(expr, pure_transforms, &state_names, &mut saw_msg, &mut impure);
+    walk(
+        expr,
+        pure_transforms,
+        &state_names,
+        &mut saw_msg,
+        &mut impure,
+    );
     if impure {
         RhsKind::Impure
     } else if saw_msg {
@@ -322,7 +335,10 @@ fn classify_rhs(
 fn parse_numeric_hold(expr: &Expr) -> Option<(String, BinOp, f64)> {
     match expr {
         Expr::Binary { op, lhs, rhs, .. }
-            if matches!(op, BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt | BinOp::Eq) =>
+            if matches!(
+                op,
+                BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt | BinOp::Eq
+            ) =>
         {
             let name = match lhs.as_ref() {
                 Expr::Ident { name, .. } => name.clone(),
@@ -360,23 +376,18 @@ fn cmp_holds(op: BinOp, value: f64, bound: f64) -> bool {
     }
 }
 
-
 fn check_ir_timeout_recover_edges(ir: &GraphIR) -> Result<()> {
     use crate::analysis::ir::Node;
     for (idx, node) in ir.nodes.iter().enumerate() {
         if let Node::Timeout { span, ms, .. } = node {
             let has_recover_succ = ir.edges.iter().any(|e| {
-                e.from == idx
-                    && matches!(ir.nodes.get(e.to), Some(Node::ErrorAck { .. }))
-            }) || ir.edges.iter().any(|e| {
-                e.from == idx
-                    && matches!(ir.nodes.get(e.to), Some(Node::Recover { .. }))
-            });
+                e.from == idx && matches!(ir.nodes.get(e.to), Some(Node::ErrorAck { .. }))
+            }) || ir
+                .edges
+                .iter()
+                .any(|e| e.from == idx && matches!(ir.nodes.get(e.to), Some(Node::Recover { .. })));
             // Also accept immediate next node Recover (same step lowering)
-            let next_is_recover = matches!(
-                ir.nodes.get(idx + 1),
-                Some(Node::Recover { .. })
-            );
+            let next_is_recover = matches!(ir.nodes.get(idx + 1), Some(Node::Recover { .. }));
             if !has_recover_succ && !next_is_recover {
                 let loc = span
                     .map(|s| format!(" at bytes {}..{}", s.start, s.end))
@@ -401,9 +412,7 @@ fn check_per_step_recovery(program: &Program) -> Result<()> {
                     Stmt::Let { expr, .. }
                     | Stmt::Assign { expr, .. }
                     | Stmt::Send { expr, .. }
-                    | Stmt::Expr { expr, .. } => {
-                        expr
-                    }
+                    | Stmt::Expr { expr, .. } => expr,
                 };
                 check_expr_steps(expr, &process.name)?;
             }
@@ -491,7 +500,12 @@ fn process_worst_case_latency_ms(
         let mut total = 0u64;
         for stmt in &h.body {
             match stmt {
-                Stmt::Send { target, backpressure, expr, .. } => {
+                Stmt::Send {
+                    target,
+                    backpressure,
+                    expr,
+                    ..
+                } => {
                     total += expr_timeout_ms(expr);
                     match backpressure.budget_ms() {
                         Some(ms) => total += ms,
@@ -515,10 +529,7 @@ fn process_worst_case_latency_ms(
 
 /// Longest path through the process topology, where each process
 /// contributes its own worst case. Parallel branches take the max.
-fn longest_path(
-    program: &Program,
-    per_process: &std::collections::BTreeMap<&str, u64>,
-) -> u64 {
+fn longest_path(program: &Program, per_process: &std::collections::BTreeMap<&str, u64>) -> u64 {
     match crate::analysis::topology::derive_topology(program) {
         Ok(topo) if topo.is_pipeline() => {
             let mut longest: std::collections::BTreeMap<&str, u64> =
@@ -546,16 +557,28 @@ fn expr_timeout_ms(expr: &Expr) -> u64 {
             let mut total = expr_timeout_ms(base);
             for step in steps {
                 let ms = step.tags.iter().find_map(|t| match t {
-                    Tag::Timeout { expr: Expr::Literal { value: Literal::DurationMs(m), .. }, .. } => Some(*m),
+                    Tag::Timeout {
+                        expr:
+                            Expr::Literal {
+                                value: Literal::DurationMs(m),
+                                ..
+                            },
+                        ..
+                    } => Some(*m),
                     _ => None,
                 });
                 let retries = step
                     .tags
                     .iter()
                     .find_map(|t| match t {
-                        Tag::Retry { expr: Expr::Literal { value: Literal::Int(n), .. }, .. } => {
-                            Some((*n).max(0) as u64)
-                        }
+                        Tag::Retry {
+                            expr:
+                                Expr::Literal {
+                                    value: Literal::Int(n),
+                                    ..
+                                },
+                            ..
+                        } => Some((*n).max(0) as u64),
                         _ => None,
                     })
                     .unwrap_or(0);
@@ -568,6 +591,7 @@ fn expr_timeout_ms(expr: &Expr) -> u64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // proof diagnostic context stays explicit at the call site
 fn check_require(
     expr: &Expr,
     path_sum: u64,
@@ -595,11 +619,16 @@ fn check_require(
         );
         if is_latency {
             let bound = match rhs.as_ref() {
-                Expr::Literal { value: Literal::DurationMs(ms), .. } => *ms,
+                Expr::Literal {
+                    value: Literal::DurationMs(ms),
+                    ..
+                } => *ms,
                 _ => bail!(
                     "Level-2 violation in spec '{}' at bytes {}..{}: path_latency bound \
                      must be a duration literal (e.g. 500.ms)",
-                    spec_name, start, end
+                    spec_name,
+                    start,
+                    end
                 ),
             };
             if !blockers.is_empty() {
@@ -609,14 +638,21 @@ fn check_require(
                      unbounded time when the destination queue is full. Declare a bounded \
                      policy (`@deadline(N.ms)` or `@shed`) on every send, or use \
                      `require path_timeout_sum` which bounds processing time only.",
-                    spec_name, start, end, blockers.join("; ")
+                    spec_name,
+                    start,
+                    end,
+                    blockers.join("; ")
                 );
             }
             if latency > bound {
                 bail!(
                     "Level-2 violation in spec '{}' at bytes {}..{}: path_latency is {}ms \
                      but require path_latency <= {}ms (processing + declared hand-off waits)",
-                    spec_name, start, end, latency, bound
+                    spec_name,
+                    start,
+                    end,
+                    latency,
+                    bound
                 );
             }
             report.discharged.push(format!(
@@ -650,10 +686,9 @@ fn check_require(
                     bound
                 );
             }
-            report.discharged.push(format!(
-                "path_timeout_sum {}ms <= {}ms",
-                path_sum, bound
-            ));
+            report
+                .discharged
+                .push(format!("path_timeout_sum {}ms <= {}ms", path_sum, bound));
             return Ok(());
         }
     }
@@ -667,7 +702,12 @@ fn check_require(
 
 fn format_expr(expr: &Expr) -> String {
     match expr {
-        Expr::If { cond, then_branch, else_branch, .. } => format!(
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => format!(
             "if {} {{ {} }} else {{ {} }}",
             format_expr(cond),
             format_expr(then_branch),
@@ -765,7 +805,10 @@ spec Slo {
         let ir = lower(&prog).expect("lower");
         let report = level2_check(&prog, &ir).expect("level2");
         assert!(
-            report.discharged.iter().any(|d| d.contains("hold") && d.contains("pure")),
+            report
+                .discharged
+                .iter()
+                .any(|d| d.contains("hold") && d.contains("pure")),
             "expected pure hold discharge: {:?}",
             report.discharged
         );
@@ -800,15 +843,24 @@ spec Bad {
         let ir = lower(&prog).expect("lower");
         let report = level2_check(&prog, &ir).expect("level2");
         assert!(report.path_timeout_sum_ms >= 300);
-        assert!(report.path_timeout_bound_ms == Some(500) || report.discharged.iter().any(|d| d.contains("path_timeout")));
+        assert!(
+            report.path_timeout_bound_ms == Some(500)
+                || report.discharged.iter().any(|d| d.contains("path_timeout"))
+        );
         // total_charged >= 0.0 is pure arithmetic + msg field
         assert!(
-            report.discharged.iter().any(|d| d.contains("total_charged") || d.contains("hold")),
+            report
+                .discharged
+                .iter()
+                .any(|d| d.contains("total_charged") || d.contains("hold")),
             "expected hold discharge notes: {:?}",
             report.discharged
         );
         assert!(
-            report.discharged.iter().any(|d| d.contains("Timeout→Recover") || d.contains("Graph IR")),
+            report
+                .discharged
+                .iter()
+                .any(|d| d.contains("Timeout→Recover") || d.contains("Graph IR")),
             "expected IR recovery discharge: {:?}",
             report.discharged
         );
@@ -822,7 +874,10 @@ spec Bad {
         let ir = lower(&prog).expect("lower");
         let report = level2_check(&prog, &ir).expect("level2");
         assert_eq!(report.path_timeout_sum_ms, 80);
-        assert!(report.discharged.iter().any(|d| d.contains("hits") || d.contains("hold")));
+        assert!(report
+            .discharged
+            .iter()
+            .any(|d| d.contains("hits") || d.contains("hold")));
     }
 
     #[test]
@@ -831,11 +886,16 @@ spec Bad {
         let prog = parse(src).expect("parse");
         let ir = lower(&prog).expect("lower");
         // Level-1 may pass (global has recover)
-        let _ = ir.iter().map(crate::analysis::check::level1_check).collect::<Vec<_>>();
+        let _ = ir
+            .iter()
+            .map(crate::analysis::check::level1_check)
+            .collect::<Vec<_>>();
         let err = level2_check(&prog, &ir).expect_err("level2 must require per-step recover");
         let msg = format!("{err}");
         assert!(msg.contains("Level-2"), "{msg}");
-        assert!(msg.contains("@timeout") || msg.contains("same step") || msg.contains("Recover"), "{msg}");
+        assert!(
+            msg.contains("@timeout") || msg.contains("same step") || msg.contains("Recover"),
+            "{msg}"
+        );
     }
-
 }

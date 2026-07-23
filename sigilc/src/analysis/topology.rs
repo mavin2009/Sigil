@@ -108,8 +108,7 @@ fn local_binding_types(
 
 /// Derive and validate the process topology.
 pub fn derive_topology(program: &Program) -> Result<Topology> {
-    let process_names: BTreeSet<&str> =
-        program.processes.iter().map(|p| p.name.as_str()).collect();
+    let process_names: BTreeSet<&str> = program.processes.iter().map(|p| p.name.as_str()).collect();
 
     let mut edges: Vec<TopologyEdge> = Vec::new();
 
@@ -119,7 +118,13 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
             // same-named bindings in different processes cross-contaminate.
             let local = local_binding_types(program, handler);
             for stmt in &handler.body {
-                let Stmt::Send { target, expr, route, .. } = stmt else {
+                let Stmt::Send {
+                    target,
+                    expr,
+                    route,
+                    ..
+                } = stmt
+                else {
                     continue;
                 };
                 if let Route::ByKey(key) = route {
@@ -130,14 +135,16 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
                         Expr::FieldAccess { base, field, .. } => {
                             let base_ty = local.get(base).cloned();
                             base_ty.and_then(|bt| {
-                                program.schemas.iter().find(|sc| sc.name == bt).and_then(
-                                    |sc| {
+                                program
+                                    .schemas
+                                    .iter()
+                                    .find(|sc| sc.name == bt)
+                                    .and_then(|sc| {
                                         sc.fields
                                             .iter()
                                             .find(|(f, _)| f == field)
                                             .map(|(_, ty)| type_name(ty))
-                                    },
-                                )
+                                    })
                             })
                         }
                         Expr::Ident { name, .. } => local.get(name).cloned(),
@@ -358,10 +365,7 @@ process B {
 
     #[test]
     fn rejects_cycles() {
-        let src = format!(
-            "{CHAIN}\n"
-        )
-        .replace(
+        let src = format!("{CHAIN}\n").replace(
             "  on m: M {\n    total := total + m.v\n  }",
             "  on m: M {\n    total := total + m.v\n    send m to A\n  }",
         );

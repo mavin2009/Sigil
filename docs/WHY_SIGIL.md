@@ -2,8 +2,9 @@
 
 *Or: what you would have to hold in your head to write this by hand.*
 
-Sigil does not make Rust unnecessary. It generates Rust — safe, idiomatic,
-lock-free Rust. The argument for the language is not that the generated code
+Sigil does not make Rust unnecessary. It generates safe, idiomatic,
+shared-nothing Rust with no explicit locks in Sigil-emitted code. The
+argument for the language is not that the generated code
 is exotic. **It is that the generated code is obvious in hindsight and
 extremely easy to get subtly wrong by hand**, and that the properties it
 satisfies are checked rather than reviewed.
@@ -81,7 +82,7 @@ handler, forever:
 | the fallback runs **after** retries are exhausted, not instead of them | Silent loss of retryable requests |
 | the fallback is `deny_unaudited`, a **pure** transform | A fallback that can itself fail or hang reintroduces the failure it exists to absorb |
 | `recorded += 1` sits **above** the `send` | Audit-after-forward: a secret can be served with no audit record |
-| the send is matched, not `.unwrap()`ed | Panic in an actor task, silently killing a shard |
+| the send error is propagated, not `.unwrap()`ed | An ordinary channel closure being promoted into a panic; genuine task panics are separately surfaced through Tokio's `JoinHandle` |
 | the send's queue-full behaviour is **declared** | An unbounded wait that quietly invalidates your latency SLO, or an unbounded queue that quietly becomes an outage |
 
 Sigil checks all seven. The first four are Level-1 rules, the fifth is the
@@ -106,8 +107,12 @@ pub struct AuthnHandle {
 
 impl Authn {
     pub fn spawn(mut self, capacity: usize)
-        -> (AuthnHandle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)
+        -> sigil_rt::Result<(
+            AuthnHandle,
+            tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>,
+        )>
     {
+        sigil_rt::validate_channel_capacity(capacity)?;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(capacity);
         let join = tokio::spawn(async move {
             let mut stats = sigil_rt::ActorStats::default();
@@ -120,7 +125,7 @@ impl Authn {
             self.authz_out = None; // release downstream channel
             (self, stats)
         });
-        (AuthnHandle { tx }, join)
+        Ok((AuthnHandle { tx }, join))
     }
 }
 ```
@@ -152,11 +157,11 @@ sequence:
 
 ```rust
 // sinks first, so upstream stages can be wired to live handles
-for _i in 0..shards { let (h, j) = Vault::new().spawn(1024); ... }
+for _i in 0..shards { let (h, j) = Vault::new().spawn(1024)?; ... }
 for _i in 0..shards {
     let mut inst = Audit::new();
-    inst.connect_vault(vault_handles.clone());
-    let (h, j) = inst.spawn(1024);
+    inst.connect_vault(vault_handles.clone())?;
+    let (h, j) = inst.spawn(1024)?;
     ...
 }
 // ... Authz, Authn
@@ -264,7 +269,10 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 ```
 
 1,757 faults hit the system. 2,560 retries and 632 recoveries absorbed them.
-Zero messages lost, every invariant intact, no locks anywhere.
+Zero messages lost, every invariant intact, and no explicit locks emitted by
+Sigil. Tokio, the allocator, and platform libraries remain free to
+synchronize internally; Sigil does not claim their implementation is
+lock-free.
 
 The finance component behaves the same way:
 

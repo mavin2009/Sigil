@@ -3,7 +3,7 @@
 use crate::analysis::ir::{GraphIR, Node};
 use crate::analysis::types::{infer_program, type_name};
 use crate::frontend::ast::{BinOp, Expr, Program, Stmt, Tag};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 
 pub fn level1_check(ir: &GraphIR) -> Result<()> {
@@ -11,7 +11,8 @@ pub fn level1_check(ir: &GraphIR) -> Result<()> {
     // @error is visible; the old process-global pairing was both too weak
     // (cross-handler pairing) and too strong (rejected @timeout+@error).
     let has_timeout = ir.has_timeout();
-    let has_recover = ir.has_recover() || ir.nodes.iter().any(|n| matches!(n, Node::ErrorAck { .. }));
+    let has_recover =
+        ir.has_recover() || ir.nodes.iter().any(|n| matches!(n, Node::ErrorAck { .. }));
 
     if has_timeout && !has_recover {
         let loc = ir
@@ -79,10 +80,7 @@ pub fn check_transform_signatures(program: &Program) -> Result<()> {
     for process in &program.processes {
         for handler in &process.handlers {
             let mut local_env = env.clone();
-            local_env.insert(
-                handler.msg_name.clone(),
-                type_name(&handler.msg_ty),
-            );
+            local_env.insert(handler.msg_name.clone(), type_name(&handler.msg_ty));
 
             for stmt in &handler.body {
                 match stmt {
@@ -176,9 +174,7 @@ fn check_expr_signatures(
                     }
                 };
                 if let Some((expected_in, out_ty)) = declared.get(&tname) {
-                    if is_named_schema(&cur)
-                        && is_named_schema(expected_in)
-                        && cur != *expected_in
+                    if is_named_schema(&cur) && is_named_schema(expected_in) && cur != *expected_in
                     {
                         bail!(
                             "Level-1 violation in process '{}' at bytes {}..{}: \
@@ -193,24 +189,8 @@ fn check_expr_signatures(
                     }
                     cur = out_ty.clone();
                 }
-                // recover fallbacks must also match input type if declared
-                for tag in &step.tags {
-                    if let Tag::Recover { with, .. } = tag {
-                        if let Expr::Ident { name, .. } = with {
-                            if let Some((expected_in, _)) = declared.get(name) {
-                                if is_named_schema(&cur)
-                                    && is_named_schema(expected_in)
-                                    && cur != *expected_in
-                                {
-                                    // Recover receives the pre-transform value; cur was already
-                                    // updated. Use expected_in vs stage input tracked separately
-                                    // is approximate — skip strict recover check for now.
-                                    let _ = expected_in;
-                                }
-                            }
-                        }
-                    }
-                }
+                // Recovery signatures are checked precisely by
+                // `check_recover_signatures`, which retains the stage input.
             }
             Ok(())
         }
@@ -252,8 +232,17 @@ fn check_expr_signatures(
 fn is_named_schema(ty: &str) -> bool {
     !matches!(
         ty,
-        "Int" | "Float" | "String" | "Bool" | "UUID" | "Bytes" | "Duration" | "i64" | "f64"
-            | "bool" | "()"
+        "Int"
+            | "Float"
+            | "String"
+            | "Bool"
+            | "UUID"
+            | "Bytes"
+            | "Duration"
+            | "i64"
+            | "f64"
+            | "bool"
+            | "()"
     )
 }
 
@@ -270,7 +259,11 @@ mod tests {
             process_span: None,
             local_states: vec!["s".into()],
             nodes: vec![
-                Node::Timeout { ms: 50, attempts: 1, span: None },
+                Node::Timeout {
+                    ms: 50,
+                    attempts: 1,
+                    span: None,
+                },
                 Node::Recover {
                     fallback: "f".into(),
                     span: None,
@@ -288,7 +281,11 @@ mod tests {
             process_name: "P".into(),
             process_span: None,
             local_states: vec![],
-            nodes: vec![Node::Timeout { ms: 50, attempts: 1, span: None }],
+            nodes: vec![Node::Timeout {
+                ms: 50,
+                attempts: 1,
+                span: None,
+            }],
             edges: vec![],
             external_calls: vec![],
         };
@@ -416,10 +413,26 @@ fn walk_failure_paths(
                 };
                 if let Some(name) = target {
                     let is_external = !pure.contains(name);
-                    let n_timeout = step.tags.iter().filter(|t| matches!(t, Tag::Timeout { .. })).count();
-                    let n_recover = step.tags.iter().filter(|t| matches!(t, Tag::Recover { .. })).count();
-                    let n_retry = step.tags.iter().filter(|t| matches!(t, Tag::Retry { .. })).count();
-                    let n_error = step.tags.iter().filter(|t| matches!(t, Tag::Error { .. })).count();
+                    let n_timeout = step
+                        .tags
+                        .iter()
+                        .filter(|t| matches!(t, Tag::Timeout { .. }))
+                        .count();
+                    let n_recover = step
+                        .tags
+                        .iter()
+                        .filter(|t| matches!(t, Tag::Recover { .. }))
+                        .count();
+                    let n_retry = step
+                        .tags
+                        .iter()
+                        .filter(|t| matches!(t, Tag::Retry { .. }))
+                        .count();
+                    let n_error = step
+                        .tags
+                        .iter()
+                        .filter(|t| matches!(t, Tag::Error { .. }))
+                        .count();
                     if n_timeout > 1 || n_recover > 1 || n_retry > 1 || n_error > 1 {
                         bail!(
                             "Level-1 violation in process '{process}' at bytes {}..{}: \
@@ -486,11 +499,13 @@ fn walk_failure_paths(
                     }
                     // Advisory: fallible fallback (external recover target)
                     for t in &step.tags {
-                        if let Tag::Recover { with, .. } = t {
-                            if let Expr::Ident { name: fb, .. } | Expr::Call { name: fb, .. } = with {
-                                if !pure.contains(fb.as_str()) {
-                                    fallible_fallbacks.push(fb.clone());
-                                }
+                        if let Tag::Recover {
+                            with: Expr::Ident { name: fb, .. } | Expr::Call { name: fb, .. },
+                            ..
+                        } = t
+                        {
+                            if !pure.contains(fb.as_str()) {
+                                fallible_fallbacks.push(fb.clone());
                             }
                         }
                     }
@@ -513,7 +528,12 @@ fn walk_failure_paths(
                 walk_failure_paths(a, pure, process, fallible_fallbacks)?;
             }
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_failure_paths(cond, pure, process, fallible_fallbacks)?;
             walk_failure_paths(then_branch, pure, process, fallible_fallbacks)?;
             walk_failure_paths(else_branch, pure, process, fallible_fallbacks)?;
@@ -593,9 +613,13 @@ fn walk_recover_sigs(
                     _ => None,
                 };
                 let Some(stage) = stage else { continue };
-                let Some((stage_in, stage_out)) = sigs.get(stage) else { continue };
+                let Some((stage_in, stage_out)) = sigs.get(stage) else {
+                    continue;
+                };
                 for tag in &step.tags {
-                    let Tag::Recover { with, span } = tag else { continue };
+                    let Tag::Recover { with, span } = tag else {
+                        continue;
+                    };
                     let fb = match with {
                         Expr::Ident { name, .. } | Expr::Call { name, .. } => name.as_str(),
                         _ => continue,
@@ -627,7 +651,12 @@ fn walk_recover_sigs(
             walk_recover_sigs(lhs, sigs, process)?;
             walk_recover_sigs(rhs, sigs, process)
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_recover_sigs(cond, sigs, process)?;
             walk_recover_sigs(then_branch, sigs, process)?;
             walk_recover_sigs(else_branch, sigs, process)
@@ -705,7 +734,8 @@ pub fn check_numeric_types(program: &Program) -> Result<()> {
     Ok(())
 }
 
-type SchemaMap<'a> = std::collections::BTreeMap<&'a str, std::collections::BTreeMap<&'a str, String>>;
+type SchemaMap<'a> =
+    std::collections::BTreeMap<&'a str, std::collections::BTreeMap<&'a str, String>>;
 type SigMap<'a> = std::collections::BTreeMap<&'a str, String>;
 
 fn expr_ty(
@@ -745,7 +775,11 @@ fn expr_ty(
             }
             cur
         }
-        Expr::If { then_branch, else_branch, .. } => expr_ty(then_branch, env, schemas, sigs)
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => expr_ty(then_branch, env, schemas, sigs)
             .or_else(|| expr_ty(else_branch, env, schemas, sigs)),
         Expr::Binary { op, lhs, rhs, .. } => match op {
             BinOp::Le | BinOp::Ge | BinOp::Lt | BinOp::Gt | BinOp::Eq => Some("Bool".into()),
@@ -774,9 +808,15 @@ fn check_expr_numeric(
                 let arithmetic = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
                 let ordering = matches!(op, BinOp::Le | BinOp::Ge | BinOp::Lt | BinOp::Gt);
                 let op_s = match op {
-                    BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
-                    BinOp::Div => "/", BinOp::Le => "<=", BinOp::Ge => ">=",
-                    BinOp::Lt => "<", BinOp::Gt => ">", BinOp::Eq => "==",
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
+                    BinOp::Le => "<=",
+                    BinOp::Ge => ">=",
+                    BinOp::Lt => "<",
+                    BinOp::Gt => ">",
+                    BinOp::Eq => "==",
                 };
                 // Arithmetic and ordering are defined only on numbers.
                 if (arithmetic || ordering) && (!numeric(&lt) || !numeric(&rt)) {
@@ -809,7 +849,12 @@ fn check_expr_numeric(
             }
             Ok(())
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             check_expr_numeric(cond, env, schemas, sigs, process)?;
             check_expr_numeric(then_branch, env, schemas, sigs, process)?;
             check_expr_numeric(else_branch, env, schemas, sigs, process)
@@ -841,7 +886,241 @@ fn check_expr_numeric(
 ///     the destination handler by type, so duplicates are ambiguous).
 pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
     use crate::analysis::types::type_name;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn is_rust_keyword(name: &str) -> bool {
+        matches!(
+            name,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+                | "abstract"
+                | "become"
+                | "box"
+                | "do"
+                | "final"
+                | "macro"
+                | "override"
+                | "priv"
+                | "try"
+                | "typeof"
+                | "union"
+                | "unsized"
+                | "virtual"
+                | "yield"
+        )
+    }
+
+    fn validate_ident(name: &str, kind: &str) -> Result<()> {
+        if is_rust_keyword(name) {
+            bail!(
+                "Level-1 violation: {kind} name '{name}' is a Rust keyword and cannot be \
+                 emitted as a Rust identifier"
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_duplicates<'a>(names: impl IntoIterator<Item = &'a str>, kind: &str) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for name in names {
+            if !seen.insert(name) {
+                bail!("Level-1 violation: duplicate {kind} name '{name}'");
+            }
+        }
+        Ok(())
+    }
+
+    reject_duplicates(
+        program.schemas.iter().map(|schema| schema.name.as_str()),
+        "schema",
+    )?;
+    reject_duplicates(
+        program
+            .processes
+            .iter()
+            .map(|process| process.name.as_str()),
+        "process",
+    )?;
+    reject_duplicates(
+        program
+            .transforms
+            .iter()
+            .map(|transform| transform.name.as_str()),
+        "transform",
+    )?;
+    reject_duplicates(program.specs.iter().map(|spec| spec.name.as_str()), "spec")?;
+    reject_duplicates(
+        program
+            .extern_crates
+            .iter()
+            .map(|dependency| dependency.name.as_str()),
+        "extern crate",
+    )?;
+    for dependency in &program.extern_crates {
+        validate_ident(&dependency.name, "extern crate")?;
+        match &dependency.source {
+            crate::frontend::ast::CrateSource::Version(requirement) => {
+                semver::VersionReq::parse(requirement).with_context(|| {
+                    format!(
+                        "Level-1 violation: extern crate '{}' has invalid version requirement \
+                         '{requirement}'",
+                        dependency.name
+                    )
+                })?;
+            }
+            crate::frontend::ast::CrateSource::Path(path) => {
+                if path.is_empty() || path.chars().any(char::is_control) {
+                    bail!(
+                        "Level-1 violation: extern crate '{}' has an empty or control-character \
+                         path",
+                        dependency.name
+                    );
+                }
+            }
+        }
+    }
+
+    // All declarations below become Rust items. Check the generated type
+    // namespace too: `P` also emits `PHandle` and, for multi-handler
+    // processes, `PMsg`.
+    let mut generated_types: BTreeMap<String, String> = BTreeMap::new();
+    let mut add_generated_type = |name: String, origin: String| -> Result<()> {
+        if let Some(previous) = generated_types.insert(name.clone(), origin.clone()) {
+            bail!(
+                "Level-1 violation: generated Rust type name '{name}' collides between \
+                 {previous} and {origin}"
+            );
+        }
+        Ok(())
+    };
+    for schema in &program.schemas {
+        validate_ident(&schema.name, "schema")?;
+        if matches!(
+            schema.name.as_str(),
+            "Int" | "Float" | "String" | "Bool" | "UUID" | "Bytes" | "Duration" | "Result"
+        ) {
+            bail!(
+                "Level-1 violation: schema name '{}' collides with a built-in/generated type",
+                schema.name
+            );
+        }
+        add_generated_type(schema.name.clone(), format!("schema '{}'", schema.name))?;
+        reject_duplicates(
+            schema.fields.iter().map(|(name, _)| name.as_str()),
+            &format!("field in schema '{}'", schema.name),
+        )?;
+        for (field, _) in &schema.fields {
+            validate_ident(field, &format!("field in schema '{}'", schema.name))?;
+        }
+    }
+    for process in &program.processes {
+        validate_ident(&process.name, "process")?;
+        let mut generated_names = vec![process.name.clone(), format!("{}Handle", process.name)];
+        if process.handlers.len() > 1 {
+            generated_names.push(format!("{}Msg", process.name));
+        }
+        for generated in generated_names {
+            add_generated_type(generated, format!("process '{}'", process.name))?;
+        }
+    }
+
+    // Demo variables and outbox fields are derived by lowercasing process
+    // names, so case-only distinctions are not representable.
+    reject_duplicates(
+        program
+            .processes
+            .iter()
+            .map(|process| process.name.to_lowercase())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str),
+        "case-insensitive process",
+    )?;
+
+    let schemas: BTreeSet<&str> = program
+        .schemas
+        .iter()
+        .map(|schema| schema.name.as_str())
+        .collect();
+    let validate_type = |ty: &crate::frontend::ast::Type, context: &str| -> Result<()> {
+        if let crate::frontend::ast::Type::Named(name) = ty {
+            if !schemas.contains(name.as_str()) {
+                bail!("Level-1 violation: {context} uses unknown schema type '{name}'");
+            }
+        }
+        Ok(())
+    };
+
+    for schema in &program.schemas {
+        for (field, ty) in &schema.fields {
+            validate_type(ty, &format!("field '{}.{}'", schema.name, field))?;
+        }
+    }
+    for transform in &program.transforms {
+        validate_ident(&transform.name, "transform")?;
+        validate_ident(
+            &transform.param,
+            &format!("parameter of transform '{}'", transform.name),
+        )?;
+        if transform.name == "timeout" {
+            bail!(
+                "Level-1 violation: transform name 'timeout' collides with generated runtime support"
+            );
+        }
+        validate_type(
+            &transform.param_ty,
+            &format!("parameter of transform '{}'", transform.name),
+        )?;
+        validate_type(
+            &transform.return_ty,
+            &format!("return type of transform '{}'", transform.name),
+        )?;
+    }
+
+    // Unqualified Level-3 holds resolve state names globally. Requiring
+    // uniqueness prevents a proof from silently selecting the first owner.
+    reject_duplicates(
+        program
+            .processes
+            .iter()
+            .flat_map(|process| process.states.iter().map(|state| state.name.as_str())),
+        "state across the compilation unit",
+    )?;
 
     for process in &program.processes {
         if process.handlers.is_empty() {
@@ -853,7 +1132,46 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
         }
         let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
         let mut by_type: BTreeMap<String, usize> = BTreeMap::new();
+        let targets: BTreeSet<String> = process
+            .handlers
+            .iter()
+            .flat_map(|handler| handler.body.iter())
+            .filter_map(|stmt| match stmt {
+                Stmt::Send { target, .. } => Some(target.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+        let reserved_states: BTreeSet<String> = std::iter::once("__shed".to_string())
+            .chain(targets.iter().map(|target| format!("{target}_out")))
+            .collect();
+        reject_duplicates(
+            process.states.iter().map(|state| state.name.as_str()),
+            &format!("state in process '{}'", process.name),
+        )?;
+        for state in &process.states {
+            validate_ident(&state.name, &format!("state in process '{}'", process.name))?;
+            validate_type(
+                &state.ty,
+                &format!("state '{}.{}'", process.name, state.name),
+            )?;
+            if reserved_states.contains(&state.name) {
+                bail!(
+                    "Level-1 violation in process '{}': state name '{}' collides with \
+                     generated actor bookkeeping",
+                    process.name,
+                    state.name
+                );
+            }
+        }
         for h in &process.handlers {
+            validate_ident(
+                &h.msg_name,
+                &format!("handler message in process '{}'", process.name),
+            )?;
+            validate_type(
+                &h.msg_ty,
+                &format!("handler '{}' in process '{}'", h.msg_name, process.name),
+            )?;
             *by_name.entry(h.msg_name.as_str()).or_insert(0) += 1;
             *by_type.entry(type_name(&h.msg_ty)).or_insert(0) += 1;
         }
@@ -887,7 +1205,11 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
                     process.name,
                     process.span.start,
                     process.span.end,
-                    names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
+                    names
+                        .iter()
+                        .map(|n| format!("'{n}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
         }
@@ -931,11 +1253,7 @@ pub fn check_transform_purity(program: &Program) -> Result<()> {
     Ok(())
 }
 
-fn walk_purity(
-    expr: &Expr,
-    pure: &std::collections::BTreeSet<&str>,
-    owner: &str,
-) -> Result<()> {
+fn walk_purity(expr: &Expr, pure: &std::collections::BTreeSet<&str>, owner: &str) -> Result<()> {
     match expr {
         Expr::Call { name, args, .. } => {
             if !pure.contains(name.as_str()) {
@@ -968,7 +1286,12 @@ fn walk_purity(
             walk_purity(lhs, pure, owner)?;
             walk_purity(rhs, pure, owner)
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_purity(cond, pure, owner)?;
             walk_purity(then_branch, pure, owner)?;
             walk_purity(else_branch, pure, owner)
@@ -980,5 +1303,80 @@ fn walk_purity(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+    use crate::frontend::ast::parse;
+
+    fn rejection(source: &str) -> String {
+        let program = parse(source).expect("test source parses");
+        check_handler_wellformedness(&program)
+            .expect_err("source must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn rejects_names_that_would_break_generated_rust() {
+        let duplicate = r#"
+schema M { value: Int }
+process P { on m: M {} }
+process P { on other: M {} }
+"#;
+        assert!(rejection(duplicate).contains("duplicate process"));
+
+        let keyword = r#"
+schema M { type: Int }
+process P { on m: M {} }
+"#;
+        assert!(rejection(keyword).contains("Rust keyword"));
+
+        let collision = r#"
+schema PHandle { value: Int }
+process P { on m: PHandle {} }
+"#;
+        assert!(rejection(collision).contains("generated Rust type"));
+    }
+
+    #[test]
+    fn rejects_unknown_schema_types_and_ambiguous_state_names() {
+        let unknown = "process P { on m: Missing {} }";
+        assert!(rejection(unknown).contains("unknown schema type"));
+
+        let ambiguous = r#"
+schema M { value: Int }
+process A { state count: Int = 0 on m: M {} }
+process B { state count: Int = 0 on m: M {} }
+"#;
+        assert!(rejection(ambiguous).contains("state across the compilation unit"));
+    }
+
+    #[test]
+    fn rejects_actor_bookkeeping_collisions() {
+        let source = r#"
+schema M { value: Int }
+process A {
+  state b_out: Int = 0
+  on m: M { send m to B }
+}
+process B { on m: M {} }
+"#;
+        assert!(rejection(source).contains("actor bookkeeping"));
+    }
+
+    #[test]
+    fn rejects_invalid_dependency_metadata() {
+        let bad_version = r#"
+extern crate dep = "not a version requirement"
+schema M { value: Int }
+process P { on m: M {} }
+"#;
+        assert!(rejection(bad_version).contains("invalid version requirement"));
+
+        let control_path = "extern crate dep = path \"../ok\ninjected\"\n\
+schema M { value: Int }\nprocess P { on m: M {} }";
+        assert!(rejection(control_path).contains("control-character"));
     }
 }

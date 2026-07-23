@@ -1,58 +1,90 @@
 //! Sigilc CLI — compile a .sigil file to an ownership-safe Rust crate.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 use sigilc::{
-    emit, emit_cargo_toml, emit_demo_main, level_banner, lower, parse, relative_sigil_rt_path,
-    residual_risk_report, run_checks, AssuranceLevel,
+    emit, emit_demo_main, level_banner, lower, parse, relative_sigil_rt_path, residual_risk_report,
+    run_checks, AssuranceLevel,
 };
 
-fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!(
-            "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--emit-graph] [--level 0|1|2|3|4]\n\
-             \n\
-             Assurance levels:\n\
-             \x20 0 | sketch     exploratory; no safety checks, everything residual\n\
-             \x20 1 | safe       default; extinct-by-design + signature checks\n\
-             \x20 2 | contracts  spec obligations (require / hold / extinct)\n\
-             \x20 3 | proofs     inductive hold proofs with runtime-guarded assumptions\n\
-             \x20 4 | system     cross-process invariants proven over the topology"
-        );
-        std::process::exit(1);
-    }
+const USAGE: &str =
+    "Usage: sigilc <file.sigil> [out_dir] [--emit-main] [--emit-graph] [--level 0|1|2|3|4]\n\
+\n\
+Assurance levels:\n\
+  0 | sketch     exploratory; no safety checks, everything residual\n\
+  1 | safe       default; extinct-by-design + signature checks\n\
+  2 | contracts  spec obligations (require / hold / extinct)\n\
+  3 | proofs     inductive hold proofs with runtime-guarded assumptions\n\
+  4 | system     cross-process invariants proven over the topology";
 
+#[derive(Debug, PartialEq)]
+struct Cli {
+    input: PathBuf,
+    out: PathBuf,
+    emit_main: bool,
+    emit_graph: bool,
+    level: AssuranceLevel,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     let mut input: Option<PathBuf> = None;
-    let mut out = PathBuf::from("generated");
+    let mut out: Option<PathBuf> = None;
     let mut emit_main_flag = false;
     let mut emit_graph_flag = false;
     let mut level = AssuranceLevel::default();
-    let mut args_iter = args.iter().skip(1).peekable();
+    let mut positional_only = false;
+    let mut args_iter = args.into_iter();
+
     while let Some(arg) = args_iter.next() {
-        if arg == "--emit-main" {
+        if !positional_only && arg == "--" {
+            positional_only = true;
+        } else if !positional_only && arg == "--emit-main" {
             emit_main_flag = true;
-        } else if arg == "--emit-graph" {
+        } else if !positional_only && arg == "--emit-graph" {
             emit_graph_flag = true;
-        } else if let Some(v) = arg.strip_prefix("--level=") {
+        } else if !positional_only && arg.starts_with("--level=") {
+            let v = arg.trim_start_matches("--level=");
             level = AssuranceLevel::from_arg(v)
                 .with_context(|| format!("invalid assurance level '{v}' (expected 0-4)"))?;
-        } else if arg == "--level" {
-            let v = args_iter
-                .next()
-                .context("--level requires a value (0, 1, or 2)")?;
-            level = AssuranceLevel::from_arg(v)
+        } else if !positional_only && arg == "--level" {
+            let v = args_iter.next().context("--level requires a value (0-4)")?;
+            level = AssuranceLevel::from_arg(&v)
                 .with_context(|| format!("invalid assurance level '{v}' (expected 0-4)"))?;
+        } else if !positional_only && arg.starts_with('-') {
+            bail!("unknown option '{arg}'\n\n{USAGE}");
         } else if input.is_none() {
             input = Some(PathBuf::from(arg));
-        } else if !arg.starts_with("--") {
-            out = PathBuf::from(arg);
+        } else if out.is_none() {
+            out = Some(PathBuf::from(arg));
+        } else {
+            bail!("too many positional arguments\n\n{USAGE}");
         }
     }
-    let input = input.expect("input file");
+
+    Ok(Cli {
+        input: input.with_context(|| format!("missing input file\n\n{USAGE}"))?,
+        out: out.unwrap_or_else(|| PathBuf::from("generated")),
+        emit_main: emit_main_flag,
+        emit_graph: emit_graph_flag,
+        level,
+    })
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let cli = parse_args(args)?;
+    let input = cli.input;
+    let out = cli.out;
+    let emit_main_flag = cli.emit_main;
+    let emit_graph_flag = cli.emit_graph;
+    let level = cli.level;
 
     let source = fs::read_to_string(&input)
         .with_context(|| format!("failed to read {}", input.display()))?;
@@ -74,13 +106,9 @@ fn main() -> Result<()> {
         Ok(o) => o,
         Err(e) => {
             // Byte spans are for machines; show the person a source position.
-            let rendered = sigilc::render_diagnostic(
-                &format!("{e:#}"),
-                &source,
-                &input.display().to_string(),
-            );
-            eprintln!("\nerror[{}]: {rendered}", level.name());
-            std::process::exit(1);
+            let rendered =
+                sigilc::render_diagnostic(&format!("{e:#}"), &source, &input.display().to_string());
+            bail!("error[{}]: {rendered}", level.name());
         }
     };
     println!("Assurance: {} — checks passed.", level.name());
@@ -113,7 +141,12 @@ fn main() -> Result<()> {
     let rt_path = relative_sigil_rt_path(&out);
     fs::write(
         out.join("Cargo.toml"),
-        sigilc::emit_cargo_toml_with_deps(&pkg_name, &rt_path, emit_main_flag, &program.extern_crates),
+        sigilc::emit_cargo_toml_with_deps(
+            &pkg_name,
+            &rt_path,
+            emit_main_flag,
+            &program.extern_crates,
+        ),
     )?;
     println!(
         "[codegen] Wrote {} (sigil_rt path: {})",
@@ -155,6 +188,57 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn missing_input_is_a_diagnostic_not_a_panic() {
+        let err = parse_args(args(&["--emit-main"]))
+            .expect_err("an input file is required")
+            .to_string();
+        assert!(err.contains("missing input file"), "{err}");
+    }
+
+    #[test]
+    fn unknown_options_and_extra_positionals_are_rejected() {
+        assert!(parse_args(args(&["x.sigil", "--wat"]))
+            .expect_err("unknown option")
+            .to_string()
+            .contains("unknown option"));
+        assert!(parse_args(args(&["x.sigil", "out", "extra"]))
+            .expect_err("extra positional")
+            .to_string()
+            .contains("too many positional"));
+    }
+
+    #[test]
+    fn parses_all_supported_options_in_any_order() {
+        let cli = parse_args(args(&[
+            "--level=4",
+            "--emit-graph",
+            "x.sigil",
+            "out",
+            "--emit-main",
+        ]))
+        .expect("valid CLI");
+        assert_eq!(
+            cli,
+            Cli {
+                input: PathBuf::from("x.sigil"),
+                out: PathBuf::from("out"),
+                emit_main: true,
+                emit_graph: true,
+                level: AssuranceLevel::System,
+            }
+        );
+    }
+}
+
+#[cfg(test)]
 mod integration {
     use sigilc::{
         check_failure_paths, check_transform_signatures, emit, emit_demo_main, level1_check,
@@ -162,12 +246,18 @@ mod integration {
     };
 
     /// The structural safety properties every generated crate must have:
-    /// no locks, no shared ownership, no unsafe block, and the crate-level
+    /// no emitted locks, no shared ownership, no unsafe block, and the crate-level
     /// `forbid(unsafe_code)` that makes the last one unrepresentable.
     fn no_shared_mutability(rust: &str) -> bool {
         assert!(!rust.contains("Mutex"), "generated code must not use locks");
-        assert!(!rust.contains("Arc<"), "generated code must not share ownership");
-        assert!(!rust.contains("unsafe {"), "generated code must not use unsafe blocks");
+        assert!(
+            !rust.contains("Arc<"),
+            "generated code must not share ownership"
+        );
+        assert!(
+            !rust.contains("unsafe {"),
+            "generated code must not use unsafe blocks"
+        );
         assert!(
             rust.contains("#![forbid(unsafe_code)]"),
             "generated crates must forbid unsafe outright"
@@ -267,7 +357,8 @@ mod integration {
 
     #[test]
     fn compile_ingest() {
-        let (rust, risk, graph) = compile_source(include_str!("../../examples/ingest/ingest.sigil"));
+        let (rust, risk, graph) =
+            compile_source(include_str!("../../examples/ingest/ingest.sigil"));
         assert!(graph.iter().any(|i| i.has_timeout()) && graph.iter().any(|i| i.has_recover()));
         assert!(rust.contains("Ingest"));
         assert!(risk.contains("Level-1"));
@@ -304,7 +395,12 @@ mod integration {
             compile_source(include_str!("../../examples/pipeline/pipeline.sigil"));
         assert_eq!(graph[0].process_name, "OrderPipeline");
         assert!(rust.contains("from_millis(120)") && rust.contains("from_millis(200)"));
-        assert!(risk.contains("Level-2") || risk.contains("path_timeout") || risk.contains("320") || risk.contains("discharged"));
+        assert!(
+            risk.contains("Level-2")
+                || risk.contains("path_timeout")
+                || risk.contains("320")
+                || risk.contains("discharged")
+        );
         assert!(risk.contains("confirm") || risk.contains("Declared") || risk.contains("Order"));
     }
 
@@ -323,7 +419,9 @@ mod integration {
         let (rust, risk, graph) = compile_source(source);
         assert!(graph.iter().all(|i| !i.has_timeout()));
         assert!(rust.contains("fn add"));
-        assert!(risk.contains("body present") || risk.contains("Compiled") || risk.contains("hold"));
+        assert!(
+            risk.contains("body present") || risk.contains("Compiled") || risk.contains("hold")
+        );
         let program = parse(source).unwrap();
         let main_rs = emit_demo_main(&program);
         assert!(main_rs.contains("Counter::new") && main_rs.contains("total"));
@@ -345,7 +443,10 @@ mod integration {
         for (i, src) in files.iter().enumerate() {
             let (rust, risk, _) = compile_source(src);
             assert!(rust.len() > 50, "example {i} empty codegen");
-            assert!(risk.contains("Level-1"), "example {i} missing residual L1 section");
+            assert!(
+                risk.contains("Level-1"),
+                "example {i} missing residual L1 section"
+            );
         }
     }
 
@@ -356,7 +457,10 @@ mod integration {
         let program = parse(src).expect("parse");
         let err = check_failure_paths(&program).expect_err("must reject");
         let msg = format!("{err}");
-        assert!(msg.contains("no failure path") && msg.contains("fetch"), "got: {msg}");
+        assert!(
+            msg.contains("no failure path") && msg.contains("fetch"),
+            "got: {msg}"
+        );
     }
 
     /// @error acknowledges a drop; @recover without @timeout is now legal.
@@ -367,7 +471,10 @@ mod integration {
         check_failure_paths(&program).expect("fully covered pipeline must pass");
         let (rust, _, _) = compile_source(src);
         // Untimed @recover emits a match on the stage result with a recovery note.
-        assert!(rust.contains("note_recovery(\"validate\")"), "untimed recover path missing");
+        assert!(
+            rust.contains("note_recovery(\"validate\")"),
+            "untimed recover path missing"
+        );
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
@@ -379,8 +486,8 @@ mod integration {
         let src = include_str!("../../examples/avionics/attitude_control.sigil");
         let program = parse(src).expect("parse");
         let irs = lower(&program).expect("lower");
-        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
-            .expect("avionics must pass Level 4");
+        let outcome =
+            run_checks(&program, &irs, AssuranceLevel::System).expect("avionics must pass Level 4");
         assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 3);
         assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 2);
 
@@ -422,9 +529,7 @@ mod integration {
         );
 
         // The declared dependency reaches the generated manifest.
-        let toml = sigilc::emit_cargo_toml_with_deps(
-            "x", "../..", true, &program.extern_crates,
-        );
+        let toml = sigilc::emit_cargo_toml_with_deps("x", "../..", true, &program.extern_crates);
         assert!(toml.contains("sensor_hal = { path ="), "{toml}");
 
         // Bound I/O is still external: it can fail and hang, so it still
@@ -470,7 +575,10 @@ mod integration {
         let src = include_str!("../../examples/level3/proven_ledger.sigil");
         let program = parse(src).expect("parse");
         let main_rs = sigilc::emit_demo_main(&program);
-        assert!(main_rs.contains("Ledger.posted >= 0"), "fleet demo must assert: {main_rs}");
+        assert!(
+            main_rs.contains("Ledger.posted >= 0"),
+            "fleet demo must assert: {main_rs}"
+        );
         assert!(main_rs.contains("Ledger.total_amount >= 0"));
 
         // The known-unsound shape still emits its (false) invariant as a
@@ -495,10 +603,14 @@ mod integration {
         // `true * true` and `19.7 * "s"` were accepted and emitted Rust that
         // rustc rejected.
         for (src, needle) in [
-            ("schema S{f:Int} process P{ state c: Int = 0 on m: S { c := c + (true * true) } }",
-             "defined only on Int and Float"),
-            ("schema S{f:Int} process P{ state c: Int = 0 on m: S { c := c + (19.7 * 3) } }",
-             "mixes numeric types"),
+            (
+                "schema S{f:Int} process P{ state c: Int = 0 on m: S { c := c + (true * true) } }",
+                "defined only on Int and Float",
+            ),
+            (
+                "schema S{f:Int} process P{ state c: Int = 0 on m: S { c := c + (19.7 * 3) } }",
+                "mixes numeric types",
+            ),
         ] {
             let program = parse(src).expect("parse");
             let err = check_numeric_types(&program).expect_err("must reject");
@@ -516,7 +628,10 @@ process P{ state c: Int = 0 on m: A { let z = m ~> f @recover(with: bad)
 ";
         let program = parse(bad).expect("parse");
         let err = check_recover_signatures(&program).expect_err("mismatched recovery");
-        assert!(format!("{err}").contains("must stand in for stage"), "got: {err}");
+        assert!(
+            format!("{err}").contains("must stand in for stage"),
+            "got: {err}"
+        );
 
         // A matching recovery target is accepted.
         let good = bad.replace("transform bad(b:B)->B{b}", "transform bad(a:A)->A{a}");
@@ -537,8 +652,8 @@ process P{ state c: Int = 0 on m: A { let z = m ~> f @recover(with: bad)
         //    counter stays put, so `got <= cnt` is FALSE and must be rejected.
         let src = include_str!("../../examples/proofs/guard_mutated_state.sigil");
         let program = parse(src).expect("parse");
-        let err = level4_prove(&program)
-            .expect_err("a guard over mutated state must not be correlated");
+        let err =
+            level4_prove(&program).expect_err("a guard over mutated state must not be correlated");
         assert!(format!("{err}").contains("GAP fails"), "got: {err}");
 
         // ...while a guard over an immutable binding still correlates.
@@ -611,12 +726,19 @@ process P {{
         // proven invariant, so overflow checks are on in EVERY profile.
         let toml = sigilc::emit_cargo_toml("x", "../..", false);
         assert!(toml.contains("[profile.release]") && toml.contains("overflow-checks = true"));
-        assert_eq!(toml.matches("overflow-checks = true").count(), 2, "dev AND release");
+        assert_eq!(
+            toml.matches("overflow-checks = true").count(),
+            2,
+            "dev AND release"
+        );
 
         // IEEE-754 has values that satisfy `>= 0.0` yet break the interval
         // model the proofs are stated over. Every Float field is checked
         // finite at handler entry, whether or not it carries a `require`.
-        assert!(rust.contains("is_finite()"), "float inputs must be validated");
+        assert!(
+            rust.contains("is_finite()"),
+            "float inputs must be validated"
+        );
         for field in ["notional", "delta_notional"] {
             assert!(
                 rust.contains(&format!("{field}.is_finite()")),
@@ -660,13 +782,16 @@ spec S { hold Down.got <= Up.kept }
         let src = base.replace("SEND", "when m.n > 0");
         let program = parse(&src).expect("parse");
         let irs = lower(&program).expect("lower");
-        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
-            .expect("guarded send must prove");
+        let outcome =
+            run_checks(&program, &irs, AssuranceLevel::System).expect("guarded send must prove");
         assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 1);
 
         // And it emits an actual conditional.
         let rust = emit(&program, &irs);
-        assert!(rust.contains("if (m.n > 0) {"), "guarded send codegen: {rust}");
+        assert!(
+            rust.contains("if (m.n > 0) {"),
+            "guarded send codegen: {rust}"
+        );
     }
 
     /// Clone elision: values are moved on their last use and cloned only when
@@ -695,7 +820,10 @@ process B { state b: Int = 0  on m: M { b := b + 1 } }
         // Fan-out: the first send still needs the value, the last one owns it.
         assert!(rust.contains("ok.clone()"), "first send must clone");
         let clones = rust.matches("ok.clone()").count();
-        assert_eq!(clones, 1, "only ONE clone should survive, got {clones}:\n{rust}");
+        assert_eq!(
+            clones, 1,
+            "only ONE clone should survive, got {clones}:\n{rust}"
+        );
     }
 
     /// Conditionals: `if` expressions, condition-aware interval narrowing
@@ -777,7 +905,10 @@ process P {
         let irs = lower(&program).expect("lower");
         run_checks(&program, &irs, AssuranceLevel::Safe).expect("schema literal is legal");
         let rust = emit(&program, &irs);
-        assert!(rust.contains("B { y: ok.x }"), "schema literal codegen: {rust}");
+        assert!(
+            rust.contains("B { y: ok.x }"),
+            "schema literal codegen: {rust}"
+        );
 
         // Numeric types do not coerce; the error surfaces in Sigil, not in
         // the generated Rust.
@@ -797,13 +928,25 @@ process P {
         let irs = lower(&program).expect("lower");
         let outcome = run_checks(&program, &irs, AssuranceLevel::System)
             .expect("clearing house must pass Level 4");
-        assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 3, "3 system holds");
-        assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 3, "2 scalar + 1 relational");
+        assert_eq!(
+            outcome.level4.as_ref().unwrap().proven.len(),
+            3,
+            "3 system holds"
+        );
+        assert_eq!(
+            outcome.level3.as_ref().unwrap().proven.len(),
+            3,
+            "2 scalar + 1 relational"
+        );
 
         // Fan-out: Intake feeds two processes with different policies.
         let topo = sigilc::derive_topology(&program).expect("topology");
-        let from_intake: std::collections::BTreeSet<_> =
-            topo.edges.iter().filter(|e| e.from == "Intake").map(|e| e.to.as_str()).collect();
+        let from_intake: std::collections::BTreeSet<_> = topo
+            .edges
+            .iter()
+            .filter(|e| e.from == "Intake")
+            .map(|e| e.to.as_str())
+            .collect();
         assert!(from_intake.contains("RiskEngine") && from_intake.contains("AuditTrail"));
 
         let rust = emit(&program, &irs);
@@ -811,7 +954,10 @@ process P {
         assert!(rust.contains("sigil_rt::backpressure::deadline("));
         assert!(rust.contains("sigil_rt::backpressure::shed("));
         // Fan-out must CLONE, not move, the shared binding.
-        assert!(rust.contains("ok.clone()"), "fan-out must not move the value");
+        assert!(
+            rust.contains("ok.clone()"),
+            "fan-out must not move the value"
+        );
         assert!(no_shared_mutability(&rust));
 
         // The strong invariant holds ONLY because forwarding is conditional
@@ -822,7 +968,10 @@ process P {
             "send checked to Settlement @deadline(5.ms) when checked.lots > 0",
             "send checked to Settlement @deadline(5.ms)",
         );
-        assert_ne!(unguarded, src, "the conditional send must be present in the example");
+        assert_ne!(
+            unguarded, src,
+            "the conditional send must be present in the example"
+        );
         let program = parse(&unguarded).expect("parse");
         let err = sigilc::level4_prove(&program)
             .expect_err("without the guard, settled <= cleared is false");
@@ -860,7 +1009,11 @@ spec S {
             let src = base.replace("POLICY", policy).replace("REQUIRE", req);
             let program = parse(&src).expect("parse");
             let irs = lower(&program).expect("lower");
-            (program.clone(), irs.clone(), run_checks(&program, &irs, AssuranceLevel::System))
+            (
+                program.clone(),
+                irs.clone(),
+                run_checks(&program, &irs, AssuranceLevel::System),
+            )
         };
 
         // @block is the default and needs no annotation.
@@ -869,8 +1022,11 @@ spec S {
 
         // A latency claim is only provable with bounded policies.
         let (_, _, r) = build("@block", "require path_latency <= 100.ms");
-        let e = format!("{:#}", r.err().expect("block cannot back a latency bound"));
-        assert!(e.contains("END-TO-END") && e.contains("unbounded time") && e.contains("@deadline"), "got: {e}");
+        let e = format!("{:#}", r.expect_err("block cannot back a latency bound"));
+        assert!(
+            e.contains("END-TO-END") && e.contains("unbounded time") && e.contains("@deadline"),
+            "got: {e}"
+        );
 
         let (_, _, r) = build("@shed", "require path_latency <= 100.ms");
         assert!(r.is_ok(), "shed is O(1) and bounded");
@@ -891,7 +1047,7 @@ spec S {
         let irs = lower(&program).unwrap();
         let e = format!(
             "{:#}",
-            run_checks(&program, &irs, AssuranceLevel::System).err().expect("over budget")
+            run_checks(&program, &irs, AssuranceLevel::System).expect_err("over budget")
         );
         assert!(e.contains("path_latency is 120ms"), "got: {e}");
 
@@ -916,17 +1072,25 @@ spec S {
         assert!(rust.contains("note_shed"));
         assert!(no_shared_mutability(&rust));
 
-        let src = base.replace("POLICY", "@deadline(7.ms)").replace("REQUIRE", "");
+        let src = base
+            .replace("POLICY", "@deadline(7.ms)")
+            .replace("REQUIRE", "");
         let program = parse(&src).unwrap();
         let irs = lower(&program).unwrap();
         let rust = emit(&program, &irs);
         assert!(rust.contains("sigil_rt::backpressure::deadline(") && rust.contains(", 7)"));
 
         // The negative proof programs.
-        let p = parse(include_str!("../../examples/proofs/latency_unbounded_block.sigil")).unwrap();
+        let p = parse(include_str!(
+            "../../examples/proofs/latency_unbounded_block.sigil"
+        ))
+        .unwrap();
         let i = lower(&p).unwrap();
         assert!(run_checks(&p, &i, AssuranceLevel::Contracts).is_err());
-        let p = parse(include_str!("../../examples/proofs/latency_budget_overflow.sigil")).unwrap();
+        let p = parse(include_str!(
+            "../../examples/proofs/latency_budget_overflow.sigil"
+        ))
+        .unwrap();
         let i = lower(&p).unwrap();
         assert!(run_checks(&p, &i, AssuranceLevel::Contracts).is_err());
     }
@@ -936,8 +1100,9 @@ spec S {
     /// wrong.
     #[test]
     fn multi_handler_processes() {
-        use sigilc::{check_handler_wellformedness, derive_topology, level4_prove, run_checks,
-                     AssuranceLevel};
+        use sigilc::{
+            check_handler_wellformedness, derive_topology, level4_prove, run_checks, AssuranceLevel,
+        };
 
         let src = include_str!("../../examples/trading/order_gateway.sigil");
         let program = parse(src).expect("parse");
@@ -959,8 +1124,12 @@ spec S {
             .filter(|e| e.from == "OrderGateway" && e.to == "RiskEngine")
             .collect();
         assert_eq!(gw_to_risk.len(), 2, "one edge per destination handler");
-        assert!(gw_to_risk.iter().any(|e| e.msg_type == "NewOrder" && e.to_handler == "new_order"));
-        assert!(gw_to_risk.iter().any(|e| e.msg_type == "Cancel" && e.to_handler == "cancel"));
+        assert!(gw_to_risk
+            .iter()
+            .any(|e| e.msg_type == "NewOrder" && e.to_handler == "new_order"));
+        assert!(gw_to_risk
+            .iter()
+            .any(|e| e.msg_type == "Cancel" && e.to_handler == "cancel"));
 
         // Codegen emits a typed dispatch enum and per-type send methods.
         let rust = emit(&program, &irs);
@@ -990,15 +1159,24 @@ spec S {
             "never updates",
         );
         // 2. duplicate handler message names (would emit duplicate enum variants)
-        let p = parse(include_str!("../../examples/proofs/mh_duplicate_msg_name.sigil")).unwrap();
+        let p = parse(include_str!(
+            "../../examples/proofs/mh_duplicate_msg_name.sigil"
+        ))
+        .unwrap();
         let e = check_handler_wellformedness(&p).expect_err("dup name");
         assert!(format!("{e}").contains("message name"));
         // 3. duplicate handler types (ambiguous dispatch)
-        let p = parse(include_str!("../../examples/proofs/mh_duplicate_msg_type.sigil")).unwrap();
+        let p = parse(include_str!(
+            "../../examples/proofs/mh_duplicate_msg_type.sigil"
+        ))
+        .unwrap();
         let e = check_handler_wellformedness(&p).expect_err("dup type");
         assert!(format!("{e}").contains("resolves the destination handler by message type"));
         // 4. sending a type the target cannot receive
-        let p = parse(include_str!("../../examples/proofs/mh_no_handler_for_type.sigil")).unwrap();
+        let p = parse(include_str!(
+            "../../examples/proofs/mh_no_handler_for_type.sigil"
+        ))
+        .unwrap();
         let e = derive_topology(&p).expect_err("no handler for type");
         assert!(format!("{e}").contains("no handler for that type"));
     }
@@ -1033,7 +1211,10 @@ spec S { hold Down.got <= Up.seen }
         let err = level4_prove(&program).expect_err("second handler violates ordering");
         let msg = format!("{err}");
         assert!(msg.contains("ORDERING fails"), "got: {msg}");
-        assert!(msg.contains("`b` handler"), "must name the offending handler: {msg}");
+        assert!(
+            msg.contains("`b` handler"),
+            "must name the offending handler: {msg}"
+        );
     }
 
     /// The finance component: five proofs, a budget, and zero-loss codegen.
@@ -1043,10 +1224,18 @@ spec S { hold Down.got <= Up.seen }
         let src = include_str!("../../examples/finance/clearing.sigil");
         let program = parse(src).expect("parse");
         let irs = lower(&program).expect("lower");
-        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
-            .expect("clearing must pass Level 4");
-        assert_eq!(outcome.level4.as_ref().unwrap().proven.len(), 3, "3 system holds");
-        assert_eq!(outcome.level3.as_ref().unwrap().proven.len(), 2, "2 scalar holds");
+        let outcome =
+            run_checks(&program, &irs, AssuranceLevel::System).expect("clearing must pass Level 4");
+        assert_eq!(
+            outcome.level4.as_ref().unwrap().proven.len(),
+            3,
+            "3 system holds"
+        );
+        assert_eq!(
+            outcome.level3.as_ref().unwrap().proven.len(),
+            2,
+            "2 scalar holds"
+        );
         assert_eq!(
             outcome.level2.as_ref().unwrap().path_timeout_sum_ms,
             380,
@@ -1066,11 +1255,13 @@ spec S { hold Down.got <= Up.seen }
         let src = include_str!("../../examples/security/vault.sigil");
         let program = parse(src).expect("parse");
         let irs = lower(&program).expect("lower");
-        let outcome = run_checks(&program, &irs, AssuranceLevel::System)
-            .expect("vault must pass Level 4");
+        let outcome =
+            run_checks(&program, &irs, AssuranceLevel::System).expect("vault must pass Level 4");
         let proven = &outcome.level4.as_ref().unwrap().proven;
         assert_eq!(proven.len(), 3, "the defense-in-depth chain");
-        assert!(proven.iter().any(|p| p.contains("Vault.served <= Audit.recorded")));
+        assert!(proven
+            .iter()
+            .any(|p| p.contains("Vault.served <= Audit.recorded")));
 
         // Mistake 1: audit AFTER the send (passes code review, fails the build).
         let after = src.replace(
@@ -1095,7 +1286,10 @@ spec S { hold Down.got <= Up.seen }
         assert!(format!("{err}").contains("infallible recovery"));
         // ...but it is a reported residual, not an error, at Level 1.
         let outcome = run_checks(&program, &irs, AssuranceLevel::Safe).expect("L1 ok");
-        assert!(outcome.notes.iter().any(|n| n.contains("fallible recovery")));
+        assert!(outcome
+            .notes
+            .iter()
+            .any(|n| n.contains("fallible recovery")));
     }
 
     /// Level 4: system invariants proven structurally over the topology,
@@ -1165,9 +1359,18 @@ spec S { hold Down.got <= Up.seen }
 
         // The assumptions are ENFORCED: guards appear in the emitted handler.
         let rust = emit(&program, &irs);
-        assert!(rust.contains("payment.amount >= 0f64"), "amount guard missing");
-        assert!(rust.contains("(payment.units as f64) >= 0f64"), "units guard missing");
-        assert!(rust.contains("SigilError::Schema"), "guard must reject typed");
+        assert!(
+            rust.contains("payment.amount >= 0f64"),
+            "amount guard missing"
+        );
+        assert!(
+            rust.contains("(payment.units as f64) >= 0f64"),
+            "units guard missing"
+        );
+        assert!(
+            rust.contains("SigilError::Schema"),
+            "guard must reject typed"
+        );
 
         // Dropping an assumption breaks the inductive step with a named fix.
         let unguarded = src.replace("  require payment.amount >= 0.0\n", "");
@@ -1182,8 +1385,7 @@ spec S { hold Down.got <= Up.seen }
         let irs = lower(&program).expect("lower");
         assert!(run_checks(&program, &irs, AssuranceLevel::Proofs).is_err());
         // ...but still builds at Level 2, where holds are residual.
-        run_checks(&program, &irs, AssuranceLevel::Contracts)
-            .expect("residual at level 2");
+        run_checks(&program, &irs, AssuranceLevel::Contracts).expect("residual at level 2");
     }
 
     /// Soundness hardening before Level 3: every hole found in the L1/L2
@@ -1218,8 +1420,10 @@ spec S { hold Down.got <= Up.seen }
         );
 
         // Purity check directly too.
-        let program =
-            parse(include_str!("../../examples/proofs/impure_pure_transform.sigil")).unwrap();
+        let program = parse(include_str!(
+            "../../examples/proofs/impure_pure_transform.sigil"
+        ))
+        .unwrap();
         assert!(check_transform_purity(&program).is_err());
 
         // @timeout + @error is a legal acknowledged drop at L1 AND L2.
@@ -1231,8 +1435,14 @@ spec S { hold Down.got <= Up.seen }
         let _ = derive_topology(&program).expect("trivial topology");
         let rust = emit(&program, &irs);
         // Codegen must propagate honestly, not silently retry-forever or recover.
-        assert!(rust.contains("SigilError::Timeout"), "acknowledged drop must propagate");
-        assert!(rust.contains("__attempt < 1"), "bounded retry before the drop");
+        assert!(
+            rust.contains("SigilError::Timeout"),
+            "acknowledged drop must propagate"
+        );
+        assert!(
+            rust.contains("__attempt < 1"),
+            "bounded retry before the drop"
+        );
     }
 
     /// The Level-2 budget is the LONGEST PATH over the topology, not a blind
@@ -1302,11 +1512,17 @@ process Right {
         let program = parse(src).expect("parse");
         let graph = lower(&program).expect("lower");
         let l2 = level2_check(&program, &graph).expect("budget holds with retries");
-        assert_eq!(l2.path_timeout_sum_ms, 180, "budget must charge attempts x timeout");
+        assert_eq!(
+            l2.path_timeout_sum_ms, 180,
+            "budget must charge attempts x timeout"
+        );
         let (rust, _, _) = compile_source(src);
         assert!(rust.contains("__attempt < 2"), "bounded retry loop missing");
         assert!(rust.contains("note_retry(\"score\")"));
-        assert!(rust.contains("note_retry(\"post\")"), "untimed retry loop missing");
+        assert!(
+            rust.contains("note_retry(\"post\")"),
+            "untimed retry loop missing"
+        );
         assert!(no_shared_mutability(&rust));
     }
 
@@ -1339,10 +1555,13 @@ process Right {
         // Cascade shutdown: outboxes released when the actor drains
         assert!(rust.contains("self.risk_out = None"));
         assert!(rust.contains("self.settlement_out = None"));
-        // Still lock-free
+        // Still shared-nothing: Sigil emits no explicit locks.
         assert!(no_shared_mutability(&rust));
         // Residual report knows the verified topology
-        assert!(risk.contains("`Gateway` → `Risk`"), "topology missing from residual report");
+        assert!(
+            risk.contains("`Gateway` → `Risk`"),
+            "topology missing from residual report"
+        );
 
         let program = parse(src).unwrap();
         let main_rs = sigilc::emit_demo_main(&program);
@@ -1355,10 +1574,13 @@ process Right {
     /// an isolated task, reachable only through a Clone-able message handle.
     /// No lock or shared-ownership machinery may appear in generated code.
     #[test]
-    fn emitted_process_is_a_lock_free_actor() {
+    fn emitted_process_is_a_shared_nothing_actor() {
         let source = include_str!("../../examples/concurrent/ledger/ledger.sigil");
         let (rust, _, _) = compile_source(source);
-        assert!(rust.contains("pub struct LedgerHandle"), "missing actor handle");
+        assert!(
+            rust.contains("pub struct LedgerHandle"),
+            "missing actor handle"
+        );
         assert!(
             rust.contains("tokio::sync::mpsc::channel::<Payment>"),
             "actor must own a typed channel"

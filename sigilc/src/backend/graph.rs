@@ -8,7 +8,7 @@
 //! used, not a redrawing of the source.
 
 use crate::analysis::topology::Topology;
-use crate::frontend::ast::{Backpressure, Program, Route, Stmt};
+use crate::frontend::ast::{Program, Route, Stmt};
 use std::collections::BTreeMap;
 
 /// How a given edge is routed and back-pressured, read off the source.
@@ -23,9 +23,20 @@ fn edge_facts(program: &Program, from: &str, from_handler: &str, to: &str) -> Ed
     let mut backpressure = "@block".to_string();
     let mut guarded = false;
     for process in program.processes.iter().filter(|p| p.name == from) {
-        for handler in process.handlers.iter().filter(|h| h.msg_name == from_handler) {
+        for handler in process
+            .handlers
+            .iter()
+            .filter(|h| h.msg_name == from_handler)
+        {
             for stmt in &handler.body {
-                let Stmt::Send { target, route: r, backpressure: bp, guard, .. } = stmt else {
+                let Stmt::Send {
+                    target,
+                    route: r,
+                    backpressure: bp,
+                    guard,
+                    ..
+                } = stmt
+                else {
                     continue;
                 };
                 if target != to {
@@ -41,7 +52,11 @@ fn edge_facts(program: &Program, from: &str, from_handler: &str, to: &str) -> Ed
             }
         }
     }
-    EdgeFacts { route, backpressure, guarded }
+    EdgeFacts {
+        route,
+        backpressure,
+        guarded,
+    }
 }
 
 /// Worst-case ms a message spends in each process, as Level 2 computed it.
@@ -49,7 +64,12 @@ fn stage_latency(program: &Program) -> BTreeMap<String, u64> {
     program
         .processes
         .iter()
-        .map(|p| (p.name.clone(), crate::analysis::level2::process_worst_case_ms_pub(p)))
+        .map(|p| {
+            (
+                p.name.clone(),
+                crate::analysis::level2::process_worst_case_ms_pub(p),
+            )
+        })
         .collect()
 }
 
@@ -73,8 +93,16 @@ pub fn to_mermaid(program: &Program, topo: &Topology) -> String {
         let label = format!(
             "{}<br/>on: {}<br/>state: {}<br/>worst case {}ms",
             p.name,
-            if handlers.is_empty() { "-".into() } else { handlers.join(", ") },
-            if states.is_empty() { "-".into() } else { states.join(", ") },
+            if handlers.is_empty() {
+                "-".into()
+            } else {
+                handlers.join(", ")
+            },
+            if states.is_empty() {
+                "-".into()
+            } else {
+                states.join(", ")
+            },
             ms
         );
         // Entry processes get a distinct shape: they are fed from outside the
@@ -163,7 +191,10 @@ process Down {
         assert!(m.contains("M → on m"), "{m}");
         // Routing and back-pressure are proof-relevant facts.
         assert!(m.contains("by key") && m.contains("@deadline(5.ms)"), "{m}");
-        assert!(m.contains("conditional"), "guarded sends must be visible: {m}");
+        assert!(
+            m.contains("conditional"),
+            "guarded sends must be visible: {m}"
+        );
         // Latency shown is the Level-2 per-process worst case: (1+1)*30.
         assert!(m.contains("worst case 60ms"), "{m}");
         // Entry processes are visually distinct (FLOW cares about them).
@@ -182,7 +213,8 @@ process Down {
 
     #[test]
     fn single_process_programs_export_cleanly() {
-        let src = "schema M { id: String }\nprocess P { state c: Int = 0\n on m: M { c := c + 1 } }\n";
+        let src =
+            "schema M { id: String }\nprocess P { state c: Int = 0\n on m: M { c := c + 1 } }\n";
         let program = parse(src).expect("parse");
         let topo = derive_topology(&program).expect("topology");
         let m = to_mermaid(&program, &topo);

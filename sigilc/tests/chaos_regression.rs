@@ -6,13 +6,11 @@
 //! external stages fail and stall — which is the claim that matters, and the
 //! one that catches prover unsoundness rather than checker bugs.
 //!
-//! Ignored by default because it invokes cargo and takes minutes:
-//!
-//! ```text
-//! cargo test --test chaos_regression -- --ignored --nocapture
-//! ```
+//! These invoke Cargo and are intentionally part of the default production
+//! gate. Each case has its own output directory so parallel test execution
+//! cannot race while generating or building a crate.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn repo_root() -> PathBuf {
@@ -34,14 +32,9 @@ fn sigilc_bin() -> PathBuf {
 
 /// Compile a `.sigil` source to a crate, build it, and run its demo under the
 /// given environment. Returns the demo's combined output.
-fn compile_build_run(example: &str, level: &str, env: &[(&str, &str)]) -> String {
+fn compile_build_run(case: &str, example: &str, level: &str, env: &[(&str, &str)]) -> String {
     let root = repo_root();
-    let out = root.join("target/chaos-regression").join(
-        Path::new(example)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("out"),
-    );
+    let out = root.join("target/chaos-regression").join(case);
 
     let status = Command::new(sigilc_bin())
         .arg(root.join(example))
@@ -99,9 +92,9 @@ fn counter(out: &str, key: &str) -> u64 {
 /// The flagship component under sustained faults and latency spikes, with
 /// every proven invariant asserted at runtime.
 #[test]
-#[ignore = "invokes cargo; run with --ignored"]
 fn clearinghouse_holds_under_chaos() {
     let out = compile_build_run(
+        "clearinghouse-faults",
         "examples/clearinghouse/clearing.sigil",
         "4",
         &[
@@ -136,9 +129,9 @@ fn clearinghouse_holds_under_chaos() {
 /// messages are shed by policy. The invariants must survive the shedding —
 /// that is exactly what "robust to every drop the language admits" claims.
 #[test]
-#[ignore = "invokes cargo; run with --ignored"]
 fn invariants_survive_shedding_under_overload() {
     let out = compile_build_run(
+        "clearinghouse-overload",
         "examples/clearinghouse/clearing.sigil",
         "4",
         &[
@@ -160,9 +153,9 @@ fn invariants_survive_shedding_under_overload() {
 /// The security component: the defence-in-depth chain must hold while the
 /// policy engine and KMS are failing.
 #[test]
-#[ignore = "invokes cargo; run with --ignored"]
 fn vault_chain_holds_under_chaos() {
     let out = compile_build_run(
+        "vault-faults",
         "examples/security/vault.sigil",
         "4",
         &[
