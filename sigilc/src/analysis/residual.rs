@@ -1,12 +1,45 @@
-
-//! Residual risk reporting from the Graph IR.
+//! Residual risk reporting from the Graph IR and declared transforms.
 
 use crate::analysis::ir::GraphIR;
+use crate::frontend::ast::{Program, Type};
 
-pub fn residual_risk_report(ir: &GraphIR) -> String {
-    let mut calls: Vec<_> = ir.external_calls.clone();
-    calls.sort();
-    calls.dedup();
+fn type_name(ty: &Type) -> String {
+    match ty {
+        Type::Int => "Int".into(),
+        Type::Float => "Float".into(),
+        Type::String => "String".into(),
+        Type::Bool => "Bool".into(),
+        Type::UUID => "UUID".into(),
+        Type::Bytes => "Bytes".into(),
+        Type::Duration => "Duration".into(),
+        Type::Named(n) => n.clone(),
+    }
+}
+
+/// Build the residual risk report using IR analysis and declared transform signatures.
+pub fn residual_risk_report(program: &Program, ir: &GraphIR) -> String {
+    let mut declared = Vec::new();
+    let mut external = Vec::new();
+    let mut compiled = Vec::new();
+
+    for t in &program.transforms {
+        let sig = format!(
+            "`{}`: {} → {}",
+            t.name,
+            type_name(&t.param_ty),
+            type_name(&t.return_ty)
+        );
+        declared.push(sig.clone());
+        if t.body.is_empty() {
+            external.push(format!("- {sig} (no body — external residual)"));
+        } else {
+            compiled.push(format!("- {sig} (body present — compiled into generated crate)"));
+        }
+    }
+
+    // IR-discovered calls that were never declared
+    let declared_names: std::collections::BTreeSet<_> =
+        program.transforms.iter().map(|t| t.name.as_str()).collect();
     let skip = [
         "packet", "v", "d", "m", "last", "event", "req", "request", "validated",
         "processed", "stored", "result", "final", "checked", "fetched", "recorded",
@@ -14,17 +47,14 @@ pub fn residual_risk_report(ir: &GraphIR) -> String {
         "order", "count", "total_charged", "last_order", "last_ok", "failures",
         "last_status", "open",
     ];
-    calls.retain(|c| !skip.contains(&c.as_str()));
-
-    let calls_list = if calls.is_empty() {
-        "- (none detected)".to_string()
-    } else {
-        calls
-            .iter()
-            .map(|c| format!("- `{c}`"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let mut undeclared: Vec<_> = ir
+        .external_calls
+        .iter()
+        .filter(|c| !declared_names.contains(c.as_str()) && !skip.contains(&c.as_str()))
+        .cloned()
+        .collect();
+    undeclared.sort();
+    undeclared.dedup();
 
     let timeout_nodes: Vec<_> = ir
         .nodes
@@ -43,6 +73,38 @@ pub fn residual_risk_report(ir: &GraphIR) -> String {
         })
         .collect();
 
+    let declared_section = if declared.is_empty() {
+        "- (none)".into()
+    } else {
+        declared
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let external_section = if external.is_empty() {
+        "- (none)".into()
+    } else {
+        external.join("\n")
+    };
+
+    let compiled_section = if compiled.is_empty() {
+        "- (none)".into()
+    } else {
+        compiled.join("\n")
+    };
+
+    let undeclared_section = if undeclared.is_empty() {
+        "- (none)".into()
+    } else {
+        undeclared
+            .iter()
+            .map(|c| format!("- `{c}` (used but not declared)"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     format!(
         r#"# Residual Risk Report
 
@@ -55,15 +117,26 @@ pub fn residual_risk_report(ir: &GraphIR) -> String {
 ## Analysis Summary
 - Process: `{process}`
 - Local states: {states}
-- External transforms (stubs in generated code):
-{calls}
 - Timeout nodes: {timeouts}
 - Recover fallbacks: {recovers}
 
+## Declared Transforms
+{declared}
+
+### Compiled (body present)
+{compiled}
+
+### External residual (empty body)
+{external}
+
+### Undeclared uses
+{undeclared}
+
 ## Residual Risk
-- External transforms are assumed to match their schemas and to terminate. Their internal failure modes are residual.
+- External transforms (empty bodies) are assumed to match their declared schemas and to terminate. Their internal failure modes are residual.
+- Undeclared transforms are residual until given signatures.
 - Tokio runtime, OS scheduler, and wall-clock latency are outside the model.
-- Functional correctness of business logic inside transforms is residual (Level-1 only).
+- Functional correctness of business logic inside external transforms is residual (Level-1 only).
 "#,
         process = ir.process_name,
         states = if ir.local_states.is_empty() {
@@ -71,7 +144,6 @@ pub fn residual_risk_report(ir: &GraphIR) -> String {
         } else {
             ir.local_states.join(", ")
         },
-        calls = calls_list,
         timeouts = if timeout_nodes.is_empty() {
             "(none)".into()
         } else {
@@ -82,5 +154,21 @@ pub fn residual_risk_report(ir: &GraphIR) -> String {
         } else {
             recover_nodes.join(", ")
         },
+        declared = declared_section,
+        compiled = compiled_section,
+        external = external_section,
+        undeclared = undeclared_section,
+    )
+}
+
+/// Backward-compatible wrapper when only the IR is available.
+pub fn residual_risk_report_ir(ir: &GraphIR) -> String {
+    residual_risk_report(
+        &Program {
+            schemas: vec![],
+            processes: vec![],
+            transforms: vec![],
+        },
+        ir,
     )
 }

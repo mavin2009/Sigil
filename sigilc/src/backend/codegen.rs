@@ -54,22 +54,70 @@ pub fn emit(program: &Program, ir: &GraphIR) -> String {
 
     let primary_ty = primary_message_type(program);
     let (_env, transform_types) = crate::analysis::types::infer_program(program);
+
+    // Prefer declared transforms: pure bodies compile; empty bodies are residual stubs.
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    if !program.transforms.is_empty() {
+        out.push_str("// --- declared transforms ---\n");
+        for t in &program.transforms {
+            out.push_str(&emit_declared_transform(t));
+            out.push('\n');
+            emitted.insert(t.name.clone());
+        }
+    }
+
     let externals = collect_externals(program);
-    if !externals.is_empty() {
-        out.push_str("// External transforms — residual risk (bodies are stubs).\n");
-        out.push_str("// Types are propagated from schemas and field usage.\n");
-        for name in &externals {
+    let leftover: Vec<_> = externals.difference(&emitted).cloned().collect();
+    if !leftover.is_empty() {
+        out.push_str("// --- undeclared transforms (residual stubs) ---\n");
+        for name in leftover {
             let (in_ty, out_ty) = transform_types
-                .get(name)
+                .get(&name)
                 .cloned()
                 .unwrap_or_else(|| (primary_ty.clone(), primary_ty.clone()));
-            out.push_str(&emit_external_stub(name, &in_ty, &out_ty));
+            out.push_str(&emit_external_stub(&name, &in_ty, &out_ty));
             out.push('\n');
         }
     }
 
     out.push_str(&emit_smoke_test(program));
     out
+}
+
+fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
+    let in_ty = rust_type(&t.param_ty);
+    let out_ty = rust_type(&t.return_ty);
+    let param = &t.param;
+    if t.body.is_empty() {
+        return emit_external_stub(&t.name, &in_ty, &out_ty);
+    }
+    let mut body_src = String::new();
+    for stmt in &t.body {
+        match stmt {
+            Stmt::Let { name, expr, .. } => {
+                body_src.push_str(&format!(
+                    "    let {name} = {};\n",
+                    emit_expr(expr, &[], param)
+                ));
+            }
+            Stmt::Expr { expr, .. } => {
+                body_src.push_str(&format!(
+                    "    return Ok({});\n",
+                    emit_expr(expr, &[], param)
+                ));
+            }
+            Stmt::Assign { .. } => {
+                body_src.push_str("    /* unsupported assign in transform */\n");
+            }
+        }
+    }
+    if !body_src.contains("return Ok") {
+        body_src.push_str(&format!("    Ok({param})\n"));
+    }
+    format!(
+        "fn {}({param}: {in_ty}) -> Result<{out_ty}> {{\n{body_src}}}\n",
+        t.name
+    )
 }
 
 fn primary_message_type(program: &Program) -> String {

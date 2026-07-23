@@ -1,3 +1,5 @@
+// Counter with a pure compiled transform body (not residual).
+
 schema Tick {
   value: Int
 }
@@ -6,11 +8,16 @@ schema Count {
   total: Int
 }
 
+transform add(x: Int) -> Int {
+  x + 1
+}
+
 process Counter {
   state total: Int = 0
 
   on tick: Tick {
     let next = total + tick.value
-    total := next
+    let bumped = next ~> add
+    total := bumped
   }
 }

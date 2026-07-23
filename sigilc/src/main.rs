@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     fs::write(out.join("Cargo.toml"), emit_cargo_toml(&pkg_name, &rt_path))?;
     println!("[codegen] Wrote {} (sigil_rt path: {})", out.join("Cargo.toml").display(), rt_path);
 
-    let risk = residual_risk_report(&graph);
+    let risk = residual_risk_report(&program, &graph);
     let risk_path = out.join("RESIDUAL_RISK.md");
     fs::write(&risk_path, &risk)?;
     println!("[risk]    Wrote {}", risk_path.display());
@@ -71,7 +71,7 @@ mod integration {
         let graph = lower(&program).expect("lower");
         level1_check(&graph).expect("level1");
         let rust = emit(&program, &graph);
-        let risk = residual_risk_report(&graph);
+        let risk = residual_risk_report(&program, &graph);
         (rust, risk, graph)
     }
 
@@ -135,6 +135,8 @@ mod integration {
         assert!(rust.contains("Process: OrderPipeline"));
         // Generated crate depends on sigil_rt
         assert!(rust.contains("use sigil_rt::Result"));
+        assert!(risk.contains("Declared Transforms") || risk.contains("confirm"));
+        assert!(risk.contains("Order") && risk.contains("Receipt"));
     }
 
     #[test]
@@ -152,6 +154,15 @@ mod integration {
         assert!(!graph.has_timeout() || graph.has_recover());
         assert!(risk.contains("Level-1"));
         assert!(rust.contains("Counter") || rust.contains("total"));
+        // Pure transform body is compiled, not residual stub identity
+        assert!(
+            rust.contains("fn add") && (rust.contains("x + 1") || rust.contains("(x + 1)")),
+            "expected compiled pure body for add; snippet missing"
+        );
+        assert!(
+            risk.contains("body present") || risk.contains("Compiled"),
+            "residual should note compiled transform"
+        );
     }
 }
 
@@ -179,7 +190,7 @@ mod gen_project {
 
         let rust = emit(&program, &graph);
         fs::write(out.join("src/lib.rs"), &rust).expect("write lib");
-        let risk = residual_risk_report(&graph);
+        let risk = residual_risk_report(&program, &graph);
         fs::write(out.join("RESIDUAL_RISK.md"), risk).expect("write risk");
 
         let rt = relative_sigil_rt_path(&out);
