@@ -1,5 +1,5 @@
-// Order pipeline: authorize → reserve inventory (timed) → charge → confirm.
-// Each timed stage has an explicit recover path. Local state tracks last order.
+// Order pipeline with explicit transform signatures.
+// authorize → reserve (timed) → charge (timed) → confirm.
 
 schema Order {
   id: String,
@@ -11,6 +11,13 @@ schema Receipt {
   id: String,
   status: String
 }
+
+transform authorize(o: Order) -> Order {}
+transform reserve(o: Order) -> Order {}
+transform release(o: Order) -> Order {}
+transform charge(o: Order) -> Order {}
+transform refund(o: Order) -> Order {}
+transform confirm(o: Order) -> Receipt {}
 
 process OrderPipeline {
   state last_order: String = "none"

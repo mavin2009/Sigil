@@ -1,5 +1,6 @@
-
 //! Frontend: parsing and AST construction.
 pub mod ast;
 
-pub use ast::{parse, Program, Schema, Process, Expr, Stmt, Tag, Span, BinOp, Literal, Type};
+pub use ast::{
+    parse, BinOp, Expr, Literal, Process, Program, Schema, Span, Stmt, Tag, TransformDecl, Type,
+};

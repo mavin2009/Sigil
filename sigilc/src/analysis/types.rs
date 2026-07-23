@@ -14,6 +14,14 @@ pub fn infer_program(program: &Program) -> (TypeEnv, TransformTypes) {
     let mut env = TypeEnv::new();
     let mut transforms = TransformTypes::new();
 
+    // Declared signatures are authoritative.
+    for t in &program.transforms {
+        transforms.insert(
+            t.name.clone(),
+            (type_name(&t.param_ty), type_name(&t.return_ty)),
+        );
+    }
+
     let schema_fields = schema_field_index(program);
 
     for process in &program.processes {
@@ -179,6 +187,9 @@ fn infer_expr_type(
             lt
         }
         Expr::Call { name, args, .. } => {
+            if let Some((in_ty, out_ty)) = transforms.get(name) {
+                return out_ty.clone();
+            }
             let in_ty = args
                 .first()
                 .map(|a| infer_expr_type(a, env, msg_ty, schema_fields, None, transforms))
@@ -197,19 +208,26 @@ fn infer_expr_type(
                     Expr::Ident { name, .. } | Expr::Call { name, .. } => name.clone(),
                     _ => "step".into(),
                 };
-                let out_ty = if i == last {
+                let mut out_ty = if i == last {
                     binding_fields
                         .map(|f| best_schema_for_fields(f, schema_fields, &cur))
                         .unwrap_or_else(|| cur.clone())
                 } else {
                     cur.clone()
                 };
-                transforms.insert(tname, (cur.clone(), out_ty.clone()));
-                // Recover fallbacks share the stage input type
+                // Do not overwrite explicit transform declarations.
+                if let Some((_, declared_out)) = transforms.get(&tname) {
+                    out_ty = declared_out.clone();
+                } else {
+                    transforms.insert(tname.clone(), (cur.clone(), out_ty.clone()));
+                }
+                // Recover fallbacks share the stage input type unless declared.
                 for tag in &step.tags {
                     if let crate::frontend::ast::Tag::Recover { with, .. } = tag {
                         if let Expr::Ident { name, .. } = with {
-                            transforms.insert(name.clone(), (cur.clone(), cur.clone()));
+                            transforms
+                                .entry(name.clone())
+                                .or_insert_with(|| (cur.clone(), cur.clone()));
                         }
                     }
                 }
@@ -230,19 +248,43 @@ mod tests {
     fn pipeline_propagates_order_and_receipt() {
         let src = include_str!("../../../examples/pipeline.sigil");
         let prog = parse(src).expect("parse");
+        assert_eq!(prog.transforms.len(), 6, "expected explicit transform decls");
         let (env, transforms) = infer_program(&prog);
         assert_eq!(env.get("order").map(String::as_str), Some("Order"));
-        // last stage result used as receipt.id — Receipt is the tighter match for {id}
-        assert!(
-            transforms.get("confirm").map(|(_, o)| o.as_str()) == Some("Receipt")
-                || env.get("receipt").map(String::as_str) == Some("Receipt")
-                || transforms.contains_key("confirm"),
-            "confirm/receipt should be typed; got env={:?} transforms={:?}",
-            env, transforms
+        assert_eq!(
+            transforms.get("confirm").map(|(i, o)| (i.as_str(), o.as_str())),
+            Some(("Order", "Receipt")),
+            "declared confirm: Order -> Receipt; got {transforms:?}"
         );
-        assert!(transforms.contains_key("authorize"));
-        assert!(transforms.contains_key("reserve"));
-        assert!(transforms.contains_key("charge"));
+        assert_eq!(
+            transforms.get("authorize").map(|(i, o)| (i.as_str(), o.as_str())),
+            Some(("Order", "Order")),
+        );
+        assert_eq!(env.get("receipt").map(String::as_str), Some("Receipt"));
+    }
+
+    #[test]
+    fn parses_transform_declarations() {
+        let src = r#"
+schema A { x: Int }
+schema B { y: Int }
+transform f(a: A) -> B {}
+process P {
+  state s: Int = 0
+  on m: A {
+    let out = m ~> f
+    s := out.y
+  }
+}
+"#;
+        let prog = parse(src).expect("parse transforms");
+        assert_eq!(prog.transforms.len(), 1);
+        assert_eq!(prog.transforms[0].name, "f");
+        let (_, transforms) = infer_program(&prog);
+        assert_eq!(
+            transforms.get("f").map(|(i, o)| (i.as_str(), o.as_str())),
+            Some(("A", "B")),
+        );
     }
 
     #[test]

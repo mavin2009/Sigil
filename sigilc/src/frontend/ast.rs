@@ -28,6 +28,17 @@ impl Span {
 pub struct Program {
     pub schemas: Vec<Schema>,
     pub processes: Vec<Process>,
+    pub transforms: Vec<TransformDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransformDecl {
+    pub name: String,
+    pub param: String,
+    pub param_ty: Type,
+    pub return_ty: Type,
+    pub body: Vec<Stmt>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +128,7 @@ pub fn parse(source: &str) -> Result<Program> {
     let mut program = Program {
         schemas: vec![],
         processes: vec![],
+        transforms: vec![],
     };
 
     for pair in pairs {
@@ -124,12 +136,36 @@ pub fn parse(source: &str) -> Result<Program> {
             match inner.as_rule() {
                 Rule::schema_def => program.schemas.push(parse_schema(inner)?),
                 Rule::process_def => program.processes.push(parse_process(inner)?),
-                Rule::EOI | Rule::transform_def | Rule::spec_def => {}
+                Rule::transform_def => program.transforms.push(parse_transform(inner)?),
+                Rule::EOI | Rule::spec_def => {}
                 r => eprintln!("skipping top-level {:?}", r),
             }
         }
     }
     Ok(program)
+}
+
+fn parse_transform(pair: pest::iterators::Pair<Rule>) -> Result<TransformDecl> {
+    let span = Span::from_pest(pair.as_span());
+    let mut inner = pair.into_inner();
+    let name = inner.next().ok_or_else(|| anyhow!("transform name"))?.as_str().to_string();
+    let param = inner.next().ok_or_else(|| anyhow!("transform param"))?.as_str().to_string();
+    let param_ty = parse_type(inner.next().ok_or_else(|| anyhow!("transform param type"))?)?;
+    let return_ty = parse_type(inner.next().ok_or_else(|| anyhow!("transform return type"))?)?;
+    let mut body = vec![];
+    for item in inner {
+        if item.as_rule() == Rule::stmt {
+            body.push(parse_stmt(item)?);
+        }
+    }
+    Ok(TransformDecl {
+        name,
+        param,
+        param_ty,
+        return_ty,
+        body,
+        span,
+    })
 }
 
 fn parse_schema(pair: pest::iterators::Pair<Rule>) -> Result<Schema> {
