@@ -185,3 +185,7 @@ assumptions; fault injection with exact message accounting.
 Not production-ready. It is a working compiler with real proofs and honest
 limits, looking for the two or three components in your system that deserve
 this treatment.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Michael Avina.
