@@ -53,12 +53,17 @@ pub fn emit(program: &Program, ir: &GraphIR) -> String {
     }
 
     let primary_ty = primary_message_type(program);
+    let (_env, transform_types) = crate::analysis::types::infer_program(program);
     let externals = collect_externals(program);
     if !externals.is_empty() {
         out.push_str("// External transforms — residual risk (bodies are stubs).\n");
-        out.push_str("// Replace with real implementations that match the schemas.\n");
+        out.push_str("// Types are propagated from schemas and field usage.\n");
         for name in &externals {
-            out.push_str(&emit_external_stub(name, &primary_ty));
+            let (in_ty, out_ty) = transform_types
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| (primary_ty.clone(), primary_ty.clone()));
+            out.push_str(&emit_external_stub(name, &in_ty, &out_ty));
             out.push('\n');
         }
     }
@@ -310,12 +315,17 @@ fn rust_type(ty: &Type) -> String {
     }
 }
 
-fn emit_external_stub(name: &str, primary_ty: &str) -> String {
-    // Prefer schema-typed stubs for the primary message type so generated
-    // pipelines type-check without fully generic identity functions.
-    format!(
-        "fn {name}(input: {primary_ty}) -> Result<{primary_ty}> {{\n    Ok(input)\n}}\n"
-    )
+fn emit_external_stub(name: &str, in_ty: &str, out_ty: &str) -> String {
+    if in_ty == out_ty {
+        format!(
+            "fn {name}(input: {in_ty}) -> Result<{out_ty}> {{\n    Ok(input)\n}}\n"
+        )
+    } else {
+        // Stage changes schema: build a default output (residual: real logic belongs here).
+        format!(
+            "fn {name}(_input: {in_ty}) -> Result<{out_ty}> {{\n    Ok({out_ty}::default())\n}}\n"
+        )
+    }
 }
 
 fn collect_externals(program: &Program) -> BTreeSet<String> {
@@ -401,7 +411,7 @@ fn emit_smoke_test(program: &Program) -> String {
     s
 }
 
-pub fn emit_cargo_toml(package_name: &str) -> String {
+pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str) -> String {
     format!(
         r#"[package]
 name = "{package_name}"
@@ -410,11 +420,26 @@ edition = "2021"
 
 [dependencies]
 tokio = {{ version = "1", features = ["time", "macros", "rt-multi-thread"] }}
-sigil_rt = {{ path = "../sigil_rt" }}
+sigil_rt = {{ path = "{sigil_rt_path}" }}
 thiserror = "1"
 
 [lib]
 path = "src/lib.rs"
 "#
     )
+}
+
+/// Compute a relative path from `out_dir` to the workspace `sigil_rt` crate.
+pub fn relative_sigil_rt_path(out_dir: &std::path::Path) -> String {
+    for rel in ["../sigil_rt", "../../sigil_rt", "../../../sigil_rt"] {
+        if out_dir.join(rel).exists() {
+            return rel.to_string();
+        }
+    }
+    // Default: nested generated/<name> under the workspace root
+    if out_dir.file_name().and_then(|s| s.to_str()) == Some("generated") {
+        "../sigil_rt".into()
+    } else {
+        "../../sigil_rt".into()
+    }
 }

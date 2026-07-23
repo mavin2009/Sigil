@@ -3,6 +3,7 @@
 pub mod ir;
 pub mod check;
 pub mod residual;
+pub mod types;
 
 pub use ir::{lower, GraphIR, Node, Edge, EffectSet};
 pub use check::level1_check;

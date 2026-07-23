@@ -8,4 +8,4 @@ pub mod backend;
 
 pub use frontend::{parse, Program, Span};
 pub use analysis::{lower, level1_check, residual_risk_report, GraphIR};
-pub use backend::{emit, emit_cargo_toml};
+pub use backend::{emit, emit_cargo_toml, relative_sigil_rt_path};

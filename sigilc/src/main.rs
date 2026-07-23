@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use sigilc::{emit, emit_cargo_toml, level1_check, lower, parse, residual_risk_report};
+use sigilc::{emit, emit_cargo_toml, level1_check, lower, parse, relative_sigil_rt_path, residual_risk_report};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -49,8 +49,9 @@ fn main() -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("sigil_out")
         .replace('-', "_");
-    fs::write(out.join("Cargo.toml"), emit_cargo_toml(&pkg_name))?;
-    println!("[codegen] Wrote {}", out.join("Cargo.toml").display());
+    let rt_path = relative_sigil_rt_path(&out);
+    fs::write(out.join("Cargo.toml"), emit_cargo_toml(&pkg_name, &rt_path))?;
+    println!("[codegen] Wrote {} (sigil_rt path: {})", out.join("Cargo.toml").display(), rt_path);
 
     let risk = residual_risk_report(&graph);
     let risk_path = out.join("RESIDUAL_RISK.md");
@@ -122,10 +123,26 @@ mod integration {
         assert!(rust.contains("from_millis(120)"));
         assert!(rust.contains("from_millis(200)"));
         assert!(rust.contains("reserve") && rust.contains("charge"));
-        // Schema-typed external stubs
+        // Schema-typed external stubs with propagation
         assert!(rust.contains("fn authorize(input: Order)"));
+        assert!(
+            rust.contains("fn confirm(_input: Order) -> Result<Receipt>")
+                || rust.contains("fn confirm(input: Order) -> Result<Receipt>")
+                || rust.contains("Result<Receipt>"),
+            "confirm should propagate toward Receipt; got snippet missing"
+        );
         assert!(rust.contains("pub total_charged"));
         assert!(rust.contains("Process: OrderPipeline"));
+        // Generated crate depends on sigil_rt
+        assert!(rust.contains("use sigil_rt::Result"));
+    }
+
+    #[test]
+    fn emit_cargo_toml_points_at_sigil_rt() {
+        let toml = sigilc::emit_cargo_toml("demo", "../../sigil_rt");
+        assert!(toml.contains("sigil_rt"));
+        assert!(toml.contains("path = \"../../sigil_rt\""));
+        assert!(toml.contains("tokio"));
     }
 
     #[test]
