@@ -87,11 +87,11 @@ pub fn residual_risk_report(ir: &GraphIR) -> String {
     };
 
     let timeout_nodes: Vec<_> = ir.nodes.iter().filter_map(|n| match n {
-        crate::ir::Node::Timeout { ms } => Some(format!("{}ms", ms)),
+        crate::ir::Node::Timeout { ms, .. } => Some(format!("{}ms", ms)),
         _ => None,
     }).collect();
     let recover_nodes: Vec<_> = ir.nodes.iter().filter_map(|n| match n {
-        crate::ir::Node::Recover { fallback } => Some(fallback.clone()),
+        crate::ir::Node::Recover { fallback, .. } => Some(fallback.clone()),
         _ => None,
     }).collect();
 

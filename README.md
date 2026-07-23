@@ -1,8 +1,8 @@
 # Sigil
 
-A language for systems that are not allowed to die.
+A language that makes whole classes of production failures extinct by construction.
 
-Sigil treats programs as living causal graphs. Data, effects, time, and failure are first-class citizens. The compiler explores possible behaviors under concurrency, latency, and faults, then certifies which classes of bugs have been made extinct.
+Programs are causal graphs: data, effects, time, and failure are first-class. The compiler checks explicit recovery paths, local state discipline, and effect tags, then reports residual risk outside the model.
 
 ## Extinct by Design (Level 1)
 

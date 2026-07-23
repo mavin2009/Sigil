@@ -1,9 +1,6 @@
-// Resilient event processor — demonstrates Sigil's core power:
-// - Explicit failure recovery with @timeout + @recover
-// - Isolated local state
-// - Causal dataflow pipelines
-// - Level-1 extinct-by-design guarantees (no shared mutability, no nulls, no unhandled timeouts)
-// - Residual risk is reported for the external transforms
+// Resilient event processor.
+// Explicit @timeout + @recover, process-local state, causal pipeline.
+// Level-1 rejects an unhandled timeout; residual risk lists only external transforms.
 
 schema Event {
   id: String,

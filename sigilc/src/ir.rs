@@ -19,8 +19,8 @@ pub struct GraphIR {
 pub enum Node {
     Input { name: String },
     Call { name: String },
-    Timeout { ms: u64 },
-    Recover { fallback: String },
+    Timeout { ms: u64, span: Option<crate::ast::Span> },
+    Recover { fallback: String, span: Option<crate::ast::Span> },
     StateWrite { slot: String },
 }
 
@@ -142,13 +142,13 @@ fn lower_pipe_step(step: &crate::ast::PipeStep, prev: usize, ir: &mut GraphIR) -
     let mut current = lower_expr(&step.expr, prev, ir);
     for tag in &step.tags {
         match tag {
-            Tag::Timeout { expr, .. } => {
+            Tag::Timeout { expr, span } => {
                 let ms = match expr {
                     Expr::Literal { value: Literal::DurationMs(m), .. } => *m,
                     _ => 0,
                 };
                 let idx = ir.nodes.len();
-                ir.nodes.push(Node::Timeout { ms });
+                ir.nodes.push(Node::Timeout { ms, span: Some(*span) });
                 ir.edges.push(Edge {
                     from: current,
                     to: idx,
@@ -156,13 +156,13 @@ fn lower_pipe_step(step: &crate::ast::PipeStep, prev: usize, ir: &mut GraphIR) -
                 });
                 current = idx;
             }
-            Tag::Recover { with, .. } => {
+            Tag::Recover { with, span } => {
                 let fallback = match with {
                     Expr::Ident { name: s, .. } => s.clone(),
                     _ => "fallback".into(),
                 };
                 let idx = ir.nodes.len();
-                ir.nodes.push(Node::Recover { fallback });
+                ir.nodes.push(Node::Recover { fallback, span: Some(*span) });
                 ir.edges.push(Edge {
                     from: current,
                     to: idx,
