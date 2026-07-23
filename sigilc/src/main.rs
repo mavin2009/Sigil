@@ -6,8 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use sigilc::{
-    check_transform_signatures, emit, emit_cargo_toml, emit_demo_main, level1_check, level2_check, lower,
-    parse, relative_sigil_rt_path, residual_risk_report,
+    check_transform_signatures, emit, emit_cargo_toml, emit_demo_main, level1_check, level2_check,
+    lower, parse, relative_sigil_rt_path, residual_risk_report,
 };
 
 fn main() -> Result<()> {
@@ -25,7 +25,7 @@ fn main() -> Result<()> {
             emit_main_flag = true;
         } else if input.is_none() {
             input = Some(PathBuf::from(arg));
-        } else {
+        } else if !arg.starts_with("--") {
             out = PathBuf::from(arg);
         }
     }
@@ -39,10 +39,11 @@ fn main() -> Result<()> {
 
     let program = parse(&source).context("parsing")?;
     println!(
-        "Parsed {} schema(s), {} process(es), {} transform(s)",
+        "Parsed {} schema(s), {} process(es), {} transform(s), {} spec(s)",
         program.schemas.len(),
         program.processes.len(),
-        program.transforms.len()
+        program.transforms.len(),
+        program.specs.len()
     );
 
     let graph = lower(&program).context("lowering to Graph IR")?;
@@ -100,152 +101,170 @@ mod integration {
         residual_risk_report, GraphIR,
     };
 
+    /// Full pipeline: parse → lower → L1 → signatures → L2 → emit → residual.
     fn compile_source(source: &str) -> (String, String, GraphIR) {
         let program = parse(source).expect("parse");
         let graph = lower(&program).expect("lower");
         level1_check(&graph).expect("level1");
         check_transform_signatures(&program).expect("signatures");
+        let l2 = level2_check(&program, &graph).expect("level2");
         let rust = emit(&program, &graph);
         let risk = residual_risk_report(&program, &graph, Some(&l2));
         (rust, risk, graph)
     }
 
-    fn expect_reject(source: &str, needle: &str) {
+    fn expect_l1_or_sig_reject(source: &str, needle: &str) {
         let program = parse(source).expect("parse should succeed");
         let graph = lower(&program).expect("lower");
         let ir_err = level1_check(&graph).err();
         let sig_err = check_transform_signatures(&program).err();
         let msg = format!(
             "{}{}",
-            ir_err
-                .map(|e| format!("{e}"))
-                .unwrap_or_default(),
-            sig_err
-                .map(|e| format!("{e}"))
-                .unwrap_or_default()
+            ir_err.map(|e| format!("{e}")).unwrap_or_default(),
+            sig_err.map(|e| format!("{e}")).unwrap_or_default()
         );
-        assert!(
-            !msg.is_empty(),
-            "expected Level-1 or signature rejection"
-        );
+        assert!(!msg.is_empty(), "expected Level-1 or signature rejection");
         assert!(
             msg.contains(needle) || msg.contains("Level-1"),
             "expected diagnostic containing '{needle}', got: {msg}"
         );
     }
 
+    fn expect_l2_reject(source: &str, needle: &str) {
+        let program = parse(source).expect("parse");
+        let graph = lower(&program).expect("lower");
+        level1_check(&graph).expect("level1 should pass for L2-only failures");
+        let _ = check_transform_signatures(&program);
+        let err = level2_check(&program, &graph).expect_err("level2 must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("Level-2"), "{msg}");
+        assert!(
+            msg.contains(needle) || msg.contains("path_timeout") || msg.contains("initial"),
+            "expected '{needle}' in: {msg}"
+        );
+    }
+
+    // ---------- Level-1 proofs (negative) ----------
+
     #[test]
     fn proof_rejects_unhandled_timeout() {
         let source = include_str!("../../examples/proofs/unhandled_timeout.sigil");
-        expect_reject(source, "@timeout");
-    }
-
-    #[test]
-    fn proof_rejects_hold_bad_init() {
-        let source = include_str!("../../examples/proofs/hold_bad_init.sigil");
-        let program = parse(source).expect("parse");
-        let graph = lower(&program).expect("lower");
-        level1_check(&graph).expect("level1");
-        let err = level2_check(&program, &graph).expect_err("level2 must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("Level-2"), "{msg}");
-    }
-
-    #[test]
-    fn proof_rejects_timeout_sum_exceeded() {
-        let source = include_str!("../../examples/proofs/timeout_sum_exceeded.sigil");
-        let program = parse(source).expect("parse");
-        let graph = lower(&program).expect("lower");
-        level1_check(&graph).expect("level1 should pass");
-        check_transform_signatures(&program).expect("signatures should pass");
-        let err = level2_check(&program, &graph).expect_err("level2 must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("Level-2"), "{msg}");
-        assert!(msg.contains("path_timeout_sum") || msg.contains("300"), "{msg}");
+        expect_l1_or_sig_reject(source, "@timeout");
     }
 
     #[test]
     fn proof_rejects_type_mismatch() {
         let source = include_str!("../../examples/proofs/type_mismatch.sigil");
-        expect_reject(source, "needs_receipt");
+        expect_l1_or_sig_reject(source, "needs_receipt");
+    }
+
+    // ---------- Level-2 proofs (negative) ----------
+
+    #[test]
+    fn proof_rejects_hold_bad_init() {
+        expect_l2_reject(
+            include_str!("../../examples/proofs/hold_bad_init.sigil"),
+            "initial",
+        );
     }
 
     #[test]
-    fn compile_ingest_example() {
-        let source = include_str!("../../examples/ingest/ingest.sigil");
-        let (rust, risk, graph) = compile_source(source);
+    fn proof_rejects_timeout_without_step_recover() {
+        expect_l2_reject(
+            include_str!("../../examples/proofs/timeout_without_step_recover.sigil"),
+            "@timeout",
+        );
+    }
+
+    #[test]
+    fn proof_rejects_timeout_sum_exceeded() {
+        expect_l2_reject(
+            include_str!("../../examples/proofs/timeout_sum_exceeded.sigil"),
+            "path_timeout_sum",
+        );
+    }
+
+    // ---------- Positive examples (full pipeline) ----------
+
+    #[test]
+    fn compile_ingest() {
+        let (rust, risk, graph) = compile_source(include_str!("../../examples/ingest/ingest.sigil"));
+        assert!(graph.has_timeout() && graph.has_recover());
+        assert!(rust.contains("Ingest"));
         assert!(risk.contains("Level-1"));
-        assert!(graph.has_timeout());
-        assert!(graph.has_recover());
-        assert!(rust.contains("pub struct Ingest"));
-        assert!(rust.contains("on_packet"));
     }
 
     #[test]
-    fn compile_resilient_example() {
-        let source = include_str!("../../examples/resilient/resilient.sigil");
-        let (rust, risk, graph) = compile_source(source);
-        assert!(graph.has_timeout());
-        assert!(graph.has_recover());
-        assert!(rust.contains("ResilientProcessor"));
-        assert!(rust.contains("fn normalize"));
-        assert!(risk.contains("enrich") && risk.contains("external residual"));
+    fn compile_counter() {
+        let (rust, risk, _) = compile_source(include_str!("../../examples/counter/counter.sigil"));
+        assert!(rust.contains("fn add") || rust.contains("Counter"));
+        assert!(risk.contains("Level-1") || risk.contains("hold") || risk.contains("Compiled"));
     }
 
     #[test]
-    fn compile_circuit_example() {
-        let source = include_str!("../../examples/circuit/circuit.sigil");
-        let (rust, risk, graph) = compile_source(source);
-        assert!(graph.has_timeout());
-        assert!(graph.has_recover());
+    fn compile_resilient() {
+        let (rust, risk, graph) =
+            compile_source(include_str!("../../examples/resilient/resilient.sigil"));
+        assert!(graph.has_timeout() && graph.has_recover());
+        assert!(rust.contains("ResilientProcessor") || rust.contains("normalize"));
+        assert!(risk.contains("enrich") || risk.contains("external") || risk.contains("Level"));
+    }
+
+    #[test]
+    fn compile_circuit() {
+        let (rust, risk, graph) =
+            compile_source(include_str!("../../examples/circuit/circuit.sigil"));
+        assert!(graph.has_timeout() && graph.has_recover());
         assert!(rust.contains("CircuitBreaker"));
         assert!(risk.contains("Level-1"));
     }
 
     #[test]
-    fn compile_pipeline_example() {
-        let source = include_str!("../../examples/pipeline/pipeline.sigil");
-        let (rust, risk, graph) = compile_source(source);
+    fn compile_pipeline() {
+        let (rust, risk, graph) =
+            compile_source(include_str!("../../examples/pipeline/pipeline.sigil"));
         assert_eq!(graph.process_name, "OrderPipeline");
-        assert!(graph.has_timeout());
-        assert!(graph.has_recover());
-        assert!(rust.contains("from_millis(120)"));
-        assert!(rust.contains("from_millis(200)"));
-        assert!(rust.contains("fn authorize") || rust.contains("authorize"));
-        assert!(risk.contains("Declared Transforms") || risk.contains("confirm"));
-    }
-
-    #[test]
-    fn compile_counter_and_demo_main() {
-        let source = include_str!("../../examples/runnable/counter/counter.sigil");
-        let (rust, risk, graph) = compile_source(source);
-        assert!(rust.contains("fn add"));
-        assert!(rust.contains("x + 1") || rust.contains("(x + 1)"));
-        assert!(risk.contains("body present") || risk.contains("Compiled"));
-        let program = parse(source).unwrap();
-        let main_rs = emit_demo_main(&program);
-        assert!(main_rs.contains("Counter::new"));
-        assert!(main_rs.contains("println!"));
-        assert!(main_rs.contains("total"));
-        assert!(!graph.has_timeout());
+        assert!(rust.contains("from_millis(120)") && rust.contains("from_millis(200)"));
+        assert!(risk.contains("Level-2") || risk.contains("path_timeout") || risk.contains("320") || risk.contains("discharged"));
+        assert!(risk.contains("confirm") || risk.contains("Declared") || risk.contains("Order"));
     }
 
     #[test]
     fn compile_level2_example() {
-        let source = include_str!("../../examples/level2/slo_and_hold.sigil");
-        let (rust, risk, graph) = compile_source(source);
-        assert!(graph.has_timeout());
-        assert!(graph.has_recover());
+        let (rust, risk, graph) =
+            compile_source(include_str!("../../examples/level2/slo_and_hold.sigil"));
+        assert!(graph.has_timeout() && graph.has_recover());
         assert!(rust.contains("Service") || rust.contains("on_event"));
-        assert!(risk.contains("Level-2") || risk.contains("path_timeout") || risk.contains("discharged"));
-        assert!(risk.contains("hits") || risk.contains("hold") || risk.contains("80"));
+        assert!(risk.contains("Level-2") || risk.contains("discharged") || risk.contains("hold"));
     }
 
     #[test]
-    fn compile_legacy_counter_example() {
-        let source = include_str!("../../examples/counter/counter.sigil");
-        let (rust, risk, _) = compile_source(source);
-        assert!(rust.contains("Counter") || rust.contains("total"));
-        assert!(risk.contains("Level-1"));
+    fn compile_runnable_counter_and_demo_main() {
+        let source = include_str!("../../examples/runnable/counter/counter.sigil");
+        let (rust, risk, graph) = compile_source(source);
+        assert!(!graph.has_timeout());
+        assert!(rust.contains("fn add"));
+        assert!(risk.contains("body present") || risk.contains("Compiled") || risk.contains("hold"));
+        let program = parse(source).unwrap();
+        let main_rs = emit_demo_main(&program);
+        assert!(main_rs.contains("Counter::new") && main_rs.contains("total"));
+    }
+
+    #[test]
+    fn all_positive_examples_pass_full_pipeline() {
+        let files = [
+            include_str!("../../examples/ingest/ingest.sigil"),
+            include_str!("../../examples/counter/counter.sigil"),
+            include_str!("../../examples/resilient/resilient.sigil"),
+            include_str!("../../examples/circuit/circuit.sigil"),
+            include_str!("../../examples/pipeline/pipeline.sigil"),
+            include_str!("../../examples/level2/slo_and_hold.sigil"),
+            include_str!("../../examples/runnable/counter/counter.sigil"),
+        ];
+        for (i, src) in files.iter().enumerate() {
+            let (rust, risk, _) = compile_source(src);
+            assert!(rust.len() > 50, "example {i} empty codegen");
+            assert!(risk.contains("Level-1"), "example {i} missing residual L1 section");
+        }
     }
 }

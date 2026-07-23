@@ -299,6 +299,21 @@ process OrderPipeline {
 
 See `examples/pipeline/pipeline.sigil` and the other directories under `examples/` for full programs.
 
+## Testing
+
+```bash
+cargo test -p sigilc
+```
+
+Coverage includes:
+
+- **Level-1:** unhandled timeout, nonlocal state write, transform signature mismatch
+- **Level-2:** path_timeout_sum overflow, hold bad init, per-step recover (when L1 process-global pairing is insufficient)
+- **Positive examples:** ingest, counter, resilient, circuit, pipeline, level2, runnable/counter (full pipeline)
+- **Codegen:** demo main emission, residual report sections
+
+Negative programs live under `examples/proofs/`.
+
 ## Status
 
 v0.2 — Modular compiler (frontend / analysis / backend), declared transform signatures, pure transform bodies, signature-checked pipelines, residual risk reporting, multi-stage examples in dedicated subdirectories.

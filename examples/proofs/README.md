@@ -9,6 +9,7 @@ Negative and positive programs that document Level-1 bug prevention.
 | `unhandled_timeout.sigil` | `@timeout` without `@recover` | Level-1 violation … matching @recover |
 | `type_mismatch.sigil` | Pipeline stage type mismatch | expects input type Receipt … has type Order |
 | `hold_bad_init.sigil` | `hold total >= 0` with init -1 | Level-2 initial value falsifies hold |
+| `timeout_without_step_recover.sigil` | Timed step without same-step recover (L1 may pass) | Level-2 per-step totality |
 | `timeout_sum_exceeded.sigil` | path_timeout_sum over SLO | Level-2 path_timeout_sum … |
 
 ```bash

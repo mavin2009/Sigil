@@ -617,4 +617,18 @@ spec Bad {
         assert_eq!(report.path_timeout_sum_ms, 80);
         assert!(report.discharged.iter().any(|d| d.contains("hits") || d.contains("hold")));
     }
+
+    #[test]
+    fn per_step_recover_required_even_if_process_has_recover() {
+        let src = include_str!("../../../examples/proofs/timeout_without_step_recover.sigil");
+        let prog = parse(src).expect("parse");
+        let ir = lower(&prog).expect("lower");
+        // Level-1 may pass (global has recover)
+        let _ = crate::analysis::check::level1_check(&ir);
+        let err = level2_check(&prog, &ir).expect_err("level2 must require per-step recover");
+        let msg = format!("{err}");
+        assert!(msg.contains("Level-2"), "{msg}");
+        assert!(msg.contains("@timeout") || msg.contains("same step") || msg.contains("Recover"), "{msg}");
+    }
+
 }

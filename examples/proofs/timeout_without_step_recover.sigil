@@ -1,0 +1,20 @@
+// PROOF (negative): process has a recover somewhere, but one timed step lacks @recover.
+// Level-1 may pass (process-global pairing). Level-2 must reject (per-step totality).
+
+schema Msg {
+  id: String
+}
+
+transform work(m: Msg) -> Msg {}
+transform other(m: Msg) -> Msg {}
+transform fb(m: Msg) -> Msg {}
+
+process P {
+  state last: String = "none"
+
+  on msg: Msg {
+    let a = msg ~> work @timeout(10.ms)
+    let b = a ~> other @timeout(5.ms) @recover(with: fb)
+    last := b.id
+  }
+}
