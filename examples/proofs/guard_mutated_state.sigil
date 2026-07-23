@@ -1,0 +1,28 @@
+// MUST FAIL --level 4.
+//
+// This program is a soundness regression test, not a style example. The
+// `when` guard reads `gate`, which is MUTATED between the conditional
+// counter and the send. Tracing one message: gate = 0, so the `if` takes
+// the ELSE branch and cnt stays 0; then gate := 1; then the guard `gate > 0`
+// is TRUE and the message is forwarded. Result: got = 1, cnt = 0.
+//
+// An earlier version of the guard-correlation logic matched the `if` and the
+// `when` syntactically and PROVED `Down.got <= Up.cnt`. The generated code
+// then measured got = 40 against cnt = 32 — a proof contradicted by the
+// program it described. Guard correlation is now only applied when the
+// guard cannot change within the handler.
+schema M { id: String }
+process Up {
+  state gate: Int = 0
+  state cnt: Int = 0
+  on m: M {
+    cnt := cnt + if gate > 0 { 1 } else { 0 }
+    gate := 1
+    send m to Down when gate > 0
+  }
+}
+process Down {
+  state got: Int = 0
+  on m: M { got := got + 1 }
+}
+spec S { hold Down.got <= Up.cnt }

@@ -539,6 +539,106 @@ fn step_span_of(step: &crate::frontend::ast::PipeStep) -> crate::frontend::ast::
     }
 }
 
+/// A recovery target must be able to stand in for the stage it recovers.
+///
+/// `@recover(with: f)` substitutes `f` for a failed stage, so `f` must accept
+/// what the stage accepted and produce what the stage produced. Without this
+/// the mismatch surfaced as a type error in the GENERATED crate rather than
+/// in the source — the compiler accepted a program it could not compile.
+pub fn check_recover_signatures(program: &Program) -> Result<()> {
+    use crate::analysis::types::type_name;
+    use std::collections::BTreeMap;
+
+    let sigs: BTreeMap<&str, (String, String)> = program
+        .transforms
+        .iter()
+        .map(|t| {
+            (
+                t.name.as_str(),
+                (type_name(&t.param_ty), type_name(&t.return_ty)),
+            )
+        })
+        .collect();
+
+    for process in &program.processes {
+        for handler in &process.handlers {
+            for stmt in &handler.body {
+                let expr = match stmt {
+                    Stmt::Let { expr, .. }
+                    | Stmt::Assign { expr, .. }
+                    | Stmt::Send { expr, .. }
+                    | Stmt::Expr { expr, .. } => expr,
+                };
+                walk_recover_sigs(expr, &sigs, &process.name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn walk_recover_sigs(
+    expr: &Expr,
+    sigs: &std::collections::BTreeMap<&str, (String, String)>,
+    process: &str,
+) -> Result<()> {
+    match expr {
+        Expr::Pipeline { base, steps, .. } => {
+            walk_recover_sigs(base, sigs, process)?;
+            for step in steps {
+                let stage = match &step.expr {
+                    Expr::Ident { name, .. } | Expr::Call { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                let Some(stage) = stage else { continue };
+                let Some((stage_in, stage_out)) = sigs.get(stage) else { continue };
+                for tag in &step.tags {
+                    let Tag::Recover { with, span } = tag else { continue };
+                    let fb = match with {
+                        Expr::Ident { name, .. } | Expr::Call { name, .. } => name.as_str(),
+                        _ => continue,
+                    };
+                    let Some((fb_in, fb_out)) = sigs.get(fb) else {
+                        bail!(
+                            "Level-1 violation in process '{process}' at bytes {}..{}: \
+                             recovery target '{fb}' for stage '{stage}' is not a declared \
+                             transform",
+                            span.start,
+                            span.end
+                        );
+                    };
+                    if fb_in != stage_in || fb_out != stage_out {
+                        bail!(
+                            "Level-1 violation in process '{process}' at bytes {}..{}: \
+                             recovery target '{fb}' has signature `{fb_in} -> {fb_out}` but \
+                             must stand in for stage '{stage}', which is \
+                             `{stage_in} -> {stage_out}`",
+                            span.start,
+                            span.end
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_recover_sigs(lhs, sigs, process)?;
+            walk_recover_sigs(rhs, sigs, process)
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_recover_sigs(cond, sigs, process)?;
+            walk_recover_sigs(then_branch, sigs, process)?;
+            walk_recover_sigs(else_branch, sigs, process)
+        }
+        Expr::SchemaLit { fields, .. } => {
+            for (_, fe) in fields {
+                walk_recover_sigs(fe, sigs, process)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Numeric type agreement in arithmetic and comparisons.
 ///
 /// Sigil does not coerce between `Int` and `Float`: silent widening is how
@@ -666,14 +766,34 @@ fn check_expr_numeric(
                 expr_ty(lhs, env, schemas, sigs),
                 expr_ty(rhs, env, schemas, sigs),
             );
-            if let (Some(lt), Some(rt)) = (lt, rt) {
+            if let (Some(lt), Some(rt)) = (lt.clone(), rt.clone()) {
                 let numeric = |t: &str| t == "Int" || t == "Float";
+                let arithmetic = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+                let ordering = matches!(op, BinOp::Le | BinOp::Ge | BinOp::Lt | BinOp::Gt);
+                let op_s = match op {
+                    BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
+                    BinOp::Div => "/", BinOp::Le => "<=", BinOp::Ge => ">=",
+                    BinOp::Lt => "<", BinOp::Gt => ">", BinOp::Eq => "==",
+                };
+                // Arithmetic and ordering are defined only on numbers.
+                if (arithmetic || ordering) && (!numeric(&lt) || !numeric(&rt)) {
+                    bail!(
+                        "Level-1 violation in process '{process}' at bytes {}..{}: \
+                         `{lt} {op_s} {rt}` — `{op_s}` is defined only on Int and Float",
+                        span.start,
+                        span.end
+                    );
+                }
+                // Equality needs both sides to be the same type.
+                if matches!(op, BinOp::Eq) && lt != rt {
+                    bail!(
+                        "Level-1 violation in process '{process}' at bytes {}..{}: \
+                         cannot compare `{lt}` with `{rt}`",
+                        span.start,
+                        span.end
+                    );
+                }
                 if numeric(&lt) && numeric(&rt) && lt != rt {
-                    let op_s = match op {
-                        BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
-                        BinOp::Div => "/", BinOp::Le => "<=", BinOp::Ge => ">=",
-                        BinOp::Lt => "<", BinOp::Gt => ">", BinOp::Eq => "==",
-                    };
                     bail!(
                         "Level-1 violation in process '{process}' at bytes {}..{}: \
                          `{lt} {op_s} {rt}` mixes numeric types — Sigil does not coerce \

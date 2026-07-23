@@ -11,7 +11,7 @@ pub mod backend;
 pub use frontend::{parse, Program, Span};
 pub use analysis::{
     input_preconditions, level3_prove, level4_prove, Level3Report, Level4Report,
-    check_failure_paths, check_handler_wellformedness, check_numeric_types, fallible_fallbacks, check_transform_purity, check_transform_signatures, level2_check, level_banner, level1_check, lower, residual_risk_report,
+    check_failure_paths, check_handler_wellformedness, check_numeric_types, check_recover_signatures, fallible_fallbacks, check_transform_purity, check_transform_signatures, level2_check, level_banner, level1_check, lower, residual_risk_report,
     run_checks, AssuranceLevel, CheckOutcome, GraphIR, Level2Report, derive_topology, Topology,
 };
 pub use diagnostics::{line_col, render as render_diagnostic};

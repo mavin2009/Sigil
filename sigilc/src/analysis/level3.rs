@@ -390,6 +390,65 @@ fn same_expr(a: &Expr, b: &Expr) -> bool {
     }
 }
 
+/// Free names read by an expression (identifiers and field-access bases).
+fn free_names(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
+    match e {
+        Expr::Ident { name, .. } => {
+            out.insert(name.clone());
+        }
+        Expr::FieldAccess { base, .. } => {
+            out.insert(base.clone());
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            free_names(lhs, out);
+            free_names(rhs, out);
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            free_names(cond, out);
+            free_names(then_branch, out);
+            free_names(else_branch, out);
+        }
+        Expr::SchemaLit { fields, .. } => {
+            for (_, fe) in fields {
+                free_names(fe, out);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                free_names(a, out);
+            }
+        }
+        Expr::Pipeline { base, steps, .. } => {
+            free_names(base, out);
+            for st in steps {
+                free_names(&st.expr, out);
+            }
+        }
+        Expr::Literal { .. } => {}
+    }
+}
+
+/// Is a `when` guard stable across the whole handler body?
+///
+/// Correlating a guard with an earlier `if` is only valid when the guard has
+/// the SAME value at both points. A guard that reads state the handler also
+/// assigns does not: the `if` sees the old value and the guard sees the new
+/// one. Treating them as the same condition proved a false invariant — see
+/// examples/proofs/guard_mutated_state.sigil, which is exactly that shape.
+fn guard_is_stable(guard: &Expr, handler: &crate::frontend::ast::OnHandler) -> bool {
+    let mut names = std::collections::BTreeSet::new();
+    free_names(guard, &mut names);
+    let assigned: std::collections::BTreeSet<&str> = handler
+        .body
+        .iter()
+        .filter_map(|st| match st {
+            Stmt::Assign { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    !names.iter().any(|n| assigned.contains(n.as_str()))
+}
+
 /// Under an assumed condition, an `if` testing that same condition can only
 /// take its then-branch. Interval arithmetic alone cannot see this (a closed
 /// domain cannot represent a strict bound), but the correlation is exactly
@@ -428,6 +487,9 @@ pub(crate) fn handler_delta_under(
     guard: Option<&Expr>,
     why: &mut Vec<String>,
 ) -> Option<Interval> {
+    // A guard may only be assumed if it cannot change between the point the
+    // conditional counter is evaluated and the point the send is reached.
+    let guard = guard.filter(|g| guard_is_stable(g, handler));
     let narrowed;
     let lets = match guard {
         Some(g) => {

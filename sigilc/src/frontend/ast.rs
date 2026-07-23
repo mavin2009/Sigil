@@ -219,7 +219,68 @@ pub enum Literal {
     DurationMs(u64),
 }
 
+/// Maximum nesting of `(`/`{`/`[` accepted in a source file.
+///
+/// The parser is recursive descent (pest's generated code recurses during
+/// parsing, before any AST is built), so sufficiently nested input exhausts
+/// the stack and aborts the process. An abort is a denial-of-service, not a
+/// diagnostic, so depth is bounded up front and reported cleanly. 64 is far
+/// beyond any legible program and far below the observed failure point.
+pub const MAX_NESTING_DEPTH: usize = 64;
+
+/// Reject pathologically nested input before it reaches the parser.
+fn check_nesting_depth(source: &str) -> Result<()> {
+    let mut depth: usize = 0;
+    let mut max_depth: usize = 0;
+    let mut deepest_byte: usize = 0;
+    let mut in_string = false;
+    let mut in_comment = false;
+    let mut prev = '\0';
+
+    for (i, ch) in source.char_indices() {
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+            }
+            prev = ch;
+            continue;
+        }
+        if in_string {
+            if ch == '"' && prev != '\\' {
+                in_string = false;
+            }
+            prev = ch;
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '/' if prev == '/' => in_comment = true,
+            '(' | '{' | '[' => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                    deepest_byte = i;
+                }
+                if depth > MAX_NESTING_DEPTH {
+                    bail!(
+                        "input nests brackets {depth} deep at bytes {i}..{}, exceeding the \
+                         limit of {MAX_NESTING_DEPTH} — deeply nested input would exhaust \
+                         the parser stack",
+                        i + 1
+                    );
+                }
+            }
+            ')' | '}' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        prev = ch;
+    }
+    let _ = (max_depth, deepest_byte);
+    Ok(())
+}
+
 pub fn parse(source: &str) -> Result<Program> {
+    check_nesting_depth(source)?;
     let pairs = SigilParser::parse(Rule::file, source)
         .map_err(|e| anyhow!("parse error:\n{}", e))?;
 

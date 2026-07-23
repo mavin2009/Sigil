@@ -8,7 +8,7 @@
 //! automatic: skipping a level never fails the build silently — every skipped
 //! guarantee is surfaced in the residual-risk report.
 
-use crate::analysis::check::{check_failure_paths, check_handler_wellformedness, check_numeric_types, check_transform_purity, check_transform_signatures, fallible_fallbacks, level1_check};
+use crate::analysis::check::{check_failure_paths, check_handler_wellformedness, check_numeric_types, check_recover_signatures, check_transform_purity, check_transform_signatures, fallible_fallbacks, level1_check};
 use crate::analysis::ir::GraphIR;
 use crate::analysis::level2::{level2_check, Level2Report};
 use crate::analysis::topology::derive_topology;
@@ -92,6 +92,7 @@ pub fn run_checks(program: &Program, irs: &[GraphIR], level: AssuranceLevel) -> 
         }
         check_handler_wellformedness(program)?;
         check_numeric_types(program)?;
+        check_recover_signatures(program)?;
         check_transform_signatures(program)?;
         check_failure_paths(program)?;
         check_transform_purity(program)?;

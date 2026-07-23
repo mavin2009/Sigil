@@ -352,6 +352,116 @@ mod integration {
         assert!(rust.contains("note_recovery(\"post\")"));
     }
 
+    /// Metamorphic property, from fuzzing: if the compiler ACCEPTS a
+    /// program, the Rust it emits must compile. Five of eight fuzz-generated
+    /// programs violated this before these checks existed.
+    #[test]
+    fn accepted_programs_are_well_typed() {
+        use sigilc::{check_numeric_types, check_recover_signatures};
+
+        // Arithmetic and ordering are defined only on numbers. Previously
+        // `true * true` and `19.7 * "s"` were accepted and emitted Rust that
+        // rustc rejected.
+        for (src, needle) in [
+            ("schema S{f:Int} process P{ state c: Int = 0 on m: S { c := c + (true * true) } }",
+             "defined only on Int and Float"),
+            ("schema S{f:Int} process P{ state c: Int = 0 on m: S { c := c + (19.7 * 3) } }",
+             "mixes numeric types"),
+        ] {
+            let program = parse(src).expect("parse");
+            let err = check_numeric_types(&program).expect_err("must reject");
+            assert!(format!("{err}").contains(needle), "got: {err}");
+        }
+
+        // A recovery target substitutes for the stage it recovers, so their
+        // signatures must match.
+        let bad = "schema A{x:Int}
+schema B{y:Int}
+transform f(a:A)->A{}
+transform bad(b:B)->B{b}
+process P{ state c: Int = 0 on m: A { let z = m ~> f @recover(with: bad)
+ c := c + 1 } }
+";
+        let program = parse(bad).expect("parse");
+        let err = check_recover_signatures(&program).expect_err("mismatched recovery");
+        assert!(format!("{err}").contains("must stand in for stage"), "got: {err}");
+
+        // A matching recovery target is accepted.
+        let good = bad.replace("transform bad(b:B)->B{b}", "transform bad(a:A)->A{a}");
+        let program = parse(&good).expect("parse");
+        check_recover_signatures(&program).expect("matching signature is fine");
+    }
+
+    /// Soundness regressions found by auditing and fuzzing the compiler.
+    ///
+    /// Both of these were real defects, not hypotheticals: the first proved a
+    /// false invariant, the second aborted the process.
+    #[test]
+    fn soundness_and_robustness_regressions() {
+        use sigilc::level4_prove;
+
+        // 1. Guard correlation must not assume a condition that the handler
+        //    itself mutates. This program forwards a message while its
+        //    counter stays put, so `got <= cnt` is FALSE and must be rejected.
+        let src = include_str!("../../examples/proofs/guard_mutated_state.sigil");
+        let program = parse(src).expect("parse");
+        let err = level4_prove(&program)
+            .expect_err("a guard over mutated state must not be correlated");
+        assert!(format!("{err}").contains("GAP fails"), "got: {err}");
+
+        // ...while a guard over an immutable binding still correlates.
+        let stable = r#"
+schema M { id: String, n: Int }
+process Up {
+  state kept: Int = 0
+  on m: M {
+    kept := kept + if m.n > 0 { 1 } else { 0 }
+    send m to Down when m.n > 0
+  }
+}
+process Down {
+  state got: Int = 0
+  on m: M { got := got + 1 }
+}
+spec S { hold Down.got <= Up.kept }
+"#;
+        let program = parse(stable).expect("parse");
+        level4_prove(&program).expect("a stable guard must still correlate");
+
+        // 2. Deeply nested input must produce a diagnostic, not a stack
+        //    overflow. The parser recurses during parsing, so depth is
+        //    bounded before the source reaches it.
+        let deep = format!(
+            "schema S {{ f0: Int }}
+process P {{
+  state c: Int = 0
+  on m: S {{
+    c := {}1{}
+  }}
+}}
+",
+            "(".repeat(500),
+            ")".repeat(500)
+        );
+        let err = parse(&deep).expect_err("500-deep nesting must be rejected");
+        assert!(format!("{err}").contains("nests brackets"), "got: {err}");
+
+        // Real programs are nowhere near the limit.
+        let ok = format!(
+            "schema S {{ f0: Int }}
+process P {{
+  state c: Int = 0
+  on m: S {{
+    c := {}1{}
+  }}
+}}
+",
+            "(".repeat(20),
+            ")".repeat(20)
+        );
+        parse(&ok).expect("ordinary nesting must still parse");
+    }
+
     /// Hardening of the generated crate against the failure modes that are
     /// hard to think of: unsafe, silent integer overflow, and hostile floats.
     #[test]
