@@ -126,23 +126,26 @@ fn best_schema_for_fields(
     if fields.is_empty() {
         return preferred.to_string();
     }
-    let mut best: Option<(usize, String)> = None;
+    // Candidates: (extra_fields, is_preferred, name). Lower extra is better.
+    // On a tie, prefer a *non*-preferred schema so terminal stages can shift
+    // from the message type to a result schema (Order → Receipt, Telemetry → Metrics).
+    let mut best: Option<(usize, bool, String)> = None;
     for (schema, sfields) in schema_fields {
         if fields.is_subset(sfields) {
-            // Prefer tighter schemas (fewer extra fields) when multiple match.
             let extra = sfields.len() - fields.len();
-            let score = extra; // lower is better
-            match &best {
-                None => best = Some((score, schema.clone())),
-                Some((b, _)) if score < *b => best = Some((score, schema.clone())),
-                Some((b, name)) if score == *b && schema == preferred => {
-                    best = Some((score, name.clone()));
-                }
-                _ => {}
+            let is_pref = schema == preferred;
+            let take = match &best {
+                None => true,
+                Some((b_extra, b_pref, _)) if extra < *b_extra => true,
+                Some((b_extra, b_pref, _)) if extra == *b_extra && *b_pref && !is_pref => true,
+                _ => false,
+            };
+            if take {
+                best = Some((extra, is_pref, schema.clone()));
             }
         }
     }
-    best.map(|(_, s)| s).unwrap_or_else(|| preferred.to_string())
+    best.map(|(_, _, s)| s).unwrap_or_else(|| preferred.to_string())
 }
 
 fn infer_expr_type(
@@ -247,8 +250,15 @@ mod tests {
         let src = include_str!("../../../examples/ingest.sigil");
         let prog = parse(src).expect("parse");
         let (env, transforms) = infer_program(&prog);
-        // m is used as m.id — both Telemetry and Metrics have id; Metrics is tighter if only id
-        let _ = (env, transforms);
-        assert!(true);
+        assert_eq!(
+            env.get("m").map(String::as_str),
+            Some("Metrics"),
+            "m uses .value (Metrics-only); env={env:?}"
+        );
+        assert_eq!(
+            transforms.get("extract").map(|(_, o)| o.as_str()),
+            Some("Metrics"),
+            "extract should output Metrics; transforms={transforms:?}"
+        );
     }
 }
