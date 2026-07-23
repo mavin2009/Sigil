@@ -8,6 +8,7 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct GraphIR {
     pub process_name: String,
+    pub process_span: Option<crate::ast::Span>,
     pub local_states: Vec<String>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -49,6 +50,7 @@ impl GraphIR {
 pub fn lower(program: &Program) -> Result<GraphIR> {
     let mut ir = GraphIR {
         process_name: String::new(),
+        process_span: None,
         local_states: vec![],
         nodes: vec![],
         edges: vec![],
@@ -57,6 +59,7 @@ pub fn lower(program: &Program) -> Result<GraphIR> {
 
     for proc in &program.processes {
         ir.process_name = proc.name.clone();
+        ir.process_span = Some(proc.span);
         for st in &proc.states {
             ir.local_states.push(st.name.clone());
         }
