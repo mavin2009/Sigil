@@ -311,7 +311,7 @@ send done to Audit broadcast             // every shard gets a clone
 | Routing | Behaviour |
 | ------- | --------- |
 | default | round-robin across the destination's shards |
-| `by <key>` | hash the key — the same key always reaches the same shard, so per-key ordering and shard-local state stay coherent |
+| `by <key>` | use the versioned stable hash — the same key and shard count select the same shard on every supported platform |
 | `broadcast` | deliver a clone to every shard |
 
 The compiler derives the whole topology from these statements and checks:
@@ -322,6 +322,21 @@ The compiler derives the whole topology from these statements and checks:
   deadlock
 - routing keys are hashable: `Float` keys are rejected, because float
   hashing is not a stable shard function
+
+The routing encoding and FNV-1a hash are versioned in `SIGIL_BUILD.json`.
+Changing the version or shard count is a state-placement migration; a rolling
+deployment must not mix those configurations for one affinity-sharded fleet.
+Routing-hash version 1 starts from FNV offset
+`14695981039346656037`, applies FNV-1a with prime `1099511628211`, and hashes
+the following type tag followed by the canonical bytes:
+
+| Sigil key type | Tag | Canonical bytes |
+| -------------- | --- | --------------- |
+| `Int` | `0x01` | signed `i64`, eight-byte little-endian |
+| `Bool` | `0x02` | `0x00` or `0x01` |
+| `String`, `UUID` | `0x03` | UTF-8 bytes |
+| `Bytes` | `0x04` | bytes unchanged |
+| `Duration` | `0x05` | `u64` seconds then `u32` nanoseconds, both little-endian |
 
 Types are inferred locally within a handler, never from a program-global
 environment, so identically-named bindings in different processes cannot

@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 
 pub const GENERATED_ABI_VERSION: u32 = 1;
 pub const RESIDUAL_RISK_SCHEMA_VERSION: u32 = 1;
+pub const ROUTING_HASH_VERSION: u32 = 1;
 
 fn json_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
@@ -85,6 +86,14 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     out.push_str("//     fail-stop: Tokio reports the task panic through its JoinHandle.\n");
     out.push_str("#![forbid(unsafe_code)]\n");
     out.push_str("#![deny(clippy::mem_forget)]\n\n");
+    out.push_str(&format!(
+        "// Refuse a runtime whose affinity-shard placement contract differs\n\
+         // from the compiler that generated this crate.\n\
+         const _: () = assert!(\n\
+             sigil_rt::ROUTING_HASH_VERSION == {ROUTING_HASH_VERSION},\n\
+             \"sigil_rt routing hash is incompatible with this generated crate\",\n\
+         );\n\n"
+    ));
     out.push_str("//\n");
     out.push_str(&format!("// Process: {}\n", ir.process_name));
     out.push_str(&format!(
@@ -1942,6 +1951,7 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
     }
 
     let package_name = cargo_package_name(package_name);
+    let runtime_version = env!("CARGO_PKG_VERSION");
     let sigil_rt_path = sigil_rt_path
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -1954,7 +1964,7 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
         ""
     };
     format!(
-        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.85\"\n\n[package.metadata.sigil]\ngenerated-abi = {GENERATED_ABI_VERSION}\nresidual-risk-schema = {RESIDUAL_RISK_SCHEMA_VERSION}\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\ntracing = {{ version = \"0.1\", optional = true }}\n\n[features]\ndefault = []\n# Emits a tracing span per handler invocation. Off by default so the\n# generated crate adds no dependency you did not ask for.\ntracing = [\"dep:tracing\"]\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
+        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.85\"\n\n[package.metadata.sigil]\ngenerated-abi = {GENERATED_ABI_VERSION}\nresidual-risk-schema = {RESIDUAL_RISK_SCHEMA_VERSION}\nrouting-hash = {ROUTING_HASH_VERSION}\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ version = \"={runtime_version}\", path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\ntracing = {{ version = \"0.1\", optional = true }}\n\n[features]\ndefault = []\n# Emits a tracing span per handler invocation. Off by default so the\n# generated crate adds no dependency you did not ask for.\ntracing = [\"dep:tracing\"]\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
     )
 }
 

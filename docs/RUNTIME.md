@@ -142,8 +142,10 @@ Shutdown ordering is where hand-written actor systems deadlock. Here it is
 derived from the graph the compiler already proved acyclic.
 
 `Router<H>` lives inside a single actor's task, so Sigil's round-robin and
-hashing logic needs no atomics or locks. `Router::new` rejects an empty shard
-set as a typed configuration error.
+hashing logic needs no atomics or locks. Key routing uses the versioned
+`StableRouteKey` encoding, so a key and shard count select the same shard
+across supported platforms. `Router::new` rejects an empty shard set as a
+typed configuration error.
 
 ## sigil_rt
 

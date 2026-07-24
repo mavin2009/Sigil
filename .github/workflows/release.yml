@@ -19,8 +19,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
-        with:
-          toolchain: 1.97.0
       - run: cargo test --workspace --all-targets --locked
       - run: cargo build --workspace --release --locked
       - name: Generate CycloneDX SBOMs

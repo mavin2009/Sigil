@@ -25,7 +25,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
         with:
-          toolchain: 1.97.0
           components: clippy,rustfmt,llvm-tools-preview
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -66,13 +65,15 @@ jobs:
         toolchain: [1.85.0, stable]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
-        with:
-          toolchain: ${{ matrix.toolchain }}
+      - name: Install matrix toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
       - run: cargo test --workspace --all-targets --locked
       - name: Compile every positive generated example with both feature sets
         shell: bash
@@ -86,8 +87,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
-        with:
-          toolchain: 1.97.0
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo audit --deny warnings
@@ -101,10 +100,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
-        with:
-          toolchain: nightly-2025-11-22
-          components: miri
+      - name: Install pinned nightly with Miri
+        run: rustup toolchain install nightly-2025-11-22 --profile minimal --component miri --no-self-update
       - name: Loom lifecycle and supervisor models
         run: cargo +nightly-2025-11-22 test -p sigil_rt --test loom_lifecycle --locked
       - name: Runtime under Miri
@@ -117,9 +114,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
-        with:
-          toolchain: nightly-2025-11-22
+      - name: Install pinned fuzzing nightly
+        run: rustup toolchain install nightly-2025-11-22 --profile minimal --no-self-update
       - run: cargo +nightly-2025-11-22 install cargo-fuzz --version 0.13.2 --locked
       - name: Coverage-guided smoke campaigns
         run: |
@@ -136,8 +132,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
-        with:
-          toolchain: 1.97.0
       - name: Mutation test the proof core
         run: |
           cargo install cargo-mutants --version 27.1.0 --locked

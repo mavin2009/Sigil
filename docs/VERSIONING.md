@@ -70,6 +70,7 @@ Not all of the surface deserves the same guarantee.
 | ---- | ------- | --------- |
 | **Stable** | Level 1 checks; `schema`, `transform`, `process`, `on`, `send`, effect tags; `SigilError`, `ActorStats` | semver as above |
 | **Stable** | Level 2 budgets; Level 3/4 obligations as documented in [ASSURANCE.md](ASSURANCE.md) | semver, plus the proof-breaking policy |
+| **Stable** | Routing hash version and built-in key encodings | version change requires an explicit state-placement migration |
 | **Provisional** | The provers' *precision* — which valid programs they can discharge | may improve in MINOR; a program that failed may start passing |
 | **Unstable** | Generated code shape, diagnostic wording, `topology.mmd` layout, demo driver | may change in PATCH |
 

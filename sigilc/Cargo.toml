@@ -25,3 +25,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1.5"
+# Generated-crate checks run offline and exercise the optional tracing
+# feature, so cache its default attribute macro as part of the test graph.
+tracing = "0.1"
+sigil_rt = { version = "=0.7.0", path = "../sigil_rt" }

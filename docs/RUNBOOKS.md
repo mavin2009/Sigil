@@ -32,7 +32,8 @@ events are retained with the deployment.
 2. If the edge is `@block`, throttle admission before producers accumulate.
 3. If it is `@shed`/`@deadline`, confirm the loss is within the product's
    declared policy and that downstream inequalities still hold.
-4. Scale shards only after validating affinity/order requirements and repeat
+4. Treat a shard-count or `routing_hash` change as a state-placement
+   migration. Never mix versions in one affinity-sharded fleet, and repeat
    the bounded soak test with production message sizes.
 
 ## Partial shutdown

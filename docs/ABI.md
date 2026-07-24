@@ -6,8 +6,8 @@ Sigil 0.7 emits generated ABI version **1** and residual-risk schema version
 Every generation transaction publishes:
 
 - `SIGIL_BUILD.json`: compiler/language/runtime versions, ABI versions, MSRV,
-  verification toolchain, source SHA-256, workspace lockfile SHA-256, and
-  runtime path;
+  verification toolchain, routing-hash version, source SHA-256, workspace
+  lockfile SHA-256, and runtime path;
 - `SIGIL_EFFECTS.json`: stable, machine-readable foreign-effect contracts;
 - `RESIDUAL_RISK.json`: assurance level and owned residual items;
 - `RESIDUAL_RISK.md`: the human review form of the same operational boundary.
@@ -15,10 +15,18 @@ Every generation transaction publishes:
 Golden v1 fixtures live under `sigilc/tests/fixtures/abi_v1` and are checked
 by `artifact_compatibility.rs`.
 
+Generated manifests require the exact matching `sigil_rt` release as well as
+the recorded local path. Generated Rust also contains a compile-time check of
+`sigil_rt::ROUTING_HASH_VERSION`, so a mismatched routing contract fails the
+build before it can place messages on different shards.
+
 ## Compatibility policy
 
 - Adding an optional JSON field is backward-compatible within a schema
   version.
+- A routing-hash version change is a state-placement migration even when the
+  JSON schema and generated Rust ABI versions do not change. Mixed versions
+  must never serve the same affinity-sharded actor fleet.
 - Removing, renaming, changing the type/meaning of a field, or changing
   generated public Rust interfaces requires a version increment.
 - Readers must reject an unknown major integer rather than guessing.

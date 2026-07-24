@@ -10,6 +10,7 @@ use sigilc::{
     emit, emit_demo_main, emit_effect_contracts, level_banner, lower, parse,
     relative_sigil_rt_path, residual_risk_report, run_checks, write_generated_crate,
     AssuranceLevel, GeneratedCrate, GENERATED_ABI_VERSION, RESIDUAL_RISK_SCHEMA_VERSION,
+    ROUTING_HASH_VERSION,
 };
 
 const USAGE: &str =
@@ -222,6 +223,7 @@ fn emit_build_manifest(source_sha: &str, runtime_path: &str) -> String {
         "{{\n  \"schema_version\": 1,\n  \"compiler\": {},\n  \"language\": {},\n  \
          \"runtime\": {},\n  \"generated_abi\": {GENERATED_ABI_VERSION},\n  \
          \"residual_risk_schema\": {RESIDUAL_RISK_SCHEMA_VERSION},\n  \
+         \"routing_hash\": {ROUTING_HASH_VERSION},\n  \
          \"msrv\": \"1.85.0\",\n  \"verification_toolchain\": \"1.97.0\",\n  \
          \"source_sha256\": {},\n  \"workspace_lock_sha256\": {},\n  \
          \"runtime_path\": {}\n}}\n",
@@ -909,6 +911,9 @@ process P {{
             2,
             "dev AND release"
         );
+        assert!(toml.contains("routing-hash = 1"));
+        assert!(toml.contains("sigil_rt = { version = \"=0.7.0\""));
+        assert!(rust.contains("sigil_rt::ROUTING_HASH_VERSION == 1"));
 
         // Float is outside the proof fragment, but executable schemas still
         // reject hostile non-finite input at actor boundaries.
@@ -1438,8 +1443,8 @@ spec S { hold Down.got <= Up.seen }
     #[test]
     fn security_vault_component() {
         use sigilc::{level4_prove, run_checks, AssuranceLevel};
-        let src = include_str!("../../examples/security/vault.sigil");
-        let program = parse(src).expect("parse");
+        let src = include_str!("../../examples/security/vault.sigil").replace("\r\n", "\n");
+        let program = parse(&src).expect("parse");
         let irs = lower(&program).expect("lower");
         let outcome =
             run_checks(&program, &irs, AssuranceLevel::System).expect("vault must pass Level 4");
@@ -1456,6 +1461,7 @@ spec S { hold Down.got <= Up.seen }
             "    send logged to Vault
     recorded := recorded + 1",
         );
+        assert_ne!(after, src, "audit-order mutation must change the fixture");
         let program = parse(&after).expect("parse");
         let err = level4_prove(&program).expect_err("audit-after-send must fail");
         assert!(format!("{err}").contains("ORDERING fails"));
@@ -1534,8 +1540,8 @@ spec S { hold Down.got <= Up.seen }
     fn level3_proofs_are_real_and_guarded() {
         use sigilc::{level3_prove, run_checks, AssuranceLevel};
 
-        let src = include_str!("../../examples/level3/proven_ledger.sigil");
-        let program = parse(src).expect("parse");
+        let src = include_str!("../../examples/level3/proven_ledger.sigil").replace("\r\n", "\n");
+        let program = parse(&src).expect("parse");
         let irs = lower(&program).expect("lower");
         let outcome = run_checks(&program, &irs, AssuranceLevel::Proofs)
             .expect("proven ledger must pass Level 3");
@@ -1585,6 +1591,10 @@ spec Exactness {
 
         // Dropping an assumption breaks the inductive step with a named fix.
         let unguarded = src.replace("  require payment.amount >= 0\n", "");
+        assert_ne!(
+            unguarded, src,
+            "guard-removal mutation must change the fixture"
+        );
         let program = parse(&unguarded).expect("parse");
         let err = level3_prove(&program).expect_err("must fail without the guard");
         let msg = format!("{err}");

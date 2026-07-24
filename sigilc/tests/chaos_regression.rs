@@ -34,7 +34,13 @@ fn sigilc_bin() -> PathBuf {
 /// given environment. Returns the demo's combined output.
 fn compile_build_run(case: &str, example: &str, level: &str, env: &[(&str, &str)]) -> String {
     let root = repo_root();
-    let out = root.join("target/chaos-regression").join(case);
+    // Separate concurrent invocations of this test binary. CI can run the
+    // current and MSRV suites at the same time, and transactionally replacing
+    // a shared generated crate while another Cargo process is compiling it
+    // makes rustc's temporary output directory disappear.
+    let out = root
+        .join("target/chaos-regression")
+        .join(format!("{case}-{}", std::process::id()));
 
     let status = Command::new(sigilc_bin())
         .arg(root.join(example))

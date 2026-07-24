@@ -1,7 +1,7 @@
 //! Exhaustive small-state models for the lifecycle/accounting contracts used
 //! by `ActorSender` and `Supervisor`.
 
-use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
@@ -45,6 +45,45 @@ fn close_racing_with_send_never_loses_accounting() {
         let undrained = inbox.accepted - inbox.completed;
         assert!(!inbox.open);
         assert_eq!(inbox.accepted, inbox.completed + undrained);
+    });
+}
+
+#[test]
+fn processed_message_publication_carries_prior_acceptance() {
+    loom::model(|| {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let visible = Arc::new(AtomicBool::new(false));
+        let handled = Arc::new(AtomicUsize::new(0));
+
+        let sender_accepted = accepted.clone();
+        let sender_visible = visible.clone();
+        let sender = thread::spawn(move || {
+            sender_accepted.store(1, Ordering::Release);
+            sender_visible.store(true, Ordering::Release);
+        });
+
+        let worker_visible = visible.clone();
+        let worker_handled = handled.clone();
+        let worker = thread::spawn(move || {
+            if worker_visible.load(Ordering::Acquire) {
+                worker_handled.store(1, Ordering::Release);
+            }
+        });
+
+        let observer_accepted = accepted.clone();
+        let observer_handled = handled.clone();
+        let observer = thread::spawn(move || {
+            let processed = observer_handled.load(Ordering::Acquire);
+            let admitted = observer_accepted.load(Ordering::Acquire);
+            assert!(
+                processed <= admitted,
+                "observed processing without its prior acceptance"
+            );
+        });
+
+        sender.join().expect("sender");
+        worker.join().expect("worker");
+        observer.join().expect("observer");
     });
 }
 

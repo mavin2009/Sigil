@@ -106,7 +106,7 @@ impl Default for ActorTelemetry {
 }
 
 fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = counter.fetch_update(Ordering::Release, Ordering::Relaxed, |current| {
         Some(current.saturating_add(value))
     });
 }
@@ -125,11 +125,16 @@ impl ActorTelemetry {
     }
 
     pub fn snapshot(&self) -> ActorSnapshot {
+        // Processing counters are Release-published after channel receipt.
+        // Read them before accepted so observing a processed message also
+        // carries the acceptance publication that preceded its hand-off.
+        let handled = self.inner.handled.load(Ordering::Acquire);
+        let dropped = self.inner.dropped.load(Ordering::Acquire);
         ActorSnapshot {
-            accepted: self.inner.accepted.load(Ordering::Relaxed),
-            handled: self.inner.handled.load(Ordering::Relaxed),
-            dropped: self.inner.dropped.load(Ordering::Relaxed),
-            shed: self.inner.shed.load(Ordering::Relaxed),
+            accepted: self.inner.accepted.load(Ordering::Acquire),
+            handled,
+            dropped,
+            shed: self.inner.shed.load(Ordering::Acquire),
         }
     }
 
@@ -191,18 +196,29 @@ impl<T> ActorSender<T> {
         &self,
         message: T,
     ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<T>> {
-        self.tx.send(message).await.map(|()| {
-            self.telemetry.note_accepted();
-        })
+        let permit = match self.tx.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => return Err(tokio::sync::mpsc::error::SendError(message)),
+        };
+        self.telemetry.note_accepted();
+        permit.send(message);
+        Ok(())
     }
 
     pub fn try_send(
         &self,
         message: T,
     ) -> std::result::Result<(), tokio::sync::mpsc::error::TrySendError<T>> {
-        self.tx.try_send(message).map(|()| {
-            self.telemetry.note_accepted();
-        })
+        use tokio::sync::mpsc::error::TrySendError;
+
+        let permit = match self.tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(TrySendError::Full(())) => return Err(TrySendError::Full(message)),
+            Err(TrySendError::Closed(())) => return Err(TrySendError::Closed(message)),
+        };
+        self.telemetry.note_accepted();
+        permit.send(message);
+        Ok(())
     }
 
     pub fn telemetry(&self) -> &ActorTelemetry {
@@ -468,6 +484,78 @@ impl Drop for Supervisor {
     }
 }
 
+/// Version of the byte-level shard-key encoding and hash algorithm.
+///
+/// Changing this value is a state-placement migration: deployments must not
+/// mix routing hash versions for actors that rely on key affinity.
+pub const ROUTING_HASH_VERSION: u32 = 1;
+
+const ROUTING_FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+const ROUTING_FNV_PRIME: u64 = 1_099_511_628_211;
+
+fn routing_hash(tag: u8, bytes: &[u8]) -> u64 {
+    let mut hash = ROUTING_FNV_OFFSET;
+    for byte in std::iter::once(&tag).chain(bytes) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(ROUTING_FNV_PRIME);
+    }
+    hash
+}
+
+/// Stable encoding for generated shard-routing key types.
+///
+/// Application-defined implementations must preserve their byte encoding
+/// across processes, platforms, and releases. Sigil-generated programs use
+/// only the built-in implementations below.
+pub trait StableRouteKey {
+    fn stable_route_hash(&self) -> u64;
+}
+
+impl StableRouteKey for i64 {
+    fn stable_route_hash(&self) -> u64 {
+        routing_hash(1, &self.to_le_bytes())
+    }
+}
+
+impl StableRouteKey for bool {
+    fn stable_route_hash(&self) -> u64 {
+        routing_hash(2, &[u8::from(*self)])
+    }
+}
+
+impl StableRouteKey for str {
+    fn stable_route_hash(&self) -> u64 {
+        routing_hash(3, self.as_bytes())
+    }
+}
+
+impl StableRouteKey for String {
+    fn stable_route_hash(&self) -> u64 {
+        self.as_str().stable_route_hash()
+    }
+}
+
+impl StableRouteKey for [u8] {
+    fn stable_route_hash(&self) -> u64 {
+        routing_hash(4, self)
+    }
+}
+
+impl StableRouteKey for Vec<u8> {
+    fn stable_route_hash(&self) -> u64 {
+        self.as_slice().stable_route_hash()
+    }
+}
+
+impl StableRouteKey for Duration {
+    fn stable_route_hash(&self) -> u64 {
+        let mut encoded = [0_u8; 12];
+        encoded[..8].copy_from_slice(&self.as_secs().to_le_bytes());
+        encoded[8..].copy_from_slice(&self.subsec_nanos().to_le_bytes());
+        routing_hash(5, &encoded)
+    }
+}
+
 /// Shard router for typed actor outboxes. Lives inside a single actor's
 /// task-local state, so round-robin needs no atomics and hashing no locks.
 pub struct Router<H> {
@@ -496,13 +584,11 @@ impl<H> Router<H> {
         h
     }
 
-    /// Key affinity: identical keys always land on the same shard, so
-    /// per-key ordering and shard-local state remain coherent.
-    pub fn by_key<K: std::hash::Hash + ?Sized>(&self, key: &K) -> &H {
-        use std::hash::BuildHasher;
-        let state =
-            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
-        &self.shards[(state.hash_one(key) as usize) % self.shards.len()]
+    /// Versioned key affinity: identical keys and shard counts select the
+    /// same shard on every supported platform.
+    pub fn by_key<K: StableRouteKey + ?Sized>(&self, key: &K) -> &H {
+        let index = key.stable_route_hash() % self.shards.len() as u64;
+        &self.shards[index as usize]
     }
 
     /// Every shard, for broadcast delivery.
@@ -566,10 +652,13 @@ struct ExternalWorkGuard;
 
 impl Drop for ExternalWorkGuard {
     fn drop(&mut self) {
-        let _ = EXTERNAL_ACTIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        // Publish completion before removing the final active worker. The
+        // AcqRel chain across concurrent decrements ensures that an Acquire
+        // snapshot observing `active == 0` also observes every completion.
+        saturating_atomic_add(&EXTERNAL_COMPLETED, 1);
+        let _ = EXTERNAL_ACTIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             Some(current.saturating_sub(1))
         });
-        saturating_atomic_add(&EXTERNAL_COMPLETED, 1);
     }
 }
 
@@ -583,7 +672,9 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     saturating_atomic_add(&EXTERNAL_STARTED, 1);
-    saturating_atomic_add(&EXTERNAL_ACTIVE, 1);
+    let _ = EXTERNAL_ACTIVE.fetch_update(Ordering::Release, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(1))
+    });
     let join = tokio::task::spawn_blocking(move || {
         let _guard = ExternalWorkGuard;
         work()
@@ -601,11 +692,13 @@ where
 }
 
 pub fn external_work_snapshot() -> ExternalWorkSnapshot {
+    let active = EXTERNAL_ACTIVE.load(Ordering::Acquire);
+    let started = EXTERNAL_STARTED.load(Ordering::Acquire);
     ExternalWorkSnapshot {
-        started: EXTERNAL_STARTED.load(Ordering::Relaxed),
-        active: EXTERNAL_ACTIVE.load(Ordering::Relaxed),
-        completed: EXTERNAL_COMPLETED.load(Ordering::Relaxed),
-        panicked: EXTERNAL_PANICKED.load(Ordering::Relaxed),
+        started,
+        active,
+        completed: EXTERNAL_COMPLETED.load(Ordering::Acquire),
+        panicked: EXTERNAL_PANICKED.load(Ordering::Acquire),
     }
 }
 
@@ -792,6 +885,27 @@ mod tests {
         assert_eq!(*router.round_robin(), 20);
         assert_eq!(*router.round_robin(), 30);
         assert_eq!(*router.round_robin(), 10);
+        assert_eq!("account-7".stable_route_hash(), 3_239_672_280_558_547_525);
+        assert_eq!(42_i64.stable_route_hash(), 13_357_854_087_122_531_014);
+        assert_eq!(false.stable_route_hash(), 592_597_218_053_142_079);
+        assert_eq!(true.stable_route_hash(), 592_596_118_541_513_868);
+        assert_eq!(
+            [1_u8, 2, 255].as_slice().stable_route_hash(),
+            14_162_279_717_579_352_217
+        );
+        assert_eq!(
+            Duration::new(2, 3).stable_route_hash(),
+            17_828_535_364_259_542_577
+        );
+        assert_eq!(
+            "account-7".to_owned().stable_route_hash(),
+            "account-7".stable_route_hash()
+        );
+        assert_eq!(
+            vec![1_u8, 2, 255].stable_route_hash(),
+            [1_u8, 2, 255].as_slice().stable_route_hash()
+        );
+        assert_eq!(*router.by_key("account-7"), 20);
         assert_eq!(router.by_key("account-7"), router.by_key("account-7"));
     }
 
@@ -891,6 +1005,30 @@ mod tests {
             Err(SigilError::ActorStopped)
         );
         assert_eq!(telemetry.snapshot().accepted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actor_sender_publishes_acceptance_before_message_visibility() {
+        const MESSAGE_COUNT: u64 = 1_000;
+
+        let telemetry = ActorTelemetry::new();
+        let observed = telemetry.clone();
+        let (raw, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = ActorSender::new(raw, telemetry);
+        let consumer = tokio::spawn(async move {
+            for received in 1..=MESSAGE_COUNT {
+                assert_eq!(receiver.recv().await, Some(received));
+                assert!(
+                    observed.snapshot().accepted >= received,
+                    "message {received} became visible before its acceptance publication"
+                );
+            }
+        });
+
+        for message in 1..=MESSAGE_COUNT {
+            sender.send(message).await.expect("receiver remains live");
+        }
+        consumer.await.expect("consumer task");
     }
 
     #[tokio::test(start_paused = true)]

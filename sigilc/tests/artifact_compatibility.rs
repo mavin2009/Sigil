@@ -3,6 +3,11 @@ use std::process::Command;
 
 #[test]
 fn abi_v1_machine_readable_artifacts_match_golden_fixtures() {
+    assert_eq!(
+        sigilc::ROUTING_HASH_VERSION,
+        sigil_rt::ROUTING_HASH_VERSION,
+        "compiler and runtime routing contracts diverged"
+    );
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest.parent().expect("workspace");
     let fixture = manifest.join("tests/fixtures/abi_v1");
@@ -37,6 +42,7 @@ fn abi_v1_machine_readable_artifacts_match_golden_fixtures() {
         "\"runtime\"",
         "\"generated_abi\": 1",
         "\"residual_risk_schema\": 1",
+        "\"routing_hash\": 1",
         "\"msrv\": \"1.85.0\"",
         "\"verification_toolchain\": \"1.97.0\"",
         "\"source_sha256\"",
