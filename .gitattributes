@@ -1,0 +1,13 @@
+* text=auto
+
+# Sigil's generated artifacts and mutation fixtures use canonical LF bytes.
+# Keep checkouts identical on Windows so golden byte comparisons and exact
+# source mutations exercise the same inputs on every supported platform.
+*.json text eol=lf
+*.md text eol=lf
+*.rs text eol=lf
+*.sh text eol=lf
+*.sigil text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
