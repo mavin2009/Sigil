@@ -256,6 +256,23 @@ pub fn residual_risk_report(
         }
         _ => String::new(),
     };
+    let distributed_residual = if program.placements.is_empty() {
+        String::new()
+    } else {
+        "- Placement groups identify remote-capable boundaries. Type/acyclic topology checks and \
+         process-local invariants still apply, but Level-2 end-to-end latency and Level-4 system \
+         conservation fail closed across transport admission. Loss, duplication, reordering, \
+         partitions, and rolling version skew remain transport/deployment obligations.\n\
+         - Every remote adapter must negotiate protocol, routing-hash, schema, payload, and \
+         delivery contracts before accepting traffic; `Accepted` does not mean actor-handled or \
+         durably committed.\n\
+         - At-least-once delivery requires durable producer sequences and a receiver deduplication \
+         frontier that is checkpointed with shard state.\n\
+         - `ShardLease` fences local data-plane admissions by epoch. A strongly consistent \
+         external coordinator must allocate monotonically increasing epochs and ensure each \
+         non-cloneable handoff bundle is activated by only one successor.\n"
+            .to_string()
+    };
 
     format!(
         r#"# Residual Risk Report
@@ -289,6 +306,8 @@ pub fn residual_risk_report(
 - Tokio runtime, OS scheduler, and wall-clock latency are outside the model.
 - Actor panic, process exit, host loss, and power loss end the proved in-process execution. Queued messages and task-local state are volatile; Sigil provides no durable inbox/outbox.
 - A panic produces incomplete accounting and requires fail-stop reconciliation; automatic replay is forbidden because a foreign effect or send may already have occurred.
+- External ingress routing and admission occur before actor acceptance. The application owns accounting for `SendOutcome::Shed` and any message it never presents to the generated component.
+{distributed_residual}- Changing a stateful process's shard count remaps affinity keys. The runtime supplies epoch fencing and a drain/checkpoint/handoff state machine; checkpoint encoding, durable storage, epoch allocation, and reconciliation remain operational obligations.
 - Functional correctness of business logic inside external transforms is residual (Level-1 only).
 - Level-2 holds that depend on external transforms remain residual assumptions.
 "#,
@@ -313,6 +332,7 @@ pub fn residual_risk_report(
         external = external_section,
         undeclared = undeclared_section,
         level2_section = level2_section,
+        distributed_residual = distributed_residual,
     )
 }
 
@@ -343,6 +363,7 @@ pub fn residual_risk_report_ir(ir: &GraphIR) -> String {
         &Program {
             extern_crates: vec![],
             schemas: vec![],
+            placements: vec![],
             processes: vec![],
             transforms: vec![],
             specs: vec![],

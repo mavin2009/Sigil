@@ -82,7 +82,9 @@ Schemas generate `#[derive(Clone, Debug, Default)]` structs.
 transform_def = "transform" ~ ident
               ~ "(" ~ ident ~ ":" ~ type ~ ")"
               ~ "->" ~ type
-              ~ "{" ~ stmt* ~ "}"
+              ~ ("{" ~ stmt* ~ "}" | binding)
+binding       = "=" ~ ("blocking" | "infallible")?
+              ~ rust_path ~ effect_contract
 ```
 
 A transform is a one-argument function. **The body's presence is
@@ -121,10 +123,22 @@ extern crate sensor_hal = path "../hal"     // or: = "1.2" for crates.io
 
 schema ImuFrame = sensor_hal::ImuFrame { id: String, roll_rate: Float }
 
-transform read_imu(f: ImuFrame) -> ImuFrame = blocking sensor_hal::read_imu @effect(idempotent, completion_tracked, read)
-transform downlink(a: Attitude) -> Attitude = sensor_hal::downlink_packet @effect(idempotent, cancel_safe, write)
-transform fuse(a: Attitude) -> Attitude = infallible sensor_hal::fuse @effect(idempotent, cancel_safe, none)
+transform read_imu(f: ImuFrame) -> ImuFrame =
+  blocking sensor_hal::read_imu
+    @effect(idempotent, completion_tracked, read)
+
+transform downlink(a: Attitude) -> Attitude =
+  sensor_hal::downlink_packet
+    @effect(idempotent, cancel_safe, write)
+
+transform fuse(a: Attitude) -> Attitude =
+  infallible sensor_hal::fuse
+    @effect(idempotent, cancel_safe, none)
 ```
+
+Whitespace is insignificant, so a binding may still be written on one line.
+The canonical formatter uses the multiline form above: the Rust function and
+its effect contract are separate, visibly nested parts of the transform.
 
 | Kind | Expected Rust signature | Emitted as |
 | ---- | ----------------------- | ---------- |
@@ -341,6 +355,42 @@ the following type tag followed by the canonical bytes:
 Types are inferred locally within a handler, never from a program-global
 environment, so identically-named bindings in different processes cannot
 cause a message to be dispatched to the wrong handler.
+
+## Placement groups
+
+```
+placement_def = "placement" ~ ident ~ "{" ~ ident ~ ("," ~ ident)* ~ ","? ~ "}"
+```
+
+```
+placement edge { Gateway }
+placement core { RiskEngine, Settlement }
+```
+
+A placement group declares processes that must be co-located. If a program
+contains any `placement` declaration, every process must appear exactly once;
+unknown, duplicate, and multiply assigned processes are Level-1 errors. A
+verified `send` edge whose endpoints belong to different groups is emitted in
+`COMPONENT_PLACEMENT.remote_boundaries` with its message schema.
+
+Remote messages must use a finite, locally declared schema. Sigil generates a
+deterministic versioned `WireCodec` plus typed envelope helpers for that
+schema, including nested locally declared schemas. Its structural SHA-256
+fingerprint changes with the schema name, ordered field names/types, or any
+nested fingerprint, so same-version rolling layout skew fails negotiation. A
+primitive message, a bound foreign schema, or a local schema that contains a
+foreign bound type is rejected at a remote boundary until the deployment
+supplies an explicit adapter; the compiler never assumes a foreign
+serialization layout.
+
+Placement changes the deployment contract, not the source-level meaning of a
+handler. The generated `Component::start` remains the complete in-process
+reference assembly. `PlacementComponent::start(...).await` starts only one
+group, wires its local edges as typed channels, requires generated durable
+endpoints for remote output, and exposes typed bounded receiver handoff.
+Multi-host deployments provide `Transport`, durable producer/outbox storage,
+one atomic state/dedup committer per receiver shard, and globally fenced
+leases. Sigil does not hide network I/O behind a local channel.
 
 ## Back-pressure
 

@@ -1,5 +1,7 @@
 //! Minimal Sigil runtime support for generated code.
 
+pub mod distributed;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -16,6 +18,8 @@ pub enum SigilError {
     Schema,
     #[error("invalid runtime configuration: {0}")]
     Configuration(String),
+    #[error("distributed delivery error: {0}")]
+    Distributed(String),
     #[error("actor stopped before accepting the message")]
     ActorStopped,
     #[error("actor task panicked")]
@@ -354,13 +358,33 @@ impl Supervisor {
     }
 
     pub fn register<T: Send + 'static>(&mut self, task: ActorTask<T>) -> Result<()> {
-        if self.actors.contains_key(task.name()) {
+        let name = task.name().to_owned();
+        self.register_as(name, task)
+    }
+
+    /// Register an actor under an operationally unique name.
+    ///
+    /// Generated component assembly uses this for shard-qualified names such
+    /// as `Gateway[0]`. The actor's process name remains the default used by
+    /// [`register`](Self::register), preserving the existing single-actor API.
+    pub fn register_as<T: Send + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        task: ActorTask<T>,
+    ) -> Result<()> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(SigilError::Configuration(
+                "supervised actor name must not be empty".into(),
+            ));
+        }
+        if self.actors.contains_key(&name) {
             return Err(SigilError::Configuration(format!(
                 "actor '{}' is already registered",
-                task.name()
+                name
             )));
         }
-        let (name, join, telemetry) = task.into_parts()?;
+        let (_process_name, join, telemetry) = task.into_parts()?;
         let report_name = name.clone();
         let report_telemetry = telemetry.clone();
         let abort = join.abort_handle();
@@ -597,6 +621,66 @@ impl<H> Router<H> {
     }
 }
 
+/// Cloneable, concurrency-safe router for traffic entering a component.
+///
+/// Unlike [`Router`], which is task-local to one generated actor, an ingress
+/// router is shared by application producer tasks. Its single atomic cursor
+/// gives all clones one round-robin sequence without a mutex. Key affinity
+/// uses the same versioned [`StableRouteKey`] contract as internal topology
+/// routing.
+#[derive(Debug)]
+pub struct IngressRouter<H> {
+    shards: Arc<[H]>,
+    rr: Arc<AtomicU64>,
+}
+
+impl<H> Clone for IngressRouter<H> {
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            rr: self.rr.clone(),
+        }
+    }
+}
+
+impl<H> IngressRouter<H> {
+    pub fn new(shards: Vec<H>) -> Result<Self> {
+        if shards.is_empty() {
+            return Err(SigilError::Configuration(
+                "an ingress router requires at least one destination shard".into(),
+            ));
+        }
+        Ok(Self {
+            shards: shards.into(),
+            rr: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Atomic producer-side distribution across all ingress-router clones.
+    pub fn round_robin(&self) -> &H {
+        let sequence = self.rr.fetch_add(1, Ordering::Relaxed);
+        let index = sequence % self.shards.len() as u64;
+        &self.shards[index as usize]
+    }
+
+    pub fn by_key<K: StableRouteKey + ?Sized>(&self, key: &K) -> &H {
+        let index = key.stable_route_hash() % self.shards.len() as u64;
+        &self.shards[index as usize]
+    }
+
+    pub fn shards(&self) -> &[H] {
+        &self.shards
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 /// Validate a capacity before calling Tokio's bounded-channel constructor.
 ///
 /// Tokio panics for zero and overlarge capacities. Generated code calls this
@@ -745,7 +829,16 @@ pub mod backpressure {
     }
 
     pub async fn deadline<T>(tx: &ActorSender<T>, msg: T, ms: u64) -> crate::Result<SendOutcome> {
-        match tokio::time::timeout(Duration::from_millis(ms), tx.send(msg)).await {
+        deadline_for(tx, msg, Duration::from_millis(ms)).await
+    }
+
+    /// Duration-based admission deadline for application ingress.
+    pub async fn deadline_for<T>(
+        tx: &ActorSender<T>,
+        msg: T,
+        duration: Duration,
+    ) -> crate::Result<SendOutcome> {
+        match tokio::time::timeout(duration, tx.send(msg)).await {
             Ok(Ok(())) => Ok(SendOutcome::Delivered),
             Ok(Err(_)) => Err(SigilError::ActorStopped),
             Err(_) => Ok(SendOutcome::Shed), // deadline expired: declared loss
@@ -876,6 +969,9 @@ mod tests {
             .err()
             .expect("an empty router must be rejected");
         assert!(matches!(err, SigilError::Configuration(_)));
+        let ingress_err = IngressRouter::<u8>::new(Vec::new())
+            .expect_err("an empty ingress router must be rejected");
+        assert!(matches!(ingress_err, SigilError::Configuration(_)));
     }
 
     #[test]
@@ -907,6 +1003,52 @@ mod tests {
         );
         assert_eq!(*router.by_key("account-7"), 20);
         assert_eq!(router.by_key("account-7"), router.by_key("account-7"));
+
+        let ingress = IngressRouter::new(vec![10, 20, 30]).expect("non-empty ingress");
+        let ingress_clone = ingress.clone();
+        assert_eq!(*ingress.round_robin(), 10);
+        assert_eq!(*ingress_clone.round_robin(), 20);
+        assert_eq!(*ingress.round_robin(), 30);
+        assert_eq!(*ingress.by_key("account-7"), *router.by_key("account-7"));
+        assert_eq!(ingress.len(), 3);
+        assert!(!ingress.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg_attr(
+        miri,
+        ignore = "concurrent ingress distribution stress is covered by native CI"
+    )]
+    async fn ingress_round_robin_is_global_and_exact_across_concurrent_clones() {
+        const SHARDS: usize = 8;
+        const PRODUCERS: usize = 32;
+        const PER_PRODUCER: usize = 1_000;
+
+        let router = IngressRouter::new((0..SHARDS).collect()).expect("non-empty ingress");
+        let counts: Arc<[AtomicU64]> = (0..SHARDS)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into();
+        let mut producers = Vec::new();
+        for _ in 0..PRODUCERS {
+            let router = router.clone();
+            let counts = counts.clone();
+            producers.push(tokio::spawn(async move {
+                for _ in 0..PER_PRODUCER {
+                    let shard = *router.round_robin();
+                    counts[shard].fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for producer in producers {
+            producer.await.expect("producer task");
+        }
+
+        let expected = (PRODUCERS * PER_PRODUCER / SHARDS) as u64;
+        assert!(counts
+            .iter()
+            .all(|count| count.load(Ordering::Relaxed) == expected));
     }
 
     #[test]
@@ -1043,8 +1185,9 @@ mod tests {
         assert_eq!(backpressure::shed(&sender, 2), Ok(SendOutcome::Shed));
 
         let deadline_sender = sender.clone();
-        let deadline =
-            tokio::spawn(async move { backpressure::deadline(&deadline_sender, 3, 25).await });
+        let deadline = tokio::spawn(async move {
+            backpressure::deadline_for(&deadline_sender, 3, Duration::from_millis(25)).await
+        });
         tokio::time::advance(Duration::from_millis(25)).await;
         assert_eq!(
             deadline.await.expect("deadline task"),
@@ -1185,6 +1328,38 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn supervisor_accepts_shard_qualified_names_and_rejects_duplicates() {
+        fn completed_task(name: &str) -> ActorTask<()> {
+            let telemetry = ActorTelemetry::new();
+            let join = tokio::spawn(async { ((), ActorStats::default()) });
+            ActorTask::new(name, join, telemetry)
+        }
+
+        let mut supervisor = Supervisor::new();
+        supervisor
+            .register_as("Worker[0]", completed_task("Worker"))
+            .expect("first shard has a unique operational name");
+        supervisor
+            .register_as("Worker[1]", completed_task("Worker"))
+            .expect("second shard has a unique operational name");
+        let duplicate = supervisor
+            .register_as("Worker[1]", completed_task("Worker"))
+            .expect_err("duplicate operational names must be rejected");
+        assert!(matches!(duplicate, SigilError::Configuration(_)));
+
+        let mut reports = [
+            supervisor.next_event().await.expect("first shard report"),
+            supervisor.next_event().await.expect("second shard report"),
+        ];
+        reports.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(reports[0].name, "Worker[0]");
+        assert_eq!(reports[1].name, "Worker[1]");
+        assert!(reports
+            .iter()
+            .all(|report| report.termination == ActorTermination::Stopped));
     }
 
     #[tokio::test]

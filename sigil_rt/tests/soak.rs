@@ -16,7 +16,7 @@ fn percentile(sorted: &[u128], numerator: usize, denominator: usize) -> u128 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "bounded soak evidence; run explicitly in the scheduled CI job"]
+#[ignore = "bounded soak evidence; run explicitly in the extended CI job"]
 async fn bounded_overload_publishes_distributions() {
     const PRODUCERS: usize = 4;
     const PER_PRODUCER: usize = 5_000;

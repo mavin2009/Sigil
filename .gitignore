@@ -34,6 +34,7 @@ core.*
 .DS_Store
 .idea/
 .vscode/
+.VSCodeCounter/
 *.swp
 *.swo
 *~

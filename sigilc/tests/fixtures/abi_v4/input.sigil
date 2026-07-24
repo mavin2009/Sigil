@@ -1,0 +1,23 @@
+extern crate service = "1"
+
+schema M { value: Int }
+
+transform read(m: M) -> M =
+  service::read
+    @effect(idempotent, cancel_safe, read)
+
+placement ingress { P }
+placement workers { Q }
+
+process P {
+  on m: M {
+    send m to Q @deadline(20.ms)
+  }
+}
+
+process Q {
+  state total: Int = 0
+  on m: M {
+    total := total + m.value
+  }
+}

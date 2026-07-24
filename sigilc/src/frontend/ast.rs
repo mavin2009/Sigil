@@ -30,9 +30,20 @@ impl Span {
 pub struct Program {
     pub extern_crates: Vec<ExternCrate>,
     pub schemas: Vec<Schema>,
+    pub placements: Vec<PlacementDecl>,
     pub processes: Vec<Process>,
     pub transforms: Vec<TransformDecl>,
     pub specs: Vec<SpecDecl>,
+}
+
+/// Processes that must be co-located within one deployment placement group.
+/// A verified topology edge between two different groups is a remote-capable
+/// boundary and must use Sigil's distributed transport contract.
+#[derive(Debug, Clone)]
+pub struct PlacementDecl {
+    pub name: String,
+    pub processes: Vec<String>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -475,6 +486,7 @@ pub fn parse(source: &str) -> Result<Program> {
     let mut program = Program {
         extern_crates: vec![],
         schemas: vec![],
+        placements: vec![],
         processes: vec![],
         transforms: vec![],
         specs: vec![],
@@ -484,6 +496,7 @@ pub fn parse(source: &str) -> Result<Program> {
         for inner in pair.into_inner() {
             match inner.as_rule() {
                 Rule::schema_def => program.schemas.push(parse_schema(inner)?),
+                Rule::placement_def => program.placements.push(parse_placement(inner)?),
                 Rule::process_def => program.processes.push(parse_process(inner)?),
                 Rule::extern_crate => {
                     let espan = Span::from_pest(inner.as_span());
@@ -526,6 +539,7 @@ fn check_program_limits(program: &Program) -> Result<()> {
         .extern_crates
         .len()
         .checked_add(program.schemas.len())
+        .and_then(|n| n.checked_add(program.placements.len()))
         .and_then(|n| n.checked_add(program.processes.len()))
         .and_then(|n| n.checked_add(program.transforms.len()))
         .and_then(|n| n.checked_add(program.specs.len()))
@@ -534,6 +548,11 @@ fn check_program_limits(program: &Program) -> Result<()> {
                 .schemas
                 .iter()
                 .try_fold(n, |acc, schema| acc.checked_add(schema.fields.len()))
+        })
+        .and_then(|n| {
+            program.placements.iter().try_fold(n, |acc, placement| {
+                acc.checked_add(placement.processes.len())
+            })
         })
         .and_then(|n| {
             program.processes.iter().try_fold(n, |acc, process| {
@@ -594,6 +613,12 @@ fn check_program_limits(program: &Program) -> Result<()> {
         }
         for handler in &process.handlers {
             check_name(&handler.msg_name, "handler message")?;
+        }
+    }
+    for placement in &program.placements {
+        check_name(&placement.name, "placement")?;
+        for process in &placement.processes {
+            check_name(process, "placed process")?;
         }
     }
     for transform in &program.transforms {
@@ -951,6 +976,18 @@ fn parse_type(pair: pest::iterators::Pair<Rule>) -> Result<Type> {
         "Bytes" => Type::Bytes,
         "Duration" => Type::Duration,
         other => Type::Named(other.to_string()),
+    })
+}
+
+fn parse_placement(pair: pest::iterators::Pair<Rule>) -> Result<PlacementDecl> {
+    let span = Span::from_pest(pair.as_span());
+    let mut inner = pair.into_inner();
+    let name = required(&mut inner, "placement name")?.as_str().to_string();
+    let processes = inner.map(|process| process.as_str().to_string()).collect();
+    Ok(PlacementDecl {
+        name,
+        processes,
+        span,
     })
 }
 
@@ -1371,6 +1408,25 @@ mod tests {
         assert_eq!(prog.processes[0].name, "Counter");
         assert!(!prog.processes[0].states.is_empty());
         assert_eq!(prog.processes[0].handlers.len(), 1);
+    }
+
+    #[test]
+    fn parses_explicit_placement_groups() {
+        let source = r#"
+schema M { value: Int }
+placement edge { Gateway }
+placement core { Worker, Audit, }
+process Gateway { on m: M { send m to Worker } }
+process Worker { on m: M { send m to Audit } }
+process Audit { on m: M {} }
+"#;
+        let program = parse(source).expect("placements parse");
+        assert_eq!(program.placements.len(), 2);
+        assert_eq!(program.placements[0].name, "edge");
+        assert_eq!(program.placements[0].processes, ["Gateway"]);
+        assert_eq!(program.placements[1].name, "core");
+        assert_eq!(program.placements[1].processes, ["Worker", "Audit"]);
+        assert!(program.placements[0].span.is_valid());
     }
 
     #[test]

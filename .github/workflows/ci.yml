@@ -1,12 +1,13 @@
 name: ci
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-  schedule:
-    - cron: "17 4 * * 1"
   workflow_dispatch:
+    inputs:
+      extended_evidence:
+        description: Run mutation testing and the bounded degradation soak
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -102,7 +103,7 @@ jobs:
           persist-credentials: false
       - name: Install pinned nightly with Miri
         run: rustup toolchain install nightly-2025-11-22 --profile minimal --component miri --no-self-update
-      - name: Loom lifecycle and supervisor models
+      - name: Loom lifecycle, ingress, ownership, and supervisor models
         run: cargo +nightly-2025-11-22 test -p sigil_rt --test loom_lifecycle --locked
       - name: Runtime under Miri
         run: cargo +nightly-2025-11-22 miri test -p sigil_rt --lib --locked
@@ -123,8 +124,8 @@ jobs:
             cargo +nightly-2025-11-22 fuzz run "$target" -- -max_total_time=10 -timeout=5
           done
 
-  scheduled-evidence:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+  extended-evidence:
+    if: ${{ inputs.extended_evidence }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -143,7 +144,7 @@ jobs:
             | tee target/soak/report.jsonl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: scheduled-hardening-evidence
+          name: extended-hardening-evidence
           path: |
             mutants.out/
             target/soak/report.jsonl

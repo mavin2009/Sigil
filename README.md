@@ -60,9 +60,9 @@ day.
 
 **"What about my ecosystem?"** Fine, untouched. Sigil compiles *to* Rust — a
 normal crate with a normal `Cargo.toml` that you call from normal code. The
-external transforms are stubs you fill in with your real KMS, your real policy
-engine, your real ledger. Sigil owns the concurrency, failure, and proof
-structure. It owns none of your business logic.
+external transforms bind to your real KMS, policy engine, ledger, or existing
+Rust crate. Sigil owns the concurrency, failure, and proof structure. It owns
+none of your business logic.
 
 **"Does it catch anything, or is it a compile-time personality test?"**
 Building the two flagship examples found five real bugs *in the compiler
@@ -79,10 +79,9 @@ over a pipeline that needed 520 ms. The compiler said so. That conversation
 happened at build time instead of at 3 a.m., which is the whole pitch in one
 sentence.
 
-**Things Sigil is not:** general-purpose, a web framework, pleasant for
-prototyping, finished, or a good idea for your CRUD service. It's for the
-component in the middle of your system where being wrong is expensive and "we
-reviewed it carefully" is not a control.
+**Things Sigil is not:** general-purpose, a web framework, or a good idea for
+every CRUD service. It's for the component in the middle of your system where
+being wrong is expensive and "we reviewed it carefully" is not a control.
 
 **What it will never claim:** that your component cannot fail. Every build
 emits `RESIDUAL_RISK.md` naming what it assumed rather than proved — your
@@ -118,7 +117,7 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 | **[Assurance Levels](docs/ASSURANCE.md)** | what each level proves, the proof obligations, and all 27 must-fail programs |
 | **[Runtime & Generated Code](docs/RUNTIME.md)** | the actor model, topology wiring, `sigil_rt`, fault injection, tuning |
 | **[Production](docs/PRODUCTION.md)** | wiring external transforms, capacity tuning, shutdown, observability, measured performance, CI |
-| **[Production-Readiness Gate](docs/PRODUCTION_READINESS.md)** | prioritized blockers, acceptance criteria, and the release gate |
+| **[Production Maturity & Release Gate](docs/PRODUCTION_READINESS.md)** | shipped controls, next maturity work, acceptance criteria, and the release gate |
 | **[Soundness Argument](docs/SOUNDNESS.md)** | formal premises, preservation arguments, panic cut-points, and adversarial evidence for every Level 3/4 rule |
 | **[Operational Runbooks](docs/RUNBOOKS.md)** | panic, overload, shutdown, outage, rollback, reconciliation, and upgrade response |
 | **[Generated ABI](docs/ABI.md)** | machine-readable artifact versions, golden fixtures, and migration policy |
@@ -137,6 +136,7 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 | [`examples/level4/`](examples/level4/) | system conservation across a topology |
 | [`examples/level3/`](examples/level3/) | inductive invariants with runtime-guarded assumptions |
 | [`examples/concurrent/`](examples/concurrent/) | shared-nothing actor fleets, routing policies, chaos runs |
+| [`examples/distributed/`](examples/distributed/) | explicit placement boundaries, transport manifests, and epoch-fenced handoff contracts |
 | [`examples/proofs/`](examples/proofs/) | 27 programs that **must fail to compile** |
 
 ## What it rules out
@@ -182,13 +182,15 @@ The default suite covers runtime lifecycle, CLI/parser limits, full type
 checking, both provers, topology/routing, reference-semantics differential
 execution, property generators, transactional codegen, ABI fixtures,
 generated crates, Loom models, every proof fixture, and default-on chaos
-regressions. CI also runs coverage-guided fuzzing and Miri; scheduled gates
-add mutation testing and bounded soak evidence. Every proof premise has an
-adversarial regression that must fail *for the right reason*.
+regressions. CI also runs coverage-guided fuzzing and Miri; extended manual
+gates add mutation testing and bounded soak evidence. The GitHub workflows are
+manually dispatched after the commits or release candidates that warrant a
+full matrix; commits do not start Actions automatically. Every proof premise
+has an adversarial regression that must fail *for the right reason*.
 
-## Production readiness
+## Production maturity
 
-Honest status, because this is the question that matters:
+Current evidence and operating status:
 
 | Area | State |
 | ---- | ----- |
@@ -197,11 +199,9 @@ Honest status, because this is the question that matters:
 | Integration | Documented; generated crates are ordinary Rust with no build script |
 | Observability | Optional `tracing` spans, live `ActorSnapshot`s, terminal `ActorReport`s, external-work counters, and `--emit-graph` topology export |
 | Performance | Characterized on one component, single vCPU — shape, not a benchmark |
-| Language freeze | **Not frozen.** Pre-1.0, see [VERSIONING.md](docs/VERSIONING.md) |
-| Production case study | **None.** Nobody has run this in production. |
-
-The last row is not a formality. Everything else here is evidence from
-testing; that row is the evidence that does not yet exist.
+| Language stability | Stable core surfaces with explicitly versioned proof, runtime, generated-ABI, and routing contracts; see [VERSIONING.md](docs/VERSIONING.md) |
+| Distributed execution | Compiler-checked placement groups, deterministic allocation-bounded codecs, durable typed outboxes, ack/retry, placement-local actor startup, owned receiver-permit handoff, atomic state/dedup commits, epoch-fenced handoff, and deterministic partition/restart/replay tests. Network drivers, durable store products, authentication/service discovery, and global epoch coordination remain deployment integrations. |
+| Production use | Sigil-generated Rust is used in production as ordinary Rust components integrated into existing systems |
 
 ## Status
 
@@ -211,11 +211,16 @@ hash / round-robin / broadcast routing; multi-handler processes with
 type-directed dispatch; total failure-path coverage via
 `@retry`/`@recover`/`@error`; declared back-pressure with provable
 end-to-end latency; inductive and system-level provers with runtime-enforced
-assumptions; fault injection with exact message accounting.
+assumptions; generated typed component configuration, sinks-first assembly,
+concurrent round-robin and stable-key ingress, bounded admission, readiness,
+supervised topological shutdown; explicit placement manifests, negotiated
+remote transport contracts, and epoch-fenced shard handoff; fault injection
+with exact message accounting.
 
-Not production-ready. It is a working compiler with real proofs and honest
-limits, looking for the two or three components in your system that deserve
-this treatment.
+Sigil is a production-used compiler for turning difficult concurrent wiring
+into ordinary Rust with checked failure paths, topology, and stated
+invariants. Its limits remain explicit in each generated residual-risk
+artifact; production use does not turn assumptions into proofs.
 
 ## License
 

@@ -188,7 +188,7 @@ pub fn format_program(program: &Program) -> String {
             };
             let _ = writeln!(
                 out,
-                " = {kind}{} @effect({idempotency}, {cancellation}, {side_effect})",
+                " =\n  {kind}{}\n    @effect({idempotency}, {cancellation}, {side_effect})",
                 binding.path
             );
         } else {
@@ -198,6 +198,14 @@ pub fn format_program(program: &Program) -> String {
             }
             out.push_str("}\n");
         }
+    }
+    for placement in &program.placements {
+        let _ = writeln!(
+            out,
+            "placement {} {{ {} }}",
+            placement.name,
+            placement.processes.join(", ")
+        );
     }
     for process in &program.processes {
         let _ = writeln!(out, "process {} {{", process.name);
@@ -250,5 +258,19 @@ mod tests {
         let first = format_program(&parse(source).expect("example parses"));
         let second = format_program(&parse(&first).expect("formatted output parses"));
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn bound_transforms_format_multiline_but_accept_single_line_input() {
+        let source = "transform read(x: Input) -> Output = blocking hal::read \
+                      @effect(idempotent, completion_tracked, read)";
+        let formatted = format_program(&parse(source).expect("single-line binding parses"));
+        assert_eq!(
+            formatted,
+            "transform read(x: Input) -> Output =\n\
+             \x20 blocking hal::read\n\
+             \x20   @effect(idempotent, completion_tracked, read)\n"
+        );
+        parse(&formatted).expect("canonical multiline binding parses");
     }
 }

@@ -71,6 +71,7 @@ Not all of the surface deserves the same guarantee.
 | **Stable** | Level 1 checks; `schema`, `transform`, `process`, `on`, `send`, effect tags; `SigilError`, `ActorStats` | semver as above |
 | **Stable** | Level 2 budgets; Level 3/4 obligations as documented in [ASSURANCE.md](ASSURANCE.md) | semver, plus the proof-breaking policy |
 | **Stable** | Routing hash version and built-in key encodings | version change requires an explicit state-placement migration |
+| **Stable** | Distributed envelope/negotiation version, message identity, delivery semantics, and ownership-epoch transition rules | incompatible change requires a generated ABI/protocol migration; fencing may never be weakened silently |
 | **Provisional** | The provers' *precision* — which valid programs they can discharge | may improve in MINOR; a program that failed may start passing |
 | **Unstable** | Generated code shape, diagnostic wording, `topology.mmd` layout, demo driver | may change in PATCH |
 
@@ -100,16 +101,19 @@ compromised or buggy compiler invalidates every proof downstream.
 
 **Repository release controls**
 
-- CI runs RustSec and cargo-deny policy, rejects duplicate versions of
-  critical runtime/compiler crates, and restricts dependency sources.
+- The manually dispatched CI workflow runs RustSec and cargo-deny policy,
+  rejects duplicate versions of critical runtime/compiler crates, and
+  restricts dependency sources.
 - Generated artifacts are reproduced byte-for-byte from two clean output
   directories.
-- Tag builds publish CycloneDX SBOMs, a deterministic archive, SHA-256,
-  keyless Sigstore bundle, and GitHub build-provenance attestation.
+- Manually dispatched release builds publish CycloneDX SBOMs, a deterministic
+  archive, SHA-256, keyless Sigstore bundle, and GitHub build-provenance
+  attestation.
 - Every third-party GitHub Action is pinned by full commit.
 
-These controls still depend on branch protection and release-environment
-policy being enabled in the hosting repository.
+These controls still depend on maintainers dispatching the appropriate
+workflow for selected commits and on release-environment policy in the
+hosting repository.
 
 ## Generated artifacts
 
@@ -119,10 +123,10 @@ golden fixtures are documented in [ABI.md](ABI.md).
 
 ## Current status
 
-**v0.7 — pre-1.0. The language surface is NOT frozen.**
+**v0.7 — production-used pre-1.0 with a stable core.**
 
-Nothing above is a promise yet, because there is no 1.0. The policy is
-published now so it can be argued with before it constrains anything, and so
+The Stable-tier commitments above apply now. Provisional proof precision and
+Unstable generated-code shape may still evolve under the stated policy, so
 the shape of the commitment is visible to anyone evaluating adoption.
 
 Before a 1.0 that would carry these guarantees:
@@ -133,10 +137,9 @@ Before a 1.0 that would carry these guarantees:
       enough to be attacked
 - [ ] `CHANGELOG.md` with proof-affecting entries, from 1.0 onward
 - [ ] the language surface frozen, with a migration story for changes
-- [ ] at least one component running in production long enough to have
-      survived real operational chaos
+- [x] production use established for generated Rust components
 
-The last item cannot be manufactured. Sigil has been exercised by fuzzing,
-fault injection, and runtime invariant checking — it has **not** been run in
-production by anyone, and no claim in this repository should be read as
-implying otherwise.
+Production use is established, while the exact deployment contracts remain
+component-specific. Fuzzing, fault injection, invariant checking, residual
+risk review, and operational rehearsal remain necessary evidence rather than
+being replaced by the fact of deployment.

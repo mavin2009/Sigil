@@ -1,0 +1,38 @@
+schema Order {
+  account: String,
+  amount_minor: Int,
+}
+
+placement edge { Gateway }
+placement core { Risk, Ledger }
+
+process Gateway {
+  state forwarded: Int = 0
+
+  on order: Order {
+    forwarded := forwarded + 1
+    send order to Risk by order.account @deadline(20.ms)
+  }
+}
+
+process Risk {
+  state accepted: Int = 0
+
+  on order: Order {
+    accepted := accepted + 1
+    send order to Ledger by order.account @deadline(20.ms)
+  }
+}
+
+process Ledger {
+  state posted: Int = 0
+
+  on order: Order {
+    posted := posted + 1
+  }
+}
+
+spec LocalSafety {
+  hold accepted >= 0
+  hold posted >= 0
+}

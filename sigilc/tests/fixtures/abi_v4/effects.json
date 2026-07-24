@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "generated_abi": 4,
+  "bindings": [
+    {"transform":"read","path":"service::read","idempotency":"idempotent","cancellation":"cancel_safe","side_effect":"read"}
+  ]
+}

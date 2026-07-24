@@ -1259,11 +1259,30 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
     )?;
     reject_duplicates(
         program
+            .placements
+            .iter()
+            .map(|placement| placement.name.as_str()),
+        "placement",
+    )?;
+    reject_duplicates(
+        program
             .transforms
             .iter()
             .map(|transform| transform.name.as_str()),
         "transform",
     )?;
+    for transform in &program.transforms {
+        if matches!(
+            transform.name.as_str(),
+            "transport_manifest" | "COMPONENT_PLACEMENT"
+        ) {
+            bail!(
+                "Level-1 violation: transform name '{}' collides with generated distributed \
+                 component assembly",
+                transform.name
+            );
+        }
+    }
     reject_duplicates(program.specs.iter().map(|spec| spec.name.as_str()), "spec")?;
     reject_duplicates(
         program
@@ -1272,6 +1291,54 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
             .map(|dependency| dependency.name.as_str()),
         "extern crate",
     )?;
+    let declared_processes = program
+        .processes
+        .iter()
+        .map(|process| process.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut placed_processes = BTreeMap::<&str, &str>::new();
+    for placement in &program.placements {
+        validate_ident(&placement.name, "placement")?;
+        reject_duplicates(
+            placement.processes.iter().map(String::as_str),
+            &format!("process in placement '{}'", placement.name),
+        )?;
+        for process in &placement.processes {
+            if !declared_processes.contains(process.as_str()) {
+                bail!(
+                    "Level-1 violation: placement '{}' references unknown process '{process}'",
+                    placement.name
+                );
+            }
+            if let Some(previous) =
+                placed_processes.insert(process.as_str(), placement.name.as_str())
+            {
+                bail!(
+                    "Level-1 violation: process '{process}' belongs to both placement \
+                     '{previous}' and placement '{}'",
+                    placement.name
+                );
+            }
+        }
+    }
+    if !program.placements.is_empty() {
+        let assigned = placed_processes.keys().copied().collect::<BTreeSet<_>>();
+        let missing = declared_processes
+            .difference(&assigned)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "Level-1 violation: placement declarations must assign every process exactly \
+                 once; missing {}",
+                missing
+                    .iter()
+                    .map(|process| format!("'{process}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     for dependency in &program.extern_crates {
         validate_ident(&dependency.name, "extern crate")?;
         match &dependency.source {
@@ -1309,6 +1376,20 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
         }
         Ok(())
     };
+    if !program.processes.is_empty() {
+        let mut component_types = vec![
+            "ProcessConfig",
+            "ComponentConfig",
+            "ComponentHealth",
+            "Component",
+        ];
+        if !program.placements.is_empty() {
+            component_types.push("RemoteEndpoints");
+        }
+        for name in component_types {
+            add_generated_type(name.to_string(), "generated component assembly".to_string())?;
+        }
+    }
     for schema in &program.schemas {
         validate_ident(&schema.name, "schema")?;
         if matches!(
@@ -1643,9 +1724,15 @@ process P { on m: M {} }
 
         let collision = r#"
 schema PHandle { value: Int }
-process P { on m: PHandle {} }
+        process P { on m: PHandle {} }
 "#;
         assert!(rejection(collision).contains("generated Rust type"));
+
+        let component_collision = r#"
+schema ComponentConfig { value: Int }
+process P { on m: ComponentConfig {} }
+"#;
+        assert!(rejection(component_collision).contains("generated component assembly"));
     }
 
     #[test]
@@ -1659,6 +1746,28 @@ process A { state count: Int = 0 on m: M {} }
 process B { state count: Int = 0 on m: M {} }
 "#;
         assert!(rejection(ambiguous).contains("state across the compilation unit"));
+    }
+
+    #[test]
+    fn placement_groups_are_complete_unique_and_reference_declared_processes() {
+        let valid = r#"
+schema M { value: Int }
+placement edge { A }
+placement core { B }
+process A { on m: M { send m to B } }
+process B { on m: M {} }
+"#;
+        let program = crate::frontend::ast::parse(valid).expect("valid placement parses");
+        check_handler_wellformedness(&program).expect("valid placement checks");
+
+        let missing = valid.replace("placement core { B }\n", "");
+        assert!(rejection(&missing).contains("must assign every process exactly once"));
+
+        let duplicate = valid.replace("placement core { B }", "placement core { A, B }");
+        assert!(rejection(&duplicate).contains("belongs to both placement"));
+
+        let unknown = valid.replace("placement core { B }", "placement core { B, Missing }");
+        assert!(rejection(&unknown).contains("references unknown process"));
     }
 
     #[test]

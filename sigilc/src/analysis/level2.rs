@@ -84,6 +84,11 @@ pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> 
     report.path_latency_ms = latency;
     report.latency_blockers = latency_blockers.clone();
     let blockers_snapshot = latency_blockers;
+    let remote_boundaries = crate::analysis::topology::derive_topology(program)?
+        .remote_edges(program)
+        .into_iter()
+        .map(|edge| format!("{} -> {}", edge.from, edge.to))
+        .collect::<Vec<_>>();
 
     let pure_transforms: BTreeSet<String> = program
         .transforms
@@ -109,6 +114,7 @@ pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> 
                         sum,
                         latency,
                         &blockers_snapshot,
+                        &remote_boundaries,
                         &mut report,
                         &spec.name,
                         span.start,
@@ -688,6 +694,7 @@ fn check_require(
     path_sum: u64,
     latency: u64,
     blockers: &[String],
+    remote_boundaries: &[String],
     report: &mut Level2Report,
     spec_name: &str,
     start: usize,
@@ -722,6 +729,18 @@ fn check_require(
                     end
                 ),
             };
+            if !remote_boundaries.is_empty() {
+                bail!(
+                    "Level-2 violation in spec '{}' at bytes {}..{}: `require path_latency` \
+                     crosses remote placement boundaries ({}). Network queueing, retries, \
+                     partitions, and remote acknowledgement are not in the in-process latency \
+                     model; declare an externally measured SLO instead of claiming this proof.",
+                    spec_name,
+                    start,
+                    end,
+                    remote_boundaries.join(", ")
+                );
+            }
             if !blockers.is_empty() {
                 bail!(
                     "Level-2 violation in spec '{}' at bytes {}..{}: `require path_latency` \
@@ -988,5 +1007,22 @@ spec Bad {
             msg.contains("@timeout") || msg.contains("same step") || msg.contains("Recover"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn end_to_end_latency_claims_fail_closed_across_remote_boundaries() {
+        let source = r#"
+schema M { value: Int }
+placement ingress { A }
+placement workers { B }
+process A { on m: M { send m to B @deadline(5.ms) } }
+process B { on m: M {} }
+spec Slo { require path_latency <= 10.ms }
+"#;
+        let program = parse(source).expect("parse");
+        let graph = lower(&program).expect("lower");
+        let error = level2_check(&program, &graph)
+            .expect_err("network latency is outside the in-process theorem");
+        assert!(error.to_string().contains("remote placement boundaries"));
     }
 }

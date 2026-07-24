@@ -179,12 +179,14 @@ write may already have completed.
 | timeout/retry budget arithmetic | checked Level 2 arithmetic | `timeout_sum_exceeded.sigil`; `retry_budget_overflow.sigil`; `latency_budget_overflow.sigil` |
 | effect cancellation/idempotency | effect-contract checker | `validates_bound_effect_and_retry_contracts`; tracked blocking cancellation test |
 | fail-stop panic accounting | generated hooks + `Supervisor` | live panic/incomplete-accounting and shutdown-deadline tests |
+| no handoff with live state mutation | packed `ShardLease` phase/permit atomic | Loom ownership admission/drain model; deterministic in-flight handoff rejection |
+| distributed theorem boundary | Level 2/4 remote-placement rejection | remote latency and conservation fail-closed tests |
 
-The scheduled mutation job mutates `level3.rs`, `level4.rs`, and
-`topology.rs`; a surviving mutant fails the evidence gate. Coverage-guided
-fuzz targets independently exercise parser, checker, topology, both provers,
-and codegen. The executable reference semantics differentially checks state
-and send traces against generated Rust.
+The extended manually dispatched mutation job mutates `level3.rs`,
+`level4.rs`, and `topology.rs`; a surviving mutant fails the evidence gate.
+Coverage-guided fuzz targets independently exercise parser, checker,
+topology, both provers, and codegen. The executable reference semantics
+differentially checks state and send traces against generated Rust.
 
 ## Review obligations
 

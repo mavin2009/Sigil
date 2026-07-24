@@ -68,6 +68,9 @@ Budget arithmetic:
 - the path total is the **longest path** through the topology; parallel
   branches take the max
 - `@deadline(N.ms)` sends add N; `@shed` adds 0; `@block` is unbounded
+- `path_latency` is an in-process theorem and fails closed across an explicit
+  placement boundary; network queueing, retry, acknowledgement, and partition
+  time are not represented by a local send deadline
 
 Holds are residual at this level; Level 3 proves them.
 
@@ -130,6 +133,12 @@ mode the language admits — timeouts, `@error` drops, guard rejections, shed
 sends, staged shutdown — only *decreases* the downstream count, so the
 inequality survives all of them. That is the payoff of mandatory failure
 paths: they make the system-level argument monotone.
+
+Level 4 fails closed when the topology contains a cross-placement edge.
+Remote at-least-once delivery can duplicate, at-most-once can lose, and
+network acknowledgement/deduplication are not currently inputs to the
+structural prover. Process-local Level-3 invariants and Level-1 type/acyclic
+checks still apply.
 
 ---
 

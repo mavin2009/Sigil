@@ -5,11 +5,13 @@ use crate::analysis::ir::GraphIR;
 use crate::frontend::ast::{
     BinOp, Expr, Literal, OnHandler, Process, Program, Schema, Stmt, Tag, Type,
 };
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub const GENERATED_ABI_VERSION: u32 = 1;
+pub const GENERATED_ABI_VERSION: u32 = 5;
 pub const RESIDUAL_RISK_SCHEMA_VERSION: u32 = 1;
 pub const ROUTING_HASH_VERSION: u32 = 1;
+pub const DISTRIBUTED_PROTOCOL_VERSION: u32 = 1;
 
 fn json_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
@@ -86,12 +88,23 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     out.push_str("//     fail-stop: Tokio reports the task panic through its JoinHandle.\n");
     out.push_str("#![forbid(unsafe_code)]\n");
     out.push_str("#![deny(clippy::mem_forget)]\n\n");
+    out.push_str(
+        "// Expressions preserve the checked Sigil AST verbatim. Compound\n\
+         // assignments, clamp rewrites (which differ for NaN), and tail-return\n\
+         // rewrites would be unnecessary secondary semantic transforms. Move\n\
+         // analysis also emits uniform clones; on Copy scalars these optimize away.\n\
+         #![allow(clippy::assign_op_pattern, clippy::clone_on_copy, clippy::manual_clamp, clippy::needless_return)]\n\n",
+    );
     out.push_str(&format!(
-        "// Refuse a runtime whose affinity-shard placement contract differs\n\
-         // from the compiler that generated this crate.\n\
+        "// Refuse a runtime whose affinity-shard placement or distributed\n\
+         // envelope contract differs from the compiler that generated this crate.\n\
          const _: () = assert!(\n\
              sigil_rt::ROUTING_HASH_VERSION == {ROUTING_HASH_VERSION},\n\
              \"sigil_rt routing hash is incompatible with this generated crate\",\n\
+         );\n\
+         const _: () = assert!(\n\
+             sigil_rt::distributed::DISTRIBUTED_PROTOCOL_VERSION == {DISTRIBUTED_PROTOCOL_VERSION},\n\
+             \"sigil_rt distributed protocol is incompatible with this generated crate\",\n\
          );\n\n"
     ));
     out.push_str("//\n");
@@ -127,11 +140,15 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     out.push_str("// codebase that has already chosen its stack.\n");
     out.push_str("#[cfg(feature = \"tracing\")]\nuse tracing::instrument;\n\n");
     out.push_str("use std::time::Duration;\n");
-    out.push_str("use tokio::time::timeout;\n");
     out.push_str("use sigil_rt::Result;\n\n");
 
+    let wire_encodable = crate::analysis::topology::wire_encodable_schemas(program);
+    let wire_fingerprints = wire_schema_fingerprints(program, &wire_encodable);
     for schema in &program.schemas {
-        out.push_str(&emit_schema(schema));
+        out.push_str(&emit_schema(
+            schema,
+            wire_fingerprints.get(&schema.name).copied(),
+        ));
         out.push('\n');
     }
 
@@ -140,7 +157,11 @@ pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     for process in &program.processes {
         out.push_str(&emit_process(process, &guards, &routes));
         out.push('\n');
-        out.push_str(&emit_actor(process));
+        out.push_str(&emit_actor(process, &routes));
+        out.push('\n');
+    }
+    if let Ok(topology) = crate::analysis::topology::derive_topology(program) {
+        out.push_str(&emit_component(program, &topology));
         out.push('\n');
     }
 
@@ -260,14 +281,14 @@ fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
         match stmt {
             Stmt::Let { name, expr, .. } => {
                 body_src.push_str(&format!(
-                    "    let {name} = {};\n",
-                    emit_expr(expr, &[], param)
+                    "    let {name} = {};\n    let _ = &{name};\n",
+                    emit_context_expr(expr, &[], param)
                 ));
             }
             Stmt::Expr { expr, .. } => {
                 body_src.push_str(&format!(
                     "    return Ok({});\n",
-                    emit_expr(expr, &[], param)
+                    emit_context_expr(expr, &[], param)
                 ));
             }
             Stmt::Assign { .. } => {
@@ -296,7 +317,7 @@ fn primary_message_type(program: &Program) -> String {
         .unwrap_or_else(|| "()".into())
 }
 
-fn emit_schema(schema: &Schema) -> String {
+fn emit_schema(schema: &Schema, wire_fingerprint: Option<[u8; 32]>) -> String {
     // A bound schema IS the foreign type. Defining a structurally identical
     // struct here would produce a DIFFERENT type, and every call into the
     // bound crate would fail to typecheck.
@@ -313,7 +334,173 @@ fn emit_schema(schema: &Schema) -> String {
         s.push_str(&format!("    pub {}: {},\n", fname, rust_type(fty)));
     }
     s.push_str("}\n");
+    if let Some(fingerprint) = wire_fingerprint {
+        s.push('\n');
+        s.push_str(&emit_wire_codec(schema, fingerprint));
+    }
     s
+}
+
+fn wire_schema_fingerprints(
+    program: &Program,
+    encodable: &BTreeSet<String>,
+) -> BTreeMap<String, [u8; 32]> {
+    fn update_text(hasher: &mut Sha256, value: &str) {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    fn fingerprint(
+        program: &Program,
+        schema_name: &str,
+        memo: &mut BTreeMap<String, [u8; 32]>,
+    ) -> [u8; 32] {
+        if let Some(existing) = memo.get(schema_name) {
+            return *existing;
+        }
+        let schema = program
+            .schemas
+            .iter()
+            .find(|schema| schema.name == schema_name)
+            .expect("wire-encodable schema must be declared");
+        let mut hasher = Sha256::new();
+        hasher.update(b"sigil-wire-schema-v1\0");
+        update_text(&mut hasher, &schema.name);
+        hasher.update((schema.fields.len() as u64).to_le_bytes());
+        for (field, ty) in &schema.fields {
+            update_text(&mut hasher, field);
+            match ty {
+                Type::Int => hasher.update([1]),
+                Type::Float => hasher.update([2]),
+                Type::String => hasher.update([3]),
+                Type::Bool => hasher.update([4]),
+                Type::UUID => hasher.update([5]),
+                Type::Bytes => hasher.update([6]),
+                Type::Duration => hasher.update([7]),
+                Type::Named(nested) => {
+                    hasher.update([8]);
+                    hasher.update(fingerprint(program, nested, memo));
+                }
+            }
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        memo.insert(schema_name.to_owned(), digest);
+        digest
+    }
+
+    let mut fingerprints = BTreeMap::new();
+    for schema in &program.schemas {
+        if encodable.contains(&schema.name) {
+            let _ = fingerprint(program, &schema.name, &mut fingerprints);
+        }
+    }
+    fingerprints
+}
+
+fn emit_wire_codec(schema: &Schema, fingerprint: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "impl sigil_rt::distributed::WireCodec for {} {{",
+        schema.name
+    );
+    let _ = writeln!(out, "    const SCHEMA: &'static str = \"{}\";", schema.name);
+    out.push_str("    const VERSION: u32 = 1;\n");
+    let fingerprint = fingerprint
+        .iter()
+        .map(|byte| format!("0x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        out,
+        "    const FINGERPRINT: sigil_rt::distributed::SchemaFingerprint =\n        sigil_rt::distributed::SchemaFingerprint::new([{fingerprint}]);\n"
+    );
+    out.push_str(
+        "    fn encode_wire(\n\
+         \x20       &self,\n\
+         \x20       encoder: &mut sigil_rt::distributed::WireEncoder,\n\
+         \x20   ) -> sigil_rt::distributed::CodecResult<()> {\n",
+    );
+    for (field, ty) in &schema.fields {
+        let method = match ty {
+            Type::Int => "write_i64",
+            Type::Float => "write_f64",
+            Type::String | Type::UUID => "write_string",
+            Type::Bool => "write_bool",
+            Type::Bytes => "write_bytes",
+            Type::Duration => "write_duration",
+            Type::Named(_) => "write_nested",
+        };
+        let value = match ty {
+            Type::String | Type::UUID => format!("&self.{field}"),
+            Type::Bytes => format!("&self.{field}"),
+            Type::Named(_) => format!("&self.{field}"),
+            _ => format!("self.{field}"),
+        };
+        let _ = writeln!(out, "        encoder.{method}({value})?;");
+    }
+    out.push_str("        Ok(())\n    }\n\n");
+    out.push_str(
+        "    fn decode_wire(\n\
+         \x20       decoder: &mut sigil_rt::distributed::WireDecoder<'_>,\n\
+         \x20   ) -> sigil_rt::distributed::CodecResult<Self> {\n\
+         \x20       Ok(Self {\n",
+    );
+    for (field, ty) in &schema.fields {
+        let method = match ty {
+            Type::Int => "read_i64",
+            Type::Float => "read_f64",
+            Type::String | Type::UUID => "read_string",
+            Type::Bool => "read_bool",
+            Type::Bytes => "read_bytes",
+            Type::Duration => "read_duration",
+            Type::Named(_) => "read_nested",
+        };
+        let _ = writeln!(out, "            {field}: decoder.{method}()?,");
+    }
+    out.push_str("        })\n    }\n}\n\n");
+    let _ = writeln!(out, "impl {} {{", schema.name);
+    out.push_str(
+        "    /// Encode this schema and attach the negotiated, fenced envelope.\n\
+         \x20   pub fn encode_remote(\n\
+         \x20       &self,\n\
+         \x20       session: &sigil_rt::distributed::NegotiatedTransport,\n\
+         \x20       destination: sigil_rt::distributed::ShardAddress,\n\
+         \x20       message_id: sigil_rt::distributed::MessageId,\n\
+         \x20       delivery: sigil_rt::distributed::DeliverySemantics,\n\
+         \x20       limits: sigil_rt::distributed::CodecLimits,\n\
+         \x20   ) -> sigil_rt::distributed::RemoteMessageResult<sigil_rt::distributed::WireEnvelope> {\n\
+         \x20       sigil_rt::distributed::encode_message(\n\
+         \x20           session,\n\
+         \x20           destination,\n\
+         \x20           message_id,\n\
+         \x20           delivery,\n\
+         \x20           self,\n\
+         \x20           limits,\n\
+         \x20       )\n\
+         \x20   }\n\n\
+         \x20   /// Validate and decode this schema from a negotiated envelope.\n\
+         \x20   pub fn decode_remote(\n\
+         \x20       session: &sigil_rt::distributed::NegotiatedTransport,\n\
+         \x20       envelope: &sigil_rt::distributed::WireEnvelope,\n\
+         \x20       limits: sigil_rt::distributed::CodecLimits,\n\
+         \x20   ) -> sigil_rt::distributed::RemoteMessageResult<Self> {\n\
+         \x20       sigil_rt::distributed::decode_message(session, envelope, limits)\n\
+         \x20   }\n\n\
+         \x20   /// Fence shard ownership and retain the permit through state mutation.\n\
+         \x20   pub fn authorize_remote(\n\
+         \x20       session: &sigil_rt::distributed::NegotiatedTransport,\n\
+         \x20       lease: &sigil_rt::distributed::ShardLease,\n\
+         \x20       envelope: &sigil_rt::distributed::WireEnvelope,\n\
+         \x20       limits: sigil_rt::distributed::CodecLimits,\n\
+         \x20   ) -> sigil_rt::distributed::RemoteMessageResult<sigil_rt::distributed::AuthorizedMessage<Self>> {\n\
+         \x20       sigil_rt::distributed::authorize_and_decode(session, lease, envelope, limits)\n\
+         \x20   }\n\
+         }\n",
+    );
+    out
 }
 
 /// Processes this process sends to, in declaration order (deduped).
@@ -419,6 +606,8 @@ fn emit_process(
     let mut s = String::new();
 
     let targets = process_send_targets(process);
+    let remote_sends = routes.remote_sends_from(&process.name);
+    let accepts_remote = routes.has_remote_receiver(&process.name);
     s.push_str(&format!("pub struct {} {{\n", process.name));
     s.push_str("    /// Live operational counters; never contains actor state.\n");
     s.push_str("    pub __telemetry: sigil_rt::ActorTelemetry,\n");
@@ -440,6 +629,27 @@ fn emit_process(
             t.to_lowercase()
         ));
     }
+    for route in &remote_sends {
+        let field = route
+            .remote_field
+            .as_deref()
+            .expect("remote send has a generated field");
+        let schema = &route.schema;
+        s.push_str(&format!(
+            "    /// Durable cross-placement outbox to `{}`.\n\
+             \x20   pub {field}: Option<sigil_rt::distributed::DurableRemoteEndpoint<{schema}>>,\n",
+            route.target
+        ));
+    }
+    if accepts_remote {
+        s.push_str(
+            "    /// Receiver transaction that atomically persists actor state and message identity.\n",
+        );
+        s.push_str(&format!(
+            "    pub __remote_committer: Option<std::sync::Arc<dyn sigil_rt::distributed::StateCommitter<{}>>>,\n",
+            process.name
+        ));
+    }
     s.push_str("}\n\n");
 
     s.push_str(&format!("impl {} {{\n", process.name));
@@ -451,7 +661,7 @@ fn emit_process(
         s.push_str(&format!(
             "            {}: {},\n",
             st.name,
-            emit_expr(&st.init, &[], "")
+            emit_context_expr(&st.init, &[], "")
         ));
     }
     if !targets.is_empty() {
@@ -460,6 +670,16 @@ fn emit_process(
     for t in &targets {
         s.push_str(&format!("            {}_out: None,\n", t.to_lowercase()));
     }
+    for route in &remote_sends {
+        let field = route
+            .remote_field
+            .as_deref()
+            .expect("remote send has a generated field");
+        s.push_str(&format!("            {field}: None,\n"));
+    }
+    if accepts_remote {
+        s.push_str("            __remote_committer: None,\n");
+    }
     s.push_str("        }\n    }\n\n");
     for t in &targets {
         s.push_str(&format!(
@@ -467,6 +687,82 @@ fn emit_process(
             t.to_lowercase(),
             t.to_lowercase()
         ));
+    }
+    for route in &remote_sends {
+        let field = route
+            .remote_field
+            .as_deref()
+            .expect("remote send has a generated field");
+        let schema = &route.schema;
+        s.push_str(&format!(
+            "    pub fn connect_{field}(\n\
+             \x20       &mut self,\n\
+             \x20       outbox: sigil_rt::distributed::DurableRemoteEndpoint<{schema}>,\n\
+             \x20   ) {{\n\
+             \x20       self.{field} = Some(outbox);\n\
+             \x20   }}\n\n"
+        ));
+    }
+    if accepts_remote {
+        s.push_str(&format!(
+            "    pub fn connect_remote_committer(\n\
+             \x20       &mut self,\n\
+             \x20       committer: std::sync::Arc<dyn sigil_rt::distributed::StateCommitter<{}>>,\n\
+             \x20   ) {{\n\
+             \x20       self.__remote_committer = Some(committer);\n\
+             \x20   }}\n\n",
+            process.name
+        ));
+        for receiver in routes.remote_receivers_for(&process.name) {
+            let method = format!("__apply_remote_{}", receiver.handler);
+            let schema = &receiver.schema;
+            let handler_method = format!("on_{}", receiver.handler);
+            s.push_str(&format!(
+                "    async fn {method}(\n\
+                 \x20       &mut self,\n\
+                 \x20       authorized: sigil_rt::distributed::AuthorizedMessage<{schema}>,\n\
+                 \x20   ) -> sigil_rt::distributed::TransportResult<sigil_rt::distributed::ApplyReceipt> {{\n\
+                 \x20       let context = sigil_rt::distributed::DeliveryContext::from_authorized(&authorized);\n\
+                 \x20       let committer = self.__remote_committer.clone();\n\
+                 \x20       if context.delivery() == sigil_rt::distributed::DeliverySemantics::AtLeastOnce\n\
+                 \x20           && committer.is_none()\n\
+                 \x20       {{\n\
+                 \x20           return Err(sigil_rt::distributed::TransportError::Configuration(\n\
+                 \x20               \"at-least-once receiver requires a durable state committer\".into(),\n\
+                 \x20           ));\n\
+                 \x20       }}\n\
+                 \x20       if let Some(committer) = &committer {{\n\
+                 \x20           if let sigil_rt::distributed::CommitLookup::Committed(commit) =\n\
+                 \x20               committer.lookup(&context).await?\n\
+                 \x20           {{\n\
+                 \x20               return Ok(sigil_rt::distributed::ApplyReceipt::committed(\n\
+                 \x20                   context,\n\
+                 \x20                   commit,\n\
+                 \x20                   true,\n\
+                 \x20               ));\n\
+                 \x20           }}\n\
+                 \x20       }}\n\
+                 \x20       let (message, _, _, _, _, _permit) = authorized.into_parts();\n\
+                 \x20       self.{handler_method}(message).await.map_err(|error| {{\n\
+                 \x20           sigil_rt::distributed::TransportError::Unavailable(format!(\n\
+                 \x20               \"remote handler `{}` failed before commit: {{error}}\"\n\
+                 \x20           ))\n\
+                 \x20       }})?;\n\
+                 \x20       match committer {{\n\
+                 \x20           Some(committer) => {{\n\
+                 \x20               let commit = committer.commit(&context, self).await?;\n\
+                 \x20               Ok(sigil_rt::distributed::ApplyReceipt::committed(\n\
+                 \x20                   context,\n\
+                 \x20                   commit,\n\
+                 \x20                   false,\n\
+                 \x20               ))\n\
+                 \x20           }}\n\
+                 \x20           None => Ok(sigil_rt::distributed::ApplyReceipt::applied(context)),\n\
+                 \x20       }}\n\
+                 \x20   }}\n\n",
+                receiver.handler
+            ));
+        }
     }
 
     for handler in &process.handlers {
@@ -477,7 +773,15 @@ fn emit_process(
         s.push_str(&emit_handler(handler, &states, &g, routes, &moves));
         s.push('\n');
     }
-    s.push_str("}\n");
+    s.push_str("}\n\n");
+    s.push_str(&format!(
+        "impl Default for {} {{\n\
+         \x20   fn default() -> Self {{\n\
+         \x20       Self::new()\n\
+         \x20   }}\n\
+         }}\n",
+        process.name
+    ));
     s
 }
 
@@ -494,9 +798,12 @@ fn emit_process(
 ///   - The only way out is `join()` after the channel closes.
 ///
 /// There is no `Arc`, no `Mutex`, and no way to observe state concurrently.
-fn emit_actor(process: &Process) -> String {
+fn emit_actor(process: &Process, routes: &SendRoutes) -> String {
     if process.handlers.is_empty() {
         return String::new();
+    }
+    if routes.has_remote_receiver(&process.name) {
+        return emit_remote_actor(process, routes);
     }
     let p = &process.name;
     let mut s = String::new();
@@ -508,7 +815,7 @@ fn emit_actor(process: &Process) -> String {
     } else {
         "self.__shed"
     };
-    let drop_outboxes: String = process_send_targets(process)
+    let mut drop_outboxes: String = process_send_targets(process)
         .iter()
         .map(|t| {
             format!(
@@ -517,6 +824,15 @@ fn emit_actor(process: &Process) -> String {
             )
         })
         .collect();
+    for route in routes.remote_sends_from(p) {
+        let field = route
+            .remote_field
+            .as_deref()
+            .expect("remote send has a generated field");
+        drop_outboxes.push_str(&format!(
+            "            self.{field} = None; // release durable remote endpoint\n"
+        ));
+    }
     if process.handlers.len() == 1 {
         let h = &process.handlers[0];
         let msg_ty = rust_type(&h.msg_ty);
@@ -538,6 +854,14 @@ fn emit_actor(process: &Process) -> String {
              \x20           .send(msg)\n\
              \x20           .await\n\
              \x20           .map_err(|_| sigil_rt::SigilError::ActorStopped)\n\
+             \x20   }}\n\n\
+             \x20   /// Admit immediately or report declared shedding when full.\n\
+             \x20   pub fn admit_shed(&self, msg: {msg_ty}) -> Result<sigil_rt::SendOutcome> {{\n\
+             \x20       sigil_rt::backpressure::shed(&self.tx, msg)\n\
+             \x20   }}\n\n\
+             \x20   /// Admit before `deadline` or report declared shedding.\n\
+             \x20   pub async fn admit_deadline(&self, msg: {msg_ty}, deadline: Duration) -> Result<sigil_rt::SendOutcome> {{\n\
+             \x20       sigil_rt::backpressure::deadline_for(&self.tx, msg, deadline).await\n\
              \x20   }}\n\
              }}\n\n\
              impl {p} {{\n\
@@ -593,7 +917,17 @@ fn emit_actor(process: &Process) -> String {
             variant_name(&h.msg_name)
         ));
     }
-    s.push_str("}\n\n");
+    s.push_str(&format!(
+        "\n    /// Admit an already typed dispatch message immediately or shed when full.\n\
+         \x20   pub fn admit_shed(&self, msg: {enum_name}) -> Result<sigil_rt::SendOutcome> {{\n\
+         \x20       sigil_rt::backpressure::shed(&self.tx, msg)\n\
+         \x20   }}\n\n\
+         \x20   /// Admit an already typed dispatch message before `deadline`.\n\
+         \x20   pub async fn admit_deadline(&self, msg: {enum_name}, deadline: Duration) -> Result<sigil_rt::SendOutcome> {{\n\
+         \x20       sigil_rt::backpressure::deadline_for(&self.tx, msg, deadline).await\n\
+         \x20   }}\n\
+         }}\n\n"
+    ));
 
     s.push_str(&format!(
         "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, sigil_rt::ActorTask<Self>)> {{\n        sigil_rt::validate_channel_capacity(capacity)?;\n        let (raw_tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let telemetry = self.__telemetry.clone();\n        let tx = sigil_rt::ActorSender::new(raw_tx, telemetry.clone());\n        let join = tokio::spawn(async move {{\n            let mut stats = sigil_rt::ActorStats::default();\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
@@ -609,6 +943,904 @@ fn emit_actor(process: &Process) -> String {
         "                }};\n                match r {{\n                    Ok(()) => {{ stats.record_handled(); self.__telemetry.note_handled(); }},\n                    Err(_) => {{ stats.record_dropped(); self.__telemetry.note_dropped(); }},\n                }}\n            }}\n{drop_outboxes}            stats.shed = {shed_expr};\n            self.__telemetry.mark_stopped();\n            (self, stats)\n        }});\n        let task = sigil_rt::ActorTask::new(\"{p}\", join, telemetry);\n        Ok(({p}Handle {{ tx }}, task))\n    }}\n}}\n"
     ));
     s
+}
+
+/// Emit the bounded receiver-inbox path for a process at a placement
+/// boundary. `AuthorizedMessage` owns its lease permit, so moving one into
+/// this enum keeps shard handoff fenced until the actor finishes apply and
+/// durable commit.
+fn emit_remote_actor(process: &Process, routes: &SendRoutes) -> String {
+    use std::fmt::Write as _;
+
+    let p = &process.name;
+    let enum_name = format!("{p}Msg");
+    let receivers = routes.remote_receivers_for(p);
+    let mut out = String::new();
+    let shed_expr = if process_send_targets(process).is_empty() {
+        "0"
+    } else {
+        "self.__shed"
+    };
+
+    let _ = writeln!(out, "pub enum {enum_name} {{");
+    for handler in &process.handlers {
+        let _ = writeln!(
+            out,
+            "    {}({}),",
+            variant_name(&handler.msg_name),
+            rust_type(&handler.msg_ty)
+        );
+    }
+    for receiver in &receivers {
+        let _ = writeln!(
+            out,
+            "    Remote{}(\n        sigil_rt::distributed::AuthorizedMessage<{}>,\n        tokio::sync::oneshot::Sender<sigil_rt::distributed::TransportResult<sigil_rt::distributed::ApplyReceipt>>,\n    ),",
+            variant_name(&receiver.handler),
+            receiver.schema
+        );
+    }
+    out.push_str("}\n\n");
+
+    let _ = writeln!(
+        out,
+        "#[derive(Clone)]\npub struct {p}Handle {{\n    tx: sigil_rt::ActorSender<{enum_name}>,\n}}\n"
+    );
+    let _ = writeln!(
+        out,
+        "impl {p}Handle {{\n    pub fn raw(&self) -> &sigil_rt::ActorSender<{enum_name}> {{\n        &self.tx\n    }}\n"
+    );
+    if process.handlers.len() == 1 {
+        let handler = &process.handlers[0];
+        let variant = variant_name(&handler.msg_name);
+        let ty = rust_type(&handler.msg_ty);
+        let _ = writeln!(
+            out,
+            "    pub async fn send(&self, msg: {ty}) -> Result<()> {{\n        self.tx.send({enum_name}::{variant}(msg)).await.map_err(|_| sigil_rt::SigilError::ActorStopped)\n    }}\n\n    pub fn admit_shed(&self, msg: {ty}) -> Result<sigil_rt::SendOutcome> {{\n        sigil_rt::backpressure::shed(&self.tx, {enum_name}::{variant}(msg))\n    }}\n\n    pub async fn admit_deadline(&self, msg: {ty}, deadline: Duration) -> Result<sigil_rt::SendOutcome> {{\n        sigil_rt::backpressure::deadline_for(&self.tx, {enum_name}::{variant}(msg), deadline).await\n    }}\n"
+        );
+    } else {
+        for handler in &process.handlers {
+            let variant = variant_name(&handler.msg_name);
+            let ty = rust_type(&handler.msg_ty);
+            let name = &handler.msg_name;
+            let _ = writeln!(
+                out,
+                "    pub async fn send_{name}(&self, msg: {ty}) -> Result<()> {{\n        self.tx.send({enum_name}::{variant}(msg)).await.map_err(|_| sigil_rt::SigilError::ActorStopped)\n    }}\n"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "    pub fn admit_shed(&self, msg: {enum_name}) -> Result<sigil_rt::SendOutcome> {{\n        sigil_rt::backpressure::shed(&self.tx, msg)\n    }}\n\n    pub async fn admit_deadline(&self, msg: {enum_name}, deadline: Duration) -> Result<sigil_rt::SendOutcome> {{\n        sigil_rt::backpressure::deadline_for(&self.tx, msg, deadline).await\n    }}\n"
+        );
+    }
+
+    for receiver in &receivers {
+        let name = &receiver.handler;
+        let schema = &receiver.schema;
+        let remote_variant = format!("Remote{}", variant_name(name));
+        let _ = writeln!(
+            out,
+            "    /// Transfer an owned shard permit through this actor's bounded inbox.\n    pub async fn deliver_remote_{name}(\n        &self,\n        authorized: sigil_rt::distributed::AuthorizedMessage<{schema}>,\n        admission: sigil_rt::distributed::RemoteAdmission,\n    ) -> sigil_rt::distributed::TransportResult<sigil_rt::distributed::ReceiverOutcome> {{\n        admission.validate()?;\n        let (response_tx, response_rx) = tokio::sync::oneshot::channel();\n        let message = {enum_name}::{remote_variant}(authorized, response_tx);\n        match admission {{\n            sigil_rt::distributed::RemoteAdmission::Shed => {{\n                match self.tx.try_send(message) {{\n                    Ok(()) => {{}},\n                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {{\n                        return Ok(sigil_rt::distributed::ReceiverOutcome::Shed);\n                    }}\n                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {{\n                        return Err(sigil_rt::distributed::TransportError::Unavailable(\n                            \"remote receiver actor is stopped\".into(),\n                        ));\n                    }}\n                }}\n            }}\n            sigil_rt::distributed::RemoteAdmission::Deadline(deadline) => {{\n                match tokio::time::timeout(deadline, self.tx.send(message)).await {{\n                    Err(_) => return Ok(sigil_rt::distributed::ReceiverOutcome::Shed),\n                    Ok(Err(_)) => {{\n                        return Err(sigil_rt::distributed::TransportError::Unavailable(\n                            \"remote receiver actor is stopped\".into(),\n                        ));\n                    }}\n                    Ok(Ok(())) => {{}}\n                }}\n            }}\n        }}\n        let receipt = response_rx.await.map_err(|_| {{\n            sigil_rt::distributed::TransportError::Unavailable(\n                \"remote receiver stopped before reporting apply outcome\".into(),\n            )\n        }})??;\n        Ok(sigil_rt::distributed::ReceiverOutcome::Applied(receipt))\n    }}\n"
+        );
+    }
+    out.push_str("}\n\n");
+
+    let _ = writeln!(
+        out,
+        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, sigil_rt::ActorTask<Self>)> {{\n        sigil_rt::validate_channel_capacity(capacity)?;\n        let (raw_tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let telemetry = self.__telemetry.clone();\n        let tx = sigil_rt::ActorSender::new(raw_tx, telemetry.clone());\n        let join = tokio::spawn(async move {{\n            let mut stats = sigil_rt::ActorStats::default();\n            while let Some(msg) = rx.recv().await {{\n                match msg {{"
+    );
+    for handler in &process.handlers {
+        let variant = variant_name(&handler.msg_name);
+        let method = format!("on_{}", handler.msg_name);
+        let _ = writeln!(
+            out,
+            "                    {enum_name}::{variant}(message) => {{\n                        match self.{method}(message).await {{\n                            Ok(()) => {{ stats.record_handled(); self.__telemetry.note_handled(); }}\n                            Err(_) => {{ stats.record_dropped(); self.__telemetry.note_dropped(); }}\n                        }}\n                    }}"
+        );
+    }
+    for receiver in &receivers {
+        let variant = format!("Remote{}", variant_name(&receiver.handler));
+        let method = format!("__apply_remote_{}", receiver.handler);
+        let _ = writeln!(
+            out,
+            "                    {enum_name}::{variant}(authorized, response) => {{\n                        let result = self.{method}(authorized).await;\n                        let failed = result.is_err();\n                        if failed {{\n                            stats.record_dropped();\n                            self.__telemetry.note_dropped();\n                        }} else {{\n                            stats.record_handled();\n                            self.__telemetry.note_handled();\n                        }}\n                        let _ = response.send(result);\n                        if failed {{ break; }}\n                    }}"
+        );
+    }
+    out.push_str("                }\n            }\n");
+    for target in process_send_targets(process) {
+        let _ = writeln!(
+            out,
+            "            self.{}_out = None; // release downstream channel",
+            target.to_lowercase()
+        );
+    }
+    for route in routes.remote_sends_from(p) {
+        let field = route
+            .remote_field
+            .as_deref()
+            .expect("remote send has a generated field");
+        let _ = writeln!(
+            out,
+            "            self.{field} = None; // release durable remote endpoint"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "            stats.shed = {shed_expr};\n            self.__telemetry.mark_stopped();\n            (self, stats)\n        }});\n        let task = sigil_rt::ActorTask::new(\"{p}\", join, telemetry);\n        Ok(({p}Handle {{ tx }}, task))\n    }}\n}}"
+    );
+    out
+}
+
+/// Emit the production assembly surface from the same verified topology used
+/// by routing analysis and the Level-4 prover.
+///
+/// Configuration is fully validated and handle storage is reserved before
+/// the first task is spawned. Stages are then created sinks-first, and the
+/// component retains every handle so shutdown can release them in verified
+/// topological order.
+fn emit_component(program: &Program, topology: &crate::analysis::topology::Topology) -> String {
+    use std::fmt::Write as _;
+
+    if program.processes.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let placement_groups = if program.placements.is_empty() {
+        vec![(
+            "local".to_string(),
+            topology
+                .order
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )]
+    } else {
+        program
+            .placements
+            .iter()
+            .map(|placement| {
+                (
+                    placement.name.clone(),
+                    placement
+                        .processes
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let process_groups = placement_groups
+        .iter()
+        .flat_map(|(group, processes)| {
+            processes
+                .iter()
+                .map(move |process| ((*process).to_string(), group.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let remote_boundaries = topology
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let from_group = process_groups.get(&edge.from)?;
+            let to_group = process_groups.get(&edge.to)?;
+            (from_group != to_group).then_some((
+                *from_group,
+                edge.from.as_str(),
+                *to_group,
+                edge.to.as_str(),
+                edge.msg_type.as_str(),
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+
+    out.push_str(
+        "/// Compiler-verified co-location groups and remote-capable edges.\n\
+         pub const COMPONENT_PLACEMENT: sigil_rt::distributed::PlacementManifest<'static> =\n\
+         \x20   sigil_rt::distributed::PlacementManifest {\n\
+         \x20       groups: &[\n",
+    );
+    for (group, processes) in &placement_groups {
+        let processes = processes
+            .iter()
+            .map(|process| format!("\"{process}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "            sigil_rt::distributed::PlacementGroupDescriptor {{ name: \"{group}\", processes: &[{processes}] }},"
+        );
+    }
+    out.push_str("        ],\n        remote_boundaries: &[\n");
+    for (from_group, from_process, to_group, to_process, schema) in &remote_boundaries {
+        let _ = writeln!(
+            out,
+            "            sigil_rt::distributed::RemoteBoundaryDescriptor {{ from_group: \"{from_group}\", from_process: \"{from_process}\", to_group: \"{to_group}\", to_process: \"{to_process}\", schema: \"{schema}\" }},"
+        );
+    }
+    out.push_str("        ],\n    };\n\n");
+
+    out.push_str(
+        "/// Safe default transport capabilities for this generated component.\n\
+         ///\n\
+         /// Both delivery modes are protocol-compatible. Generated placement\n\
+         /// startup accepts cross-group output only through a durable endpoint,\n\
+         /// whose constructors enforce persistent identities and outbox state.\n\
+         pub fn transport_manifest(\n\
+         \x20   max_payload_bytes: usize,\n\
+         ) -> sigil_rt::distributed::TransportResult<sigil_rt::distributed::TransportManifest> {\n\
+         \x20   COMPONENT_PLACEMENT.validate()?;\n\
+         \x20   let mut manifest = sigil_rt::distributed::TransportManifest::new(\n\
+         \x20       sigil_rt::distributed::VersionRange::exact(\n\
+         \x20           sigil_rt::distributed::DISTRIBUTED_PROTOCOL_VERSION,\n\
+         \x20       )?,\n\
+         \x20       max_payload_bytes,\n\
+         \x20   )?;\n",
+    );
+    for schema in remote_boundaries
+        .iter()
+        .map(|(_, _, _, _, schema)| *schema)
+        .collect::<BTreeSet<_>>()
+    {
+        let _ = writeln!(
+            out,
+            "    manifest.register_schema(\n        \"{schema}\",\n        <{schema} as sigil_rt::distributed::WireCodec>::VERSION,\n        <{schema} as sigil_rt::distributed::WireCodec>::FINGERPRINT,\n    )?;"
+        );
+    }
+    out.push_str(
+        "    manifest.enable_delivery(sigil_rt::distributed::DeliverySemantics::AtMostOnce);\n\
+         \x20   manifest.enable_delivery(sigil_rt::distributed::DeliverySemantics::AtLeastOnce);\n\
+         \x20   Ok(manifest)\n\
+         }\n\n",
+    );
+
+    if !remote_boundaries.is_empty() {
+        out.push_str(
+            "/// Typed outbound transport endpoints required by remote placement boundaries.\n\
+             ///\n\
+             /// Constructing each `RemoteEndpoint` validates negotiation, bounded codecs,\n\
+             /// destination-shard consistency, delivery semantics, and message-identity\n\
+             /// durability. This aggregate additionally verifies that endpoints target the\n\
+             /// compiler-declared placement group and process.\n\
+             #[derive(Clone, Default)]\n\
+             pub struct RemoteEndpoints {\n",
+        );
+        for (_, from_process, _, to_process, schema) in &remote_boundaries {
+            let field = format!(
+                "{}_to_{}_{}",
+                from_process.to_lowercase(),
+                to_process.to_lowercase(),
+                schema.to_lowercase()
+            );
+            let _ = writeln!(
+                out,
+                "    pub {field}: Option<sigil_rt::distributed::DurableRemoteEndpoint<{schema}>>,"
+            );
+        }
+        out.push_str(
+            "}\n\n\
+             impl RemoteEndpoints {\n\
+             \x20   pub fn validate_for(&self, placement: &str) -> sigil_rt::distributed::TransportResult<()> {\n\
+             \x20       if !COMPONENT_PLACEMENT.groups.iter().any(|group| group.name == placement) {\n\
+             \x20           return Err(sigil_rt::distributed::TransportError::Configuration(format!(\n\
+             \x20               \"unknown placement group '{placement}'\"\n\
+             \x20           )));\n\
+             \x20       }\n\
+             \x20       let mut deployment: Option<&str> = None;\n",
+        );
+        for (from_group, from_process, to_group, to_process, schema) in &remote_boundaries {
+            let field = format!(
+                "{}_to_{}_{}",
+                from_process.to_lowercase(),
+                to_process.to_lowercase(),
+                schema.to_lowercase()
+            );
+            let _ = writeln!(
+                out,
+                "        if placement == \"{from_group}\" && self.{field}.is_none() {{\n            return Err(sigil_rt::distributed::TransportError::Configuration(\n                \"placement '{from_group}' requires durable remote endpoint '{field}'\".into(),\n            ));\n        }}"
+            );
+            let _ = writeln!(
+                out,
+                "        if let Some(endpoint) = &self.{field} {{\n            for destination in endpoint.destinations() {{"
+            );
+            let _ = writeln!(
+                out,
+                "                if destination.key().placement_group() != \"{to_group}\" || destination.key().process() != \"{to_process}\" {{"
+            );
+            let _ = writeln!(
+                out,
+                "                    return Err(sigil_rt::distributed::TransportError::Configuration(\n                        \"endpoint '{field}' does not target placement '{to_group}' process '{to_process}'\".into(),\n                    ));"
+            );
+            out.push_str(
+                "                }\n\
+                 \x20               match deployment {\n\
+                 \x20                   Some(expected) if expected != destination.key().deployment() => {\n\
+                 \x20                       return Err(sigil_rt::distributed::TransportError::Configuration(\n\
+                 \x20                           \"remote endpoints span more than one deployment\".into(),\n\
+                 \x20                       ));\n\
+                 \x20                   }\n\
+                 \x20                   None => deployment = Some(destination.key().deployment()),\n\
+                 \x20                   Some(_) => {}\n\
+                 \x20               }\n\
+                 \x20           }\n\
+                 \x20       }\n",
+            );
+        }
+        out.push_str("        Ok(())\n    }\n}\n\n");
+    }
+
+    out.push_str(
+        "/// Shard and bounded-inbox configuration for one generated process.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+         pub struct ProcessConfig {\n\
+         \x20   pub shards: usize,\n\
+         \x20   pub inbox_capacity: usize,\n\
+         }\n\n\
+         impl Default for ProcessConfig {\n\
+         \x20   fn default() -> Self {\n\
+         \x20       Self {\n\
+         \x20           shards: 1,\n\
+         \x20           inbox_capacity: 1024,\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n\n\
+         impl ProcessConfig {\n\
+         \x20   fn validate(self, process: &str) -> Result<()> {\n\
+         \x20       if self.shards == 0 {\n\
+         \x20           return Err(sigil_rt::SigilError::Configuration(format!(\n\
+         \x20               \"process '{process}' must have at least one shard\"\n\
+         \x20           )));\n\
+         \x20       }\n\
+         \x20       sigil_rt::validate_channel_capacity(self.inbox_capacity)\n\
+         \x20   }\n\
+         }\n\n",
+    );
+
+    out.push_str(
+        "/// Complete runtime configuration for the compiler-verified component.\n\
+         #[derive(Debug, Clone, PartialEq, Eq, Default)]\n\
+         pub struct ComponentConfig {\n",
+    );
+    for process_name in &topology.order {
+        let _ = writeln!(
+            out,
+            "    pub {}: ProcessConfig,",
+            process_name.to_lowercase()
+        );
+    }
+    out.push_str("}\n\nimpl ComponentConfig {\n");
+    out.push_str("    /// Validate every process before component startup has side effects.\n");
+    out.push_str("    pub fn validate(&self) -> Result<()> {\n");
+    for process_name in &topology.order {
+        let _ = writeln!(
+            out,
+            "        self.{}.validate(\"{process_name}\")?;",
+            process_name.to_lowercase()
+        );
+    }
+    out.push_str(
+        "        let _ = self.actor_count()?;\n\
+         \x20       Ok(())\n\
+         \x20   }\n\n\
+         \x20   /// Total supervised actors implied by this configuration.\n\
+         \x20   pub fn actor_count(&self) -> Result<usize> {\n\
+         \x20       let mut total = 0usize;\n",
+    );
+    for process_name in &topology.order {
+        let lc = process_name.to_lowercase();
+        let _ = writeln!(
+            out,
+            "        total = total.checked_add(self.{lc}.shards).ok_or_else(|| {{"
+        );
+        out.push_str(
+            "            sigil_rt::SigilError::Configuration(\n\
+             \x20               \"component actor count overflows usize\".into(),\n\
+             \x20           )\n\
+             \x20       })?;\n",
+        );
+    }
+    out.push_str("        Ok(total)\n    }\n}\n\n");
+
+    out.push_str(
+        "/// Point-in-time component readiness and per-actor accounting.\n\
+         #[derive(Debug, Clone, PartialEq, Eq)]\n\
+         pub struct ComponentHealth {\n\
+         \x20   pub expected_actors: usize,\n\
+         \x20   pub running_actors: Vec<String>,\n\
+         \x20   pub snapshots: std::collections::BTreeMap<String, sigil_rt::ActorSnapshot>,\n\
+         }\n\n\
+         impl ComponentHealth {\n\
+         \x20   pub fn is_ready(&self) -> bool {\n\
+         \x20       self.running_actors.len() == self.expected_actors\n\
+         \x20   }\n\n\
+         \x20   pub fn unavailable_actors(&self) -> usize {\n\
+         \x20       self.expected_actors.saturating_sub(self.running_actors.len())\n\
+         \x20   }\n\
+         }\n\n",
+    );
+
+    out.push_str(
+        "/// A running instance of the compiler-verified process topology.\n\
+         ///\n\
+         /// Only inferred entry stages expose ingress handles. All stage\n\
+         /// handles remain owned here so `shutdown` can close them in\n\
+         /// topological order before applying its hard deadline.\n\
+         pub struct Component {\n",
+    );
+    for process_name in &topology.order {
+        let lc = process_name.to_lowercase();
+        if topology.entries.contains(process_name) {
+            let _ = writeln!(
+                out,
+                "    {lc}_ingress: sigil_rt::IngressRouter<{process_name}Handle>,"
+            );
+        } else {
+            let _ = writeln!(out, "    {lc}_handles: Vec<{process_name}Handle>,");
+        }
+    }
+    out.push_str(
+        "    expected_actors: usize,\n    supervisor: sigil_rt::Supervisor,\n}\n\nimpl Component {\n",
+    );
+
+    let start_order = topology
+        .order
+        .iter()
+        .rev()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shutdown_order = topology
+        .order
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let edges = topology
+        .edges
+        .iter()
+        .map(|edge| format!("(\"{}\", \"{}\")", edge.from, edge.to))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        out,
+        "    pub const START_ORDER: &'static [&'static str] = &[{start_order}];"
+    );
+    let _ = writeln!(
+        out,
+        "    pub const SHUTDOWN_ORDER: &'static [&'static str] = &[{shutdown_order}];"
+    );
+    let _ = writeln!(
+        out,
+        "    pub const EDGES: &'static [(&'static str, &'static str)] = &[{edges}];\n"
+    );
+
+    out.push_str(
+        "    /// Validate, allocate, wire, spawn, and supervise the component.\n\
+         \x20   /// No actor is spawned unless every process configuration and all\n\
+         \x20   /// handle-vector reservations succeed.\n\
+         \x20   pub fn start(config: ComponentConfig) -> Result<Self> {\n\
+         \x20       config.validate()?;\n\
+         \x20       let expected_actors = config.actor_count()?;\n\
+         \x20       if tokio::runtime::Handle::try_current().is_err() {\n\
+         \x20           return Err(sigil_rt::SigilError::Configuration(\n\
+         \x20               \"Component::start requires an active Tokio runtime\".into(),\n\
+         \x20           ));\n\
+         \x20       }\n",
+    );
+
+    // Reserve all handle vectors before spawning. `try_reserve_exact` turns
+    // representationally impossible shard counts into typed configuration
+    // errors instead of capacity-overflow panics.
+    for process_name in &topology.order {
+        let lc = process_name.to_lowercase();
+        let _ = writeln!(
+            out,
+            "        let mut {lc}_handles: Vec<{process_name}Handle> = Vec::new();"
+        );
+        let _ = writeln!(
+            out,
+            "        {lc}_handles\n            .try_reserve_exact(config.{lc}.shards)\n            .map_err(|error| {{"
+        );
+        let _ = writeln!(
+            out,
+            "                sigil_rt::SigilError::Configuration(format!(\n                    \"cannot reserve shards for process '{process_name}': {{error}}\"\n                ))"
+        );
+        out.push_str("            })?;\n");
+    }
+    out.push_str("        let mut supervisor = sigil_rt::Supervisor::new();\n\n");
+
+    // Sinks first: every connect call receives a non-empty, already-live
+    // destination fleet.
+    for process_name in topology.order.iter().rev() {
+        let lc = process_name.to_lowercase();
+        let targets = topology
+            .targets_of(process_name)
+            .into_iter()
+            .map(|edge| edge.to.as_str())
+            .collect::<BTreeSet<_>>();
+        let _ = writeln!(out, "        // Start {process_name}.");
+        let _ = writeln!(out, "        for shard in 0..config.{lc}.shards {{");
+        if targets.is_empty() {
+            let _ = writeln!(out, "            let process = {process_name}::new();");
+        } else {
+            let _ = writeln!(out, "            let mut process = {process_name}::new();");
+            for target in targets {
+                let target_lc = target.to_lowercase();
+                let _ = writeln!(
+                    out,
+                    "            process.connect_{target_lc}({target_lc}_handles.clone())?;"
+                );
+            }
+        }
+        let _ = writeln!(
+            out,
+            "            let (handle, task) = process.spawn(config.{lc}.inbox_capacity)?;"
+        );
+        let _ = writeln!(
+            out,
+            "            supervisor.register_as(format!(\"{process_name}[{{shard}}]\"), task)?;"
+        );
+        let _ = writeln!(out, "            {lc}_handles.push(handle);");
+        out.push_str("        }\n\n");
+    }
+
+    for entry in &topology.entries {
+        let lc = entry.to_lowercase();
+        let _ = writeln!(
+            out,
+            "        let {lc}_ingress = sigil_rt::IngressRouter::new({lc}_handles)?;"
+        );
+    }
+    if !topology.entries.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("        Ok(Self {\n");
+    for process_name in &topology.order {
+        let lc = process_name.to_lowercase();
+        if topology.entries.contains(process_name) {
+            let _ = writeln!(out, "            {lc}_ingress,");
+        } else {
+            let _ = writeln!(out, "            {lc}_handles,");
+        }
+    }
+    out.push_str("            expected_actors,\n            supervisor,\n        })\n    }\n\n");
+
+    // The graph's zero-indegree processes are the only public ingress.
+    for entry in &topology.entries {
+        let lc = entry.to_lowercase();
+        let _ = writeln!(
+            out,
+            "    /// Ingress handles for the verified entry process `{entry}`."
+        );
+        let _ = write!(
+            out,
+            "    pub fn ingress_{lc}(&self) -> &sigil_rt::IngressRouter<{entry}Handle> {{\n        &self.{lc}_ingress\n    }}\n\n"
+        );
+    }
+
+    out.push_str(
+        "    pub fn supervisor(&self) -> &sigil_rt::Supervisor {\n\
+         \x20       &self.supervisor\n\
+         \x20   }\n\n\
+         \x20   pub fn snapshots(&self) -> std::collections::BTreeMap<String, sigil_rt::ActorSnapshot> {\n\
+         \x20       self.supervisor.snapshots()\n\
+         \x20   }\n\n\
+         \x20   pub fn running(&self) -> Vec<String> {\n\
+         \x20       self.supervisor.running()\n\
+         \x20   }\n\n\
+         \x20   pub fn health(&self) -> ComponentHealth {\n\
+         \x20       ComponentHealth {\n\
+         \x20           expected_actors: self.expected_actors,\n\
+         \x20           running_actors: self.supervisor.running(),\n\
+         \x20           snapshots: self.supervisor.snapshots(),\n\
+         \x20       }\n\
+         \x20   }\n\n\
+         \x20   pub fn is_ready(&self) -> bool {\n\
+         \x20       self.supervisor.running().len() == self.expected_actors\n\
+         \x20   }\n\n\
+         \x20   pub async fn next_event(&mut self) -> Option<sigil_rt::ActorReport> {\n\
+         \x20       self.supervisor.next_event().await\n\
+         \x20   }\n\n\
+         \x20   /// Close component-owned handles in verified topological order,\n\
+         \x20   /// drain accepted work, then abort and report anything beyond\n\
+         \x20   /// the supplied hard deadline.\n\
+         \x20   pub async fn shutdown(self, deadline: Duration) -> Vec<sigil_rt::ActorReport> {\n\
+         \x20       let Self {\n",
+    );
+    for process_name in &topology.order {
+        let lc = process_name.to_lowercase();
+        let field = if topology.entries.contains(process_name) {
+            format!("{lc}_ingress")
+        } else {
+            format!("{lc}_handles")
+        };
+        let _ = writeln!(out, "            {field},");
+    }
+    out.push_str(
+        "            expected_actors: _,\n\
+         \x20           supervisor,\n\
+         \x20       } = self;\n",
+    );
+    for process_name in &topology.order {
+        let lc = process_name.to_lowercase();
+        let field = if topology.entries.contains(process_name) {
+            format!("{lc}_ingress")
+        } else {
+            format!("{lc}_handles")
+        };
+        let _ = writeln!(out, "        drop({field}); // close {process_name}");
+    }
+    out.push_str("        supervisor.shutdown(deadline).await\n    }\n}\n\n");
+
+    if !remote_boundaries.is_empty() {
+        let remote_receiver_processes = topology
+            .remote_edges(program)
+            .into_iter()
+            .map(|edge| edge.to.as_str())
+            .collect::<BTreeSet<_>>();
+        out.push_str(
+            "/// Per-shard receiver transactions for processes with remote ingress.\n\
+             /// One committer is required for every locally started receiver shard.\n\
+             #[derive(Clone, Default)]\n\
+             pub struct RemoteCommitters {\n",
+        );
+        for process_name in &remote_receiver_processes {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(
+                out,
+                "    pub {lc}: Vec<std::sync::Arc<dyn sigil_rt::distributed::StateCommitter<{process_name}>>>,"
+            );
+        }
+        out.push_str("}\n\n");
+
+        out.push_str(
+            "/// A genuine placement-local component: only actors assigned to\n\
+             /// `placement` are allocated, wired, spawned, and supervised.\n\
+             pub struct PlacementComponent {\n\
+             \x20   placement: String,\n",
+        );
+        for process_name in &topology.order {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(
+                out,
+                "    {lc}_local: Option<sigil_rt::IngressRouter<{process_name}Handle>>,"
+            );
+        }
+        out.push_str(
+            "    expected_actors: usize,\n\
+             \x20   supervisor: sigil_rt::Supervisor,\n\
+             }\n\n\
+             impl PlacementComponent {\n\
+             \x20   pub async fn start(\n\
+             \x20       placement: &str,\n\
+             \x20       config: ComponentConfig,\n\
+             \x20       endpoints: RemoteEndpoints,\n\
+             \x20       committers: RemoteCommitters,\n\
+             \x20   ) -> Result<Self> {\n\
+             \x20       COMPONENT_PLACEMENT.validate().map_err(|error| {\n\
+             \x20           sigil_rt::SigilError::Configuration(error.to_string())\n\
+             \x20       })?;\n\
+             \x20       endpoints.validate_for(placement).map_err(|error| {\n\
+             \x20           sigil_rt::SigilError::Configuration(error.to_string())\n\
+             \x20       })?;\n\
+             \x20       if tokio::runtime::Handle::try_current().is_err() {\n\
+             \x20           return Err(sigil_rt::SigilError::Configuration(\n\
+             \x20               \"PlacementComponent::start requires an active Tokio runtime\".into(),\n\
+             \x20           ));\n\
+             \x20       }\n\
+             \x20       let expected_actors = match placement {\n",
+        );
+        for (group, processes) in &placement_groups {
+            let _ = writeln!(out, "            \"{group}\" => {{");
+            out.push_str("                let mut total = 0usize;\n");
+            for process_name in processes {
+                let lc = process_name.to_lowercase();
+                let _ = writeln!(
+                    out,
+                    "                config.{lc}.validate(\"{process_name}\")?;"
+                );
+                let _ = writeln!(
+                    out,
+                    "                total = total.checked_add(config.{lc}.shards).ok_or_else(|| sigil_rt::SigilError::Configuration(\"placement actor count overflows usize\".into()))?;"
+                );
+                if remote_receiver_processes.contains(process_name) {
+                    let _ = writeln!(
+                        out,
+                        "                if committers.{lc}.len() != config.{lc}.shards {{"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "                    return Err(sigil_rt::SigilError::Configuration(format!(\"placement '{group}' requires one durable committer per {process_name} shard (expected {{}}, got {{}})\", config.{lc}.shards, committers.{lc}.len())));"
+                    );
+                    out.push_str("                }\n");
+                }
+            }
+            out.push_str("                total\n            }\n");
+        }
+        out.push_str(
+            "            _ => return Err(sigil_rt::SigilError::Configuration(format!(\n\
+             \x20               \"unknown placement group '{placement}'\"\n\
+             \x20           ))),\n\
+             \x20       };\n",
+        );
+
+        for process_name in &topology.order {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(
+                out,
+                "        let mut {lc}_handles: Vec<{process_name}Handle> = Vec::new();"
+            );
+        }
+        out.push_str("        let mut supervisor = sigil_rt::Supervisor::new();\n");
+
+        for (group, processes) in &placement_groups {
+            let process_set = processes.iter().copied().collect::<BTreeSet<_>>();
+            let _ = writeln!(out, "        if placement == \"{group}\" {{");
+            for process_name in topology
+                .order
+                .iter()
+                .rev()
+                .filter(|process| process_set.contains(process.as_str()))
+            {
+                let lc = process_name.to_lowercase();
+                let _ = writeln!(
+                    out,
+                    "            {lc}_handles.try_reserve_exact(config.{lc}.shards).map_err(|error| sigil_rt::SigilError::Configuration(format!(\"cannot reserve shards for process '{process_name}': {{error}}\")))?;"
+                );
+                let _ = writeln!(out, "            for shard in 0..config.{lc}.shards {{");
+                let has_connections = !topology.targets_of(process_name).is_empty()
+                    || remote_receiver_processes.contains(process_name.as_str());
+                if has_connections {
+                    let _ = writeln!(
+                        out,
+                        "                let mut process = {process_name}::new();"
+                    );
+                } else {
+                    let _ = writeln!(out, "                let process = {process_name}::new();");
+                }
+                let mut local_targets = BTreeSet::new();
+                for edge in topology.targets_of(process_name) {
+                    let target_group = process_groups
+                        .get(&edge.to)
+                        .expect("verified placement target");
+                    if *target_group == group {
+                        if local_targets.insert(edge.to.as_str()) {
+                            let target_lc = edge.to.to_lowercase();
+                            let _ = writeln!(
+                                out,
+                                "                process.connect_{target_lc}({target_lc}_handles.clone())?;"
+                            );
+                        }
+                    } else {
+                        let target_lc = edge.to.to_lowercase();
+                        let schema_lc = edge.msg_type.to_lowercase();
+                        let endpoint_field = format!("{lc}_to_{target_lc}_{schema_lc}");
+                        let remote_field = format!("{target_lc}_{schema_lc}_remote_out");
+                        let _ = writeln!(
+                            out,
+                            "                process.connect_{remote_field}(endpoints.{endpoint_field}.clone().expect(\"validated remote endpoint\"));"
+                        );
+                    }
+                }
+                if remote_receiver_processes.contains(process_name.as_str()) {
+                    let _ = writeln!(
+                        out,
+                        "                let committer = committers.{lc}[shard].clone();"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "                committer.restore(&mut process).await.map_err(|error| sigil_rt::SigilError::Distributed(error.to_string()))?;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "                process.connect_remote_committer(committer);"
+                    );
+                }
+                let _ = writeln!(
+                    out,
+                    "                let (handle, task) = process.spawn(config.{lc}.inbox_capacity)?;"
+                );
+                let _ = writeln!(
+                    out,
+                    "                supervisor.register_as(format!(\"{process_name}[{{shard}}]\"), task)?;"
+                );
+                let _ = writeln!(out, "                {lc}_handles.push(handle);");
+                out.push_str("            }\n");
+            }
+            out.push_str("        }\n");
+        }
+
+        for process_name in &topology.order {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(
+                out,
+                "        let {lc}_local = if {lc}_handles.is_empty() {{ None }} else {{ Some(sigil_rt::IngressRouter::new({lc}_handles)?) }};"
+            );
+        }
+        out.push_str(
+            "        Ok(Self {\n\
+             \x20           placement: placement.to_owned(),\n",
+        );
+        for process_name in &topology.order {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(out, "            {lc}_local,");
+        }
+        out.push_str(
+            "            expected_actors,\n\
+             \x20           supervisor,\n\
+             \x20       })\n\
+             \x20   }\n\n\
+             \x20   pub fn placement(&self) -> &str {\n\
+             \x20       &self.placement\n\
+             \x20   }\n\n",
+        );
+
+        for entry in &topology.entries {
+            let lc = entry.to_lowercase();
+            let _ = writeln!(
+                out,
+                "    pub fn ingress_{lc}(&self) -> Option<&sigil_rt::IngressRouter<{entry}Handle>> {{\n        self.{lc}_local.as_ref()\n    }}\n"
+            );
+        }
+        for process_name in &remote_receiver_processes {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(
+                out,
+                "    pub fn receiver_{lc}(&self) -> Option<&sigil_rt::IngressRouter<{process_name}Handle>> {{\n        self.{lc}_local.as_ref()\n    }}\n"
+            );
+        }
+        let remote_deliveries = topology
+            .remote_edges(program)
+            .into_iter()
+            .map(|edge| {
+                (
+                    edge.to.as_str(),
+                    edge.to_handler.as_str(),
+                    edge.msg_type.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        for (process_name, handler, schema) in remote_deliveries {
+            let process_lc = process_name.to_lowercase();
+            let placement = process_groups
+                .get(process_name)
+                .expect("verified placement receiver");
+            let _ = writeln!(
+                out,
+                "    pub async fn deliver_{process_lc}_{handler}(\n        &self,\n        authorized: sigil_rt::distributed::AuthorizedMessage<{schema}>,\n        admission: sigil_rt::distributed::RemoteAdmission,\n    ) -> sigil_rt::distributed::TransportResult<sigil_rt::distributed::ReceiverOutcome> {{\n        let destination = authorized.destination();\n        if destination.key().placement_group() != \"{placement}\" || destination.key().process() != \"{}\" {{\n            return Err(sigil_rt::distributed::TransportError::Configuration(\n                \"authorized message targets the wrong generated receiver\".into(),\n            ));\n        }}\n        let shard = usize::try_from(destination.key().shard()).map_err(|_| {{\n            sigil_rt::distributed::TransportError::Configuration(\n                \"destination shard does not fit this platform\".into(),\n            )\n        }})?;\n        let receivers = self.{process_lc}_local.as_ref().ok_or_else(|| {{\n            sigil_rt::distributed::TransportError::Unavailable(\n                \"destination placement is not running in this component\".into(),\n            )\n        }})?;\n        let receiver = receivers.shards().get(shard).ok_or_else(|| {{\n            sigil_rt::distributed::TransportError::Configuration(format!(\n                \"destination shard {{shard}} is outside the local receiver fleet\"\n            ))\n        }})?;\n        receiver.deliver_remote_{handler}(authorized, admission).await\n    }}\n",
+                process_name
+            );
+        }
+        out.push_str(
+            "    pub fn health(&self) -> ComponentHealth {\n\
+             \x20       ComponentHealth {\n\
+             \x20           expected_actors: self.expected_actors,\n\
+             \x20           running_actors: self.supervisor.running(),\n\
+             \x20           snapshots: self.supervisor.snapshots(),\n\
+             \x20       }\n\
+             \x20   }\n\n\
+             \x20   pub fn supervisor(&self) -> &sigil_rt::Supervisor {\n\
+             \x20       &self.supervisor\n\
+             \x20   }\n\n\
+             \x20   pub async fn shutdown(self, deadline: Duration) -> Vec<sigil_rt::ActorReport> {\n\
+             \x20       let Self {\n\
+             \x20           placement: _,\n",
+        );
+        for process_name in &topology.order {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(out, "            {lc}_local,");
+        }
+        out.push_str(
+            "            expected_actors: _,\n\
+             \x20           supervisor,\n\
+             \x20       } = self;\n",
+        );
+        for process_name in &topology.order {
+            let lc = process_name.to_lowercase();
+            let _ = writeln!(out, "        drop({lc}_local);");
+        }
+        out.push_str("        supervisor.shutdown(deadline).await\n    }\n}\n");
+    }
+    out
 }
 
 /// snake_case handler name → UpperCamelCase enum variant (`new_order` →
@@ -647,6 +1879,7 @@ fn emit_handler(
         "    pub async fn {method}(&mut self, {}: {msg_ty}) -> Result<()> {{\n",
         handler.msg_name
     ));
+    s.push_str(&format!("        let _ = &{};\n", handler.msg_name));
     for g in guards {
         s.push_str(g);
     }
@@ -798,23 +2031,72 @@ fn analyse_moves(process: &Process) -> MoveAnalysis {
 /// the Handle method to call. Built from the verified topology so codegen
 /// and the checker can never disagree about which handler receives a
 /// message.
+#[derive(Debug, Clone)]
+struct SendRoute {
+    wrap: String,
+    from_process: String,
+    target: String,
+    schema: String,
+    remote_field: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RemoteReceiver {
+    process: String,
+    handler: String,
+    schema: String,
+    placement: String,
+}
+
 #[derive(Default)]
 pub struct SendRoutes {
     /// span start → template that wraps the value for the destination's
     /// channel: `{v}` for single-handler targets, `TargetMsg::Variant({v})`
     /// for multi-handler ones.
-    by_span: std::collections::BTreeMap<usize, String>,
+    by_span: std::collections::BTreeMap<usize, SendRoute>,
+    remote_receivers: BTreeSet<RemoteReceiver>,
 }
 
 impl SendRoutes {
     fn wrap(&self, target: &str, span_start: usize, value: &str) -> String {
         match self.by_span.get(&span_start) {
-            Some(tpl) => tpl.replace("{v}", value),
+            Some(route) => route.wrap.replace("{v}", value),
             None => {
                 debug_assert!(false, "unresolved send to {target} at byte {span_start}");
                 value.to_string()
             }
         }
+    }
+
+    fn route(&self, span_start: usize) -> Option<&SendRoute> {
+        self.by_span.get(&span_start)
+    }
+
+    fn remote_sends_from(&self, process: &str) -> Vec<&SendRoute> {
+        let mut unique = BTreeMap::new();
+        for route in self
+            .by_span
+            .values()
+            .filter(|route| route.from_process == process)
+        {
+            if let Some(field) = route.remote_field.as_deref() {
+                unique.entry(field).or_insert(route);
+            }
+        }
+        unique.into_values().collect()
+    }
+
+    fn remote_receivers_for(&self, process: &str) -> Vec<&RemoteReceiver> {
+        self.remote_receivers
+            .iter()
+            .filter(|receiver| receiver.process == process)
+            .collect()
+    }
+
+    fn has_remote_receiver(&self, process: &str) -> bool {
+        self.remote_receivers
+            .iter()
+            .any(|receiver| receiver.process == process)
     }
 }
 
@@ -823,6 +2105,27 @@ fn build_send_routes(program: &Program) -> SendRoutes {
     let Ok(topo) = crate::analysis::topology::derive_topology(program) else {
         return routes;
     };
+    let process_groups = program
+        .placements
+        .iter()
+        .flat_map(|placement| {
+            placement
+                .processes
+                .iter()
+                .map(move |process| (process.as_str(), placement.name.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for edge in topo.remote_edges(program) {
+        let Some(placement) = process_groups.get(edge.to.as_str()) else {
+            continue;
+        };
+        routes.remote_receivers.insert(RemoteReceiver {
+            process: edge.to.clone(),
+            handler: edge.to_handler.clone(),
+            schema: edge.msg_type.clone(),
+            placement: (*placement).to_string(),
+        });
+    }
     for process in &program.processes {
         for handler in &process.handlers {
             for stmt in &handler.body {
@@ -832,7 +2135,7 @@ fn build_send_routes(program: &Program) -> SendRoutes {
                 let Some(dest) = program.processes.iter().find(|p| p.name == *target) else {
                     continue;
                 };
-                let multi = dest.handlers.len() > 1;
+                let multi = dest.handlers.len() > 1 || routes.has_remote_receiver(&dest.name);
                 // Unique edge for this (from, to) pair unless the source sends
                 // several types to the same multi-handler target; in that case
                 // re-resolve by the sent value's local type.
@@ -854,7 +2157,39 @@ fn build_send_routes(program: &Program) -> SendRoutes {
                 } else {
                     "{v}".to_string()
                 };
-                routes.by_span.insert(span.start, tpl);
+                let remote = process_groups.get(process.name.as_str())
+                    != process_groups.get(target.as_str())
+                    && !program.placements.is_empty();
+                let remote_field = remote.then(|| {
+                    format!(
+                        "{}_{}_remote_out",
+                        target.to_lowercase(),
+                        candidates
+                            .iter()
+                            .find(|edge| edge.to_handler == to_handler)
+                            .map_or_else(
+                                || "message".to_string(),
+                                |edge| { edge.msg_type.to_lowercase() }
+                            )
+                    )
+                });
+                let schema = candidates
+                    .iter()
+                    .find(|edge| edge.to_handler == to_handler)
+                    .map_or_else(
+                        || type_name_of(&handler.msg_ty),
+                        |edge| edge.msg_type.clone(),
+                    );
+                routes.by_span.insert(
+                    span.start,
+                    SendRoute {
+                        wrap: tpl,
+                        from_process: process.name.clone(),
+                        target: target.clone(),
+                        schema,
+                        remote_field,
+                    },
+                );
             }
         }
     }
@@ -934,19 +2269,23 @@ fn emit_stmt(
             // Prefer multi-line for timeout pipelines so the recover path is readable.
             if is_timed_pipeline(expr) {
                 format!(
-                    "{indent}let {name} = {};\n",
+                    "{indent}let {name} = {};\n{indent}let _ = &{name};\n",
                     emit_expr_multiline(expr, states, msg, indent)
                 )
             } else {
-                format!("{indent}let {name} = {};\n", emit_expr(expr, states, msg))
+                format!(
+                    "{indent}let {name} = {};\n{indent}let _ = &{name};\n",
+                    emit_context_expr(expr, states, msg)
+                )
             }
         }
         Stmt::Assign { name, expr, .. } => {
+            let value = emit_context_expr(expr, states, msg);
             format!(
                 "{indent}sigil_rt::panic_point(\"before_state_write\");\n\
                  {indent}self.{name} = {};\n\
                  {indent}sigil_rt::panic_point(\"after_state_write\");\n",
-                emit_expr(expr, states, msg)
+                value
             )
         }
         Stmt::Send {
@@ -974,6 +2313,35 @@ fn emit_stmt(
                 }
             };
             let wrapped = routes.wrap(target, span.start, &value);
+            if let Some(remote_field) = routes
+                .route(span.start)
+                .and_then(|route_info| route_info.remote_field.as_deref())
+            {
+                let emitted = emit_remote_send(
+                    target,
+                    remote_field,
+                    &value,
+                    route,
+                    backpressure,
+                    span.start,
+                    indent,
+                    states,
+                    msg,
+                    routes,
+                );
+                return match guard {
+                    None => emitted,
+                    Some(condition) => {
+                        let condition = emit_context_expr(condition, states, msg);
+                        let inner = emitted
+                            .lines()
+                            .map(|line| format!("    {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("{indent}if {condition} {{\n{inner}\n{indent}}}\n")
+                    }
+                };
+            }
 
             // How the value reaches a shard's raw channel, per routing policy.
             let (borrow, pick): (&str, String) = match route {
@@ -1028,7 +2396,7 @@ fn emit_stmt(
                 return match guard {
                     None => emitted,
                     Some(cond) => {
-                        let condition = emit_expr(cond, states, msg);
+                        let condition = emit_context_expr(cond, states, msg);
                         let inner = emitted
                             .lines()
                             .map(|line| format!("    {line}"))
@@ -1084,7 +2452,7 @@ fn emit_stmt(
                 Some(cond) => {
                     // Conditional forwarding. Level 4 charges this send
                     // against the counter's increase under the same guard.
-                    let c = emit_expr(cond, states, msg);
+                    let c = emit_context_expr(cond, states, msg);
                     let inner = emitted
                         .lines()
                         .map(|l| format!("    {l}"))
@@ -1095,9 +2463,150 @@ fn emit_stmt(
             }
         }
         Stmt::Expr { expr, .. } => {
-            format!("{indent}let _ = {};\n", emit_expr(expr, states, msg))
+            format!(
+                "{indent}let _ = {};\n",
+                emit_context_expr(expr, states, msg)
+            )
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_remote_send(
+    target: &str,
+    remote_field: &str,
+    value: &str,
+    route: &crate::frontend::ast::Route,
+    backpressure: &crate::frontend::ast::Backpressure,
+    span_start: usize,
+    indent: &str,
+    states: &[String],
+    msg: &str,
+    routes: &SendRoutes,
+) -> String {
+    let target_lc = target.to_lowercase();
+    let admission = match backpressure {
+        crate::frontend::ast::Backpressure::Shed => {
+            "sigil_rt::distributed::RemoteAdmission::Shed".to_string()
+        }
+        crate::frontend::ast::Backpressure::Deadline(ms) => format!(
+            "sigil_rt::distributed::RemoteAdmission::deadline(Duration::from_millis({ms}))\
+             .map_err(|error| sigil_rt::SigilError::Distributed(error.to_string()))?"
+        ),
+        crate::frontend::ast::Backpressure::Block => {
+            return format!(
+                "{indent}return Err(sigil_rt::SigilError::Configuration(\n\
+                 {indent}    \"cross-placement @block escaped compiler validation\".into(),\n\
+                 {indent}));\n"
+            );
+        }
+    };
+    let map_remote_error =
+        ".map_err(|error| sigil_rt::SigilError::Distributed(error.to_string()))?";
+    let map_report = format!(
+        "match report.transport_outcome(){map_remote_error} {{\n\
+         {indent}            sigil_rt::distributed::TransportOutcome::Shed => sigil_rt::SendOutcome::Shed,\n\
+         {indent}            sigil_rt::distributed::TransportOutcome::Accepted\n\
+         {indent}            | sigil_rt::distributed::TransportOutcome::Duplicate => sigil_rt::SendOutcome::Delivered,\n\
+         {indent}        }}"
+    );
+
+    if matches!(route, crate::frontend::ast::Route::Broadcast) {
+        let wrapped = routes.wrap(target, span_start, "__message.clone()");
+        let local_send = match backpressure {
+            crate::frontend::ast::Backpressure::Shed => format!(
+                "if sigil_rt::backpressure::shed(h.raw(), {wrapped})? == sigil_rt::SendOutcome::Shed {{\n\
+                 {indent}                __shed_n = __shed_n.saturating_add(1);\n\
+                 {indent}            }}"
+            ),
+            crate::frontend::ast::Backpressure::Deadline(ms) => format!(
+                "if sigil_rt::backpressure::deadline(h.raw(), {wrapped}, {ms}).await? == sigil_rt::SendOutcome::Shed {{\n\
+                 {indent}                __shed_n = __shed_n.saturating_add(1);\n\
+                 {indent}            }}"
+            ),
+            crate::frontend::ast::Backpressure::Block => unreachable!(),
+        };
+        return format!(
+            "{indent}sigil_rt::panic_point(\"before_send\");\n\
+             {indent}let __message = {value};\n\
+             {indent}let mut __shed_n = 0_u64;\n\
+             {indent}if let Some(out) = self.{target_lc}_out.as_ref() {{\n\
+             {indent}    for h in out.shards() {{\n\
+             {indent}        {local_send}\n\
+             {indent}    }}\n\
+             {indent}}} else if let Some(out) = self.{remote_field}.as_ref() {{\n\
+             {indent}    let reports = out.admit_broadcast(&__message, {admission}).await{map_remote_error};\n\
+             {indent}    for report in reports {{\n\
+             {indent}        if {map_report} == sigil_rt::SendOutcome::Shed {{\n\
+             {indent}            __shed_n = __shed_n.saturating_add(1);\n\
+             {indent}        }}\n\
+             {indent}    }}\n\
+             {indent}}} else {{\n\
+             {indent}    return Err(sigil_rt::SigilError::Configuration(\n\
+             {indent}        \"neither local nor durable remote outbox to {target} is connected\".into(),\n\
+             {indent}    ));\n\
+             {indent}}}\n\
+             {indent}if __shed_n > 0 {{\n\
+             {indent}    self.__shed = self.__shed.saturating_add(__shed_n);\n\
+             {indent}    self.__telemetry.note_shed(__shed_n);\n\
+             {indent}    for _ in 0..__shed_n {{ sigil_rt::chaos::note_shed(\"{target}\"); }}\n\
+             {indent}}}\n\
+             {indent}sigil_rt::panic_point(\"after_send\");\n"
+        );
+    }
+
+    let wrapped = routes.wrap(target, span_start, "__message");
+    let (local_router_borrow, local_handle, remote_call, route_key) = match route {
+        crate::frontend::ast::Route::RoundRobin => (
+            "as_mut",
+            "out.round_robin()".to_string(),
+            format!("out.admit_round_robin(&__message, {admission})"),
+            String::new(),
+        ),
+        crate::frontend::ast::Route::ByKey(key) => {
+            let key = emit_expr(key, states, msg);
+            (
+                "as_ref",
+                "out.by_key(__route_key)".to_string(),
+                format!("out.admit_by_key(__route_key, &__message, {admission})"),
+                format!("{indent}let __route_key = &{key};\n"),
+            )
+        }
+        crate::frontend::ast::Route::Broadcast => unreachable!(),
+    };
+    let local_send = match backpressure {
+        crate::frontend::ast::Backpressure::Shed => {
+            format!("sigil_rt::backpressure::shed({local_handle}.raw(), {wrapped})?")
+        }
+        crate::frontend::ast::Backpressure::Deadline(ms) => {
+            format!(
+                "sigil_rt::backpressure::deadline({local_handle}.raw(), {wrapped}, {ms}).await?"
+            )
+        }
+        crate::frontend::ast::Backpressure::Block => unreachable!(),
+    };
+
+    format!(
+        "{indent}sigil_rt::panic_point(\"before_send\");\n\
+         {route_key}\
+         {indent}let __message = {value};\n\
+         {indent}let __outcome = if let Some(out) = self.{target_lc}_out.{local_router_borrow}() {{\n\
+         {indent}    {local_send}\n\
+         {indent}}} else if let Some(out) = self.{remote_field}.as_ref() {{\n\
+         {indent}    let report = {remote_call}.await{map_remote_error};\n\
+         {indent}    {map_report}\n\
+         {indent}}} else {{\n\
+         {indent}    return Err(sigil_rt::SigilError::Configuration(\n\
+         {indent}        \"neither local nor durable remote outbox to {target} is connected\".into(),\n\
+         {indent}    ));\n\
+         {indent}}};\n\
+         {indent}if __outcome == sigil_rt::SendOutcome::Shed {{\n\
+         {indent}    self.__shed = self.__shed.saturating_add(1);\n\
+         {indent}    self.__telemetry.note_shed(1);\n\
+         {indent}    sigil_rt::chaos::note_shed(\"{target}\");\n\
+         {indent}}}\n\
+         {indent}sigil_rt::panic_point(\"after_send\");\n"
+    )
 }
 
 fn is_timed_pipeline(expr: &Expr) -> bool {
@@ -1129,7 +2638,7 @@ fn emit_expr(expr: &Expr, states: &[String], msg: &str) -> String {
         Expr::Call { name, args, .. } => {
             let a = args
                 .iter()
-                .map(|e| emit_expr(e, states, msg))
+                .map(|e| emit_context_expr(e, states, msg))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{name}({a}).await?")
@@ -1160,19 +2669,36 @@ fn emit_expr(expr: &Expr, states: &[String], msg: &str) -> String {
             ..
         } => format!(
             "if {} {{ {} }} else {{ {} }}",
-            emit_expr(cond, states, msg),
+            emit_context_expr(cond, states, msg),
             emit_expr(then_branch, states, msg),
             emit_expr(else_branch, states, msg)
         ),
         Expr::SchemaLit { name, fields, .. } => {
             let inits = fields
                 .iter()
-                .map(|(f, e)| format!("{f}: {}", emit_expr(e, states, msg)))
+                .map(|(f, e)| format!("{f}: {}", emit_context_expr(e, states, msg)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{name} {{ {inits} }}")
         }
         Expr::Pipeline { base, steps, .. } => emit_pipeline(base, steps, states, msg, false, ""),
+    }
+}
+
+/// Render an expression in a syntactic position that already supplies its
+/// own precedence boundary (`let`, assignment, argument, condition, field).
+/// Binary expressions retain parentheses when nested inside another
+/// expression but do not trigger warnings at these top-level sites.
+fn emit_context_expr(expr: &Expr, states: &[String], msg: &str) -> String {
+    let rendered = emit_expr(expr, states, msg);
+    if matches!(expr, Expr::Binary { .. }) {
+        rendered
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+            .unwrap_or(&rendered)
+            .to_string()
+    } else {
+        rendered
     }
 }
 
@@ -1194,7 +2720,7 @@ fn emit_pipeline(
     // Pipelines borrow their input conceptually; in Rust terms the base is
     // cloned when it is a named binding so the handler can keep using it
     // (e.g. guarded state updates after the pipeline).
-    let mut current = emit_expr(base, states, msg);
+    let mut current = emit_context_expr(base, states, msg);
     if matches!(base, Expr::Ident { .. } | Expr::FieldAccess { .. }) {
         current = format!("{current}.clone()");
     }
@@ -1245,7 +2771,7 @@ fn emit_pipeline(
             // Acknowledged timed drop: no fallback; timeout/failure propagates
             // (counted as dropped by the actor loop), after bounded retries.
             current = format!(
-                "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ sigil_rt::panic_point(\"before_retry\"); __attempt = __attempt.saturating_add(1); sigil_rt::chaos::note_retry(\"{transform}\"); sigil_rt::panic_point(\"after_retry\"); }} Ok(Err(e)) => return Err(e), Err(_) => return Err(sigil_rt::SigilError::Timeout), }} }} }}"
+                "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match tokio::time::timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ sigil_rt::panic_point(\"before_retry\"); __attempt = __attempt.saturating_add(1); sigil_rt::chaos::note_retry(\"{transform}\"); sigil_rt::panic_point(\"after_retry\"); }} Ok(Err(e)) => return Err(e), Err(_) => return Err(sigil_rt::SigilError::Timeout), }} }} }}"
             );
         } else if let (Some(ms), true) = (timeout_ms, retries > 0) {
             let fallback = recover.clone().unwrap_or_else(|| transform.clone());
@@ -1257,7 +2783,7 @@ fn emit_pipeline(
 {indent}    let __in = {current};\n\
 {indent}    let mut __attempt: u64 = 0;\n\
 {indent}    loop {{\n\
-{indent}        match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{\n\
+{indent}        match tokio::time::timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{\n\
 {indent}            Ok(Ok(v)) => break v,\n\
 {indent}            _ if __attempt < {retries} => {{\n\
 {indent}                sigil_rt::panic_point(\"before_retry\");\n\
@@ -1275,7 +2801,7 @@ fn emit_pipeline(
                 )
             } else {
                 format!(
-                    "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ sigil_rt::panic_point(\"before_retry\"); __attempt = __attempt.saturating_add(1); sigil_rt::chaos::note_retry(\"{transform}\"); sigil_rt::panic_point(\"after_retry\"); }} _ => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
+                    "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match tokio::time::timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ sigil_rt::panic_point(\"before_retry\"); __attempt = __attempt.saturating_add(1); sigil_rt::chaos::note_retry(\"{transform}\"); sigil_rt::panic_point(\"after_retry\"); }} _ => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
                 )
             };
         } else if let Some(ms) = timeout_ms {
@@ -1284,7 +2810,7 @@ fn emit_pipeline(
                 let inner = format!(
                     "{{\n\
 {indent}    let __in = {current};\n\
-{indent}    match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{\n\
+{indent}    match tokio::time::timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{\n\
 {indent}        Ok(Ok(v)) => v,\n\
 {indent}        Ok(Err(_)) | Err(_) => {{\n\
 {indent}            sigil_rt::chaos::note_recovery(\"{transform}\");\n\
@@ -1296,7 +2822,7 @@ fn emit_pipeline(
                 current = inner;
             } else {
                 current = format!(
-                    "({{ let __in = {current}; match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => v, Ok(Err(_)) | Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }})"
+                    "{{ let __in = {current}; match tokio::time::timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => v, Ok(Err(_)) | Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }}"
                 );
             }
         } else if let Some(fallback) = recover {
@@ -1308,7 +2834,7 @@ fn emit_pipeline(
             } else {
                 // Untimed external stage with a declared recovery path.
                 current = format!(
-                    "({{ let __in = {current}; match {transform}(__in.clone()).await {{ Ok(v) => v, Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }})"
+                    "{{ let __in = {current}; match {transform}(__in.clone()).await {{ Ok(v) => v, Err(_) => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); {fallback}(__in).await? }} }} }}"
                 );
             }
         } else {
@@ -1681,7 +3207,12 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         "// outboxes, verified message types along every edge, proved the graph"
     );
     let _ = write!(out, "// acyclic, and staged shutdown so accepted in-process messages drain before\n// downstream channels close. Queues are volatile across process/host loss.\n// Sigil emits no explicit locks or shared mutable state.\n\n");
-    out.push_str("use sigil_gen::*;\nuse std::time::Instant;\n\n");
+    out.push_str(
+        "#![allow(clippy::field_reassign_with_default, clippy::modulo_one)]\n\
+         // The generated stress driver mutates schema defaults mechanically and\n\
+         // uses the same dispatch expression for one or many handlers.\n\
+         use sigil_gen::*;\nuse std::time::Instant;\n\n",
+    );
     out.push_str(
         "#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() -> sigil_rt::Result<()> {\n",
     );
@@ -1964,7 +3495,7 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
         ""
     };
     format!(
-        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.85\"\n\n[package.metadata.sigil]\ngenerated-abi = {GENERATED_ABI_VERSION}\nresidual-risk-schema = {RESIDUAL_RISK_SCHEMA_VERSION}\nrouting-hash = {ROUTING_HASH_VERSION}\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ version = \"={runtime_version}\", path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\ntracing = {{ version = \"0.1\", optional = true }}\n\n[features]\ndefault = []\n# Emits a tracing span per handler invocation. Off by default so the\n# generated crate adds no dependency you did not ask for.\ntracing = [\"dep:tracing\"]\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
+        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.85\"\n\n[package.metadata.sigil]\ngenerated-abi = {GENERATED_ABI_VERSION}\nresidual-risk-schema = {RESIDUAL_RISK_SCHEMA_VERSION}\nrouting-hash = {ROUTING_HASH_VERSION}\ndistributed-protocol = {DISTRIBUTED_PROTOCOL_VERSION}\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ version = \"={runtime_version}\", path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\ntracing = {{ version = \"0.1\", optional = true }}\n\n[features]\ndefault = []\n# Emits a tracing span per handler invocation. Off by default so the\n# generated crate adds no dependency you did not ask for.\ntracing = [\"dep:tracing\"]\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
     )
 }
 
@@ -2088,6 +3619,8 @@ pub fn emit_demo_main(program: &Program) -> String {
 // lock, no Arc, and no atomic in this program. State isolation is by
 // construction: each actor owns its state inside its own task.
 
+#![allow(clippy::field_reassign_with_default)]
+// The generated stress driver initializes arbitrary schemas mechanically.
 use sigil_gen::*;
 use std::time::Instant;
 
@@ -2233,5 +3766,36 @@ mod cargo_manifest_tests {
         let expected =
             pathdiff::diff_paths(workspace.join("sigil_rt"), &deep).expect("relative path");
         assert_eq!(relative, expected.to_string_lossy().replace('\\', "/"));
+    }
+
+    #[test]
+    fn schema_fingerprints_are_stable_and_structural() {
+        let base =
+            crate::frontend::ast::parse("schema M { value: Int }").expect("base schema parses");
+        let encodable = crate::analysis::topology::wire_encodable_schemas(&base);
+        let fingerprints = wire_schema_fingerprints(&base, &encodable);
+        assert_eq!(
+            fingerprints["M"],
+            [
+                0x4a, 0x6a, 0x73, 0xd9, 0xa3, 0x52, 0x94, 0xba, 0xbb, 0x97, 0x33, 0x76, 0x2f, 0xf0,
+                0x0d, 0xdf, 0xd2, 0x93, 0x5b, 0x04, 0x96, 0x3a, 0xab, 0x00, 0x3e, 0x07, 0xef, 0xe9,
+                0x3a, 0x6f, 0xf9, 0xea,
+            ]
+        );
+
+        for changed in [
+            "schema M { renamed: Int }",
+            "schema M { value: String }",
+            "schema M { value: Int, extra: Bool }",
+            "schema Child { value: Int } schema M { value: Child }",
+        ] {
+            let program = crate::frontend::ast::parse(changed).expect("changed schema parses");
+            let encodable = crate::analysis::topology::wire_encodable_schemas(&program);
+            assert_ne!(
+                wire_schema_fingerprints(&program, &encodable)["M"],
+                fingerprints["M"],
+                "layout change must alter the negotiated fingerprint: {changed}"
+            );
+        }
     }
 }

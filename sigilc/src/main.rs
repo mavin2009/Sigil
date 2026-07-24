@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use sigilc::{
     emit, emit_demo_main, emit_effect_contracts, level_banner, lower, parse,
     relative_sigil_rt_path, residual_risk_report, run_checks, write_generated_crate,
-    AssuranceLevel, GeneratedCrate, GENERATED_ABI_VERSION, RESIDUAL_RISK_SCHEMA_VERSION,
-    ROUTING_HASH_VERSION,
+    AssuranceLevel, GeneratedCrate, DISTRIBUTED_PROTOCOL_VERSION, GENERATED_ABI_VERSION,
+    RESIDUAL_RISK_SCHEMA_VERSION, ROUTING_HASH_VERSION,
 };
 
 const USAGE: &str =
@@ -97,8 +97,9 @@ fn main() -> Result<()> {
 
     let program = parse(&source).context("parsing")?;
     println!(
-        "Parsed {} schema(s), {} process(es), {} transform(s), {} spec(s)",
+        "Parsed {} schema(s), {} placement(s), {} process(es), {} transform(s), {} spec(s)",
         program.schemas.len(),
+        program.placements.len(),
         program.processes.len(),
         program.transforms.len(),
         program.specs.len()
@@ -224,6 +225,7 @@ fn emit_build_manifest(source_sha: &str, runtime_path: &str) -> String {
          \"runtime\": {},\n  \"generated_abi\": {GENERATED_ABI_VERSION},\n  \
          \"residual_risk_schema\": {RESIDUAL_RISK_SCHEMA_VERSION},\n  \
          \"routing_hash\": {ROUTING_HASH_VERSION},\n  \
+         \"distributed_protocol\": {DISTRIBUTED_PROTOCOL_VERSION},\n  \
          \"msrv\": \"1.85.0\",\n  \"verification_toolchain\": \"1.97.0\",\n  \
          \"source_sha256\": {},\n  \"workspace_lock_sha256\": {},\n  \
          \"runtime_path\": {}\n}}\n",
@@ -287,6 +289,14 @@ fn emit_residual_json(
                 json_string(&transform.name)
             ));
         }
+    }
+    if !program.placements.is_empty() {
+        items.extend([
+            "    {\"kind\":\"distributed_transport\",\"description\":\"remote acceptance is not actor handling or durable commit; loss, duplication, reordering, partition, authentication, and rolling-version behavior belong to the selected transport adapter\",\"owner\":\"deployment_owner\"}".to_string(),
+            "    {\"kind\":\"distributed_identity\",\"description\":\"at-least-once delivery requires durable producer sequences and a bounded receiver deduplication frontier checkpointed with actor state\",\"owner\":\"application_owner\"}".to_string(),
+            "    {\"kind\":\"shard_coordination\",\"description\":\"ShardLease provides a local epoch fence; globally unique ownership epochs, authenticated durable checkpoints, and single-successor handoff require a strongly consistent coordinator\",\"owner\":\"platform_owner\"}".to_string(),
+            "    {\"kind\":\"distributed_proof_boundary\",\"description\":\"Level-2 end-to-end latency and Level-4 system conservation are not discharged across remote placement boundaries\",\"owner\":\"compiler_operator\"}".to_string(),
+        ]);
     }
     items.extend([
         "    {\"kind\":\"volatile_durability\",\"description\":\"queued messages and actor state are in-memory and are not retained across process or host failure\",\"owner\":\"deployment_owner\"}".to_string(),
@@ -977,7 +987,7 @@ spec S { hold Down.got <= Up.kept }
         // And it emits an actual conditional.
         let rust = emit(&program, &irs);
         assert!(
-            rust.contains("if (m.n > 0) {"),
+            rust.contains("if m.n > 0 {"),
             "guarded send codegen: {rust}"
         );
     }
@@ -1073,7 +1083,7 @@ spec S { hold kept <= seen }
         let program = parse(&src).unwrap();
         let irs = lower(&program).unwrap();
         let rust = emit(&program, &irs);
-        assert!(rust.contains("if (ok.qty > 100) { 100 } else { 0 }"));
+        assert!(rust.contains("if ok.qty > 100 { 100 } else { 0 }"));
 
         let lit = r#"
 schema A { x: Int }
@@ -1811,6 +1821,32 @@ process Down {
         // Cascade shutdown: outboxes released when the actor drains
         assert!(rust.contains("self.risk_out = None"));
         assert!(rust.contains("self.settlement_out = None"));
+        // The production component API is emitted from that same topology.
+        assert!(rust.contains("pub struct ComponentConfig"));
+        assert!(rust.contains("pub struct ComponentHealth"));
+        assert!(rust.contains("pub struct Component"));
+        assert!(rust
+            .contains("pub fn ingress_gateway(&self) -> &sigil_rt::IngressRouter<GatewayHandle>"));
+        assert!(!rust.contains("pub fn ingress_risk(&self)"));
+        assert!(!rust.contains("pub fn ingress_settlement(&self)"));
+        assert!(rust.contains("pub fn admit_shed"));
+        assert!(rust.contains("pub async fn admit_deadline"));
+        assert!(rust.contains("pub fn health(&self) -> ComponentHealth"));
+        assert!(rust.contains("supervisor.register_as(format!(\"Gateway[{shard}]\"), task)?"));
+        let settlement_start = rust.find("// Start Settlement.").expect("sink startup");
+        let risk_start = rust.find("// Start Risk.").expect("middle startup");
+        let gateway_start = rust.find("// Start Gateway.").expect("entry startup");
+        assert!(settlement_start < risk_start && risk_start < gateway_start);
+        let gateway_stop = rust
+            .find("drop(gateway_ingress); // close Gateway")
+            .expect("entry shutdown");
+        let risk_stop = rust
+            .find("drop(risk_handles); // close Risk")
+            .expect("middle shutdown");
+        let settlement_stop = rust
+            .find("drop(settlement_handles); // close Settlement")
+            .expect("sink shutdown");
+        assert!(gateway_stop < risk_stop && risk_stop < settlement_stop);
         // Still shared-nothing: Sigil emits no explicit locks.
         assert!(no_shared_mutability(&rust));
         // Residual report knows the verified topology
@@ -1824,6 +1860,118 @@ process Down {
         assert!(main_rs.contains("inst.connect_risk"));
         assert!(main_rs.contains("inst.connect_settlement"));
         assert!(main_rs.contains("entry-stage message conservation"));
+    }
+
+    #[test]
+    fn distributed_placement_emits_only_cross_group_transport_boundaries() {
+        let source = r#"
+schema Order { id: String }
+placement edge { Gateway }
+placement core { Risk, Settlement }
+process Gateway {
+  on order: Order { send order to Risk by order.id @deadline(20.ms) }
+}
+process Risk {
+  on order: Order { send order to Settlement @deadline(20.ms) }
+}
+process Settlement { on order: Order {} }
+"#;
+        let (rust, risk, _) = compile_source(source);
+        assert!(rust.contains("pub const COMPONENT_PLACEMENT"));
+        assert!(
+            rust.contains("PlacementGroupDescriptor { name: \"edge\", processes: &[\"Gateway\"] }")
+        );
+        assert!(rust.contains(
+            "PlacementGroupDescriptor { name: \"core\", processes: &[\"Risk\", \"Settlement\"] }"
+        ));
+        assert!(rust.contains(
+            "from_group: \"edge\", from_process: \"Gateway\", to_group: \"core\", \
+             to_process: \"Risk\", schema: \"Order\""
+        ));
+        assert!(
+            !rust.contains(
+                "from_group: \"core\", from_process: \"Risk\", to_group: \"core\", \
+                 to_process: \"Settlement\""
+            ),
+            "co-located edges must not be advertised as remote boundaries"
+        );
+        assert!(rust.contains("pub fn transport_manifest("));
+        assert!(rust.contains("<Order as sigil_rt::distributed::WireCodec>::FINGERPRINT"));
+        assert!(rust.contains("DeliverySemantics::AtMostOnce"));
+        assert!(rust.contains("DeliverySemantics::AtLeastOnce"));
+        assert!(rust.contains("pub struct RemoteEndpoints"));
+        assert!(rust.contains(
+            "pub gateway_to_risk_order: Option<sigil_rt::distributed::DurableRemoteEndpoint<Order>>"
+        ));
+        assert!(rust.contains("endpoint 'gateway_to_risk_order' does not target placement"));
+        assert!(rust.contains("pub struct PlacementComponent"));
+        assert!(rust.contains("pub async fn deliver_risk_order"));
+        assert!(risk.contains("Level-2 end-to-end latency and Level-4 system"));
+        assert!(risk.contains("strongly consistent external coordinator"));
+    }
+
+    #[test]
+    fn component_assembly_metadata_matches_every_verified_topology() {
+        for source in [
+            include_str!("../../examples/concurrent/orderflow/orderflow.sigil"),
+            include_str!("../../examples/clearinghouse/clearing.sigil"),
+            include_str!("../../examples/avionics/attitude_control.sigil"),
+            include_str!("../../examples/concurrent/ledger/ledger.sigil"),
+        ] {
+            let program = parse(source).expect("example parses");
+            let graph = lower(&program).expect("example lowers");
+            let topology = sigilc::derive_topology(&program).expect("topology verifies");
+            let rust = emit(&program, &graph);
+
+            let start_order = topology
+                .order
+                .iter()
+                .rev()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert!(rust.contains(&format!(
+                "pub const START_ORDER: &'static [&'static str] = &[{start_order}];"
+            )));
+
+            let shutdown_order = topology
+                .order
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert!(rust.contains(&format!(
+                "pub const SHUTDOWN_ORDER: &'static [&'static str] = &[{shutdown_order}];"
+            )));
+
+            let edges = topology
+                .edges
+                .iter()
+                .map(|edge| format!("(\"{}\", \"{}\")", edge.from, edge.to))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert!(rust.contains(&format!(
+                "pub const EDGES: &'static [(&'static str, &'static str)] = &[{edges}];"
+            )));
+
+            for entry in &topology.entries {
+                assert!(rust.contains(&format!(
+                    "pub fn ingress_{}(&self) -> &sigil_rt::IngressRouter<{}Handle>",
+                    entry.to_lowercase(),
+                    entry
+                )));
+            }
+            for process in program
+                .processes
+                .iter()
+                .filter(|process| !topology.entries.contains(&process.name))
+            {
+                assert!(!rust.contains(&format!(
+                    "pub fn ingress_{}(&self)",
+                    process.name.to_lowercase()
+                )));
+            }
+        }
     }
 
     /// Every process must compile to a shared-nothing actor: state moves into

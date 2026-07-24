@@ -9,7 +9,7 @@
 //!     rejected until an explicit async-boundary construct exists)
 
 use crate::analysis::types::type_name;
-use crate::frontend::ast::{Expr, Program, Route, Stmt};
+use crate::frontend::ast::{Expr, Program, Route, Stmt, Type};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,6 +45,62 @@ impl Topology {
 
     pub fn targets_of(&self, process: &str) -> Vec<&TopologyEdge> {
         self.edges.iter().filter(|e| e.from == process).collect()
+    }
+
+    /// Verified edges whose endpoints belong to different explicit placement
+    /// groups. An empty placement declaration set means fully local assembly.
+    pub fn remote_edges<'a>(&'a self, program: &Program) -> Vec<&'a TopologyEdge> {
+        if program.placements.is_empty() {
+            return Vec::new();
+        }
+        let groups = program
+            .placements
+            .iter()
+            .flat_map(|placement| {
+                placement
+                    .processes
+                    .iter()
+                    .map(move |process| (process.as_str(), placement.name.as_str()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.edges
+            .iter()
+            .filter(|edge| groups.get(edge.from.as_str()) != groups.get(edge.to.as_str()))
+            .collect()
+    }
+}
+
+/// Locally declared schemas for which the compiler can emit a complete,
+/// deterministic wire codec without assuming anything about foreign types.
+///
+/// This is a least fixed point: a schema becomes encodable only after every
+/// named field it contains is already encodable. It consequently excludes
+/// foreign bindings, unknown names, and infinitely recursive value layouts.
+pub fn wire_encodable_schemas(program: &Program) -> BTreeSet<String> {
+    let mut encodable = BTreeSet::new();
+    loop {
+        let before = encodable.len();
+        for schema in &program.schemas {
+            if schema.binding.is_some() || encodable.contains(&schema.name) {
+                continue;
+            }
+            let fields_are_encodable = schema.fields.iter().all(|(_, field)| match field {
+                Type::Int
+                | Type::Float
+                | Type::String
+                | Type::Bool
+                | Type::UUID
+                | Type::Bytes
+                | Type::Duration => true,
+                Type::Named(name) => encodable.contains(name),
+            });
+            if fields_are_encodable {
+                encodable.insert(schema.name.clone());
+            }
+        }
+        if encodable.len() == before {
+            return encodable;
+        }
     }
 }
 
@@ -323,11 +379,87 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
         );
     }
 
-    Ok(Topology {
+    let topology = Topology {
         edges,
         order,
         entries,
-    })
+    };
+
+    if !program.placements.is_empty() {
+        let encodable = wire_encodable_schemas(program);
+        let groups = program
+            .placements
+            .iter()
+            .flat_map(|placement| {
+                placement
+                    .processes
+                    .iter()
+                    .map(move |process| (process.as_str(), placement.name.as_str()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let remote_edges = topology.remote_edges(program);
+        let mut endpoint_fields = BTreeMap::<String, (&str, &str, &str)>::new();
+        for edge in &remote_edges {
+            if !encodable.contains(&edge.msg_type) {
+                bail!(
+                    "topology violation in process '{}': remote edge to '{}' carries `{}` but \
+                     no deterministic wire codec can be generated. Remote messages must use a \
+                     locally declared, finite schema whose nested fields are also locally \
+                     declared schemas; foreign bound types require an explicit adapter",
+                    edge.from,
+                    edge.to,
+                    edge.msg_type
+                );
+            }
+            let field = format!(
+                "{}_to_{}_{}",
+                edge.from.to_lowercase(),
+                edge.to.to_lowercase(),
+                edge.msg_type.to_lowercase()
+            );
+            if let Some((previous_from, previous_to, previous_schema)) = endpoint_fields.insert(
+                field.clone(),
+                (edge.from.as_str(), edge.to.as_str(), edge.msg_type.as_str()),
+            ) {
+                bail!(
+                    "topology violation: remote endpoint field '{field}' collides between \
+                     {previous_from}->{previous_to} `{previous_schema}` and {}->{} `{}`; \
+                     rename the case-distinct schemas",
+                    edge.from,
+                    edge.to,
+                    edge.msg_type
+                );
+            }
+        }
+        for process in &program.processes {
+            for handler in &process.handlers {
+                for statement in &handler.body {
+                    let Stmt::Send {
+                        target,
+                        backpressure,
+                        ..
+                    } = statement
+                    else {
+                        continue;
+                    };
+                    if groups.get(process.name.as_str()) != groups.get(target.as_str())
+                        && matches!(backpressure, crate::frontend::ast::Backpressure::Block)
+                    {
+                        bail!(
+                            "topology violation in process '{}': remote send to '{}' uses \
+                             `@block`. Cross-host admission must use `@shed` or a finite \
+                             `@deadline`; an unbounded wait can consume all producers during a \
+                             partition",
+                            process.name,
+                            target
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(topology)
 }
 
 #[cfg(test)]
@@ -385,6 +517,43 @@ process B {
         let program = parse(&src).expect("parse");
         let err = derive_topology(&program).expect_err("must reject cycle");
         assert!(format!("{err}").contains("cycle"));
+    }
+
+    #[test]
+    fn remote_edges_require_a_complete_compiler_owned_codec() {
+        let bound = r#"
+schema Foreign = service::Foreign { value: Int }
+placement edge { A }
+placement core { B }
+process A { on m: Foreign { send m to B @shed } }
+process B { on m: Foreign {} }
+"#;
+        let program = parse(bound).expect("bound schema parses");
+        let error = derive_topology(&program).expect_err("foreign wire type must be rejected");
+        assert!(error.to_string().contains("explicit adapter"));
+
+        let nested = r#"
+schema Foreign = service::Foreign { value: Int }
+schema M { nested: Foreign }
+placement edge { A }
+placement core { B }
+process A { on m: M { send m to B @shed } }
+process B { on m: M {} }
+"#;
+        let program = parse(nested).expect("nested schema parses");
+        let error = derive_topology(&program).expect_err("nested foreign wire type must fail");
+        assert!(error.to_string().contains("no deterministic wire codec"));
+
+        let blocking = r#"
+schema M { value: Int }
+placement edge { A }
+placement core { B }
+process A { on m: M { send m to B @block } }
+process B { on m: M {} }
+"#;
+        let program = parse(blocking).expect("blocking program parses");
+        let error = derive_topology(&program).expect_err("remote block must fail");
+        assert!(error.to_string().contains("unbounded wait"));
     }
 
     #[test]

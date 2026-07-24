@@ -36,6 +36,29 @@ events are retained with the deployment.
    migration. Never mix versions in one affinity-sharded fleet, and repeat
    the bounded soak test with production message sizes.
 
+## Distributed shard handoff
+
+1. Stop assigning new keys to the source shard and obtain a strictly greater
+   epoch from the deployment's strongly consistent coordinator.
+2. Call `begin_drain`. Treat every old-epoch `NotServing` response as a
+   redirect/retry decision under the declared delivery contract, never as
+   permission to bypass the fence.
+3. Wait for `in_flight() == 0`. An ownership permit must remain alive through
+   the complete state mutation, not merely until local queue admission.
+4. Checkpoint actor state and the exact deduplication frontier together.
+   Persist and authenticate the checkpoint before `complete_handoff`.
+5. Deliver the resulting non-cloneable handoff bundle to only the coordinator-
+   selected owner. Restore and verify while the successor is `Pending`.
+6. Call `activate` only after restoration succeeds. Reject stale epochs and
+   keep the retired source unable to serve.
+7. On a failed drain before completion, `cancel_drain` may reopen only the
+   original owner and epoch. After completion, recovery requires coordinator
+   reconciliation; the source lease cannot be reopened.
+
+Never allocate epochs from a node-local counter or infer ownership from
+service discovery. `ShardLease` is the local data-plane fence, not the global
+consensus system.
+
 ## Partial shutdown
 
 1. Stop admission, then close actors in topological order from sources to

@@ -111,6 +111,20 @@ pub fn level4_prove(program: &Program) -> Result<Level4Report> {
         return Ok(report);
     }
     let topo = derive_topology(program)?;
+    let remote = topo.remote_edges(program);
+    if !remote.is_empty() {
+        bail!(
+            "Level-4 violation: system holds cross a topology containing remote placement \
+             boundaries ({}). Transport loss/duplication semantics are not part of the \
+             conservation proof; keep the theorem within one placement group or discharge it \
+             in a transport-aware external proof.",
+            remote
+                .iter()
+                .map(|edge| format!("{} -> {}", edge.from, edge.to))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let preconds = input_preconditions(program);
 
     for h in &holds {
@@ -722,5 +736,29 @@ spec Unsupported {
         let program = parse(source).expect("parse");
         let error = level4_prove(&program).expect_err("Float theorem must not be emitted");
         assert!(error.to_string().contains("system Float holds"));
+    }
+
+    #[test]
+    fn system_conservation_fails_closed_across_remote_boundaries() {
+        let source = r#"
+schema M { value: Int }
+placement ingress { Up }
+placement workers { Down }
+process Up {
+  state sent: Int = 0
+  on m: M {
+    sent := sent + 1
+    send m to Down @deadline(5.ms)
+  }
+}
+process Down {
+  state received: Int = 0
+  on m: M { received := received + 1 }
+}
+spec Conservation { hold Down.received <= Up.sent }
+"#;
+        let program = parse(source).expect("parse");
+        let error = level4_prove(&program).expect_err("transport semantics are outside Level 4");
+        assert!(error.to_string().contains("remote placement boundaries"));
     }
 }

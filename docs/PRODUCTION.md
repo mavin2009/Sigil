@@ -8,6 +8,8 @@ document covers the parts that are not obvious.
 - [Wiring external transforms](#wiring-external-transforms)
 - [Capacity and back-pressure tuning](#capacity-and-back-pressure-tuning)
 - [Lifecycle: startup and graceful shutdown](#lifecycle-startup-and-graceful-shutdown)
+- [Concurrent ingress and readiness](#concurrent-ingress-and-readiness)
+- [Distributed placement and shard handoff](#distributed-placement-and-shard-handoff)
 - [Panics and task supervision](#panics-and-task-supervision)
 - [Observability](#observability)
 - [Performance characterization](#performance-characterization)
@@ -43,7 +45,9 @@ deployments so regeneration never overwrites integration code:
 ```
 transform fetch_secret(r: Request) -> Request {}
 
-transform fetch_secret(r: Request) -> Request = kms::fetch @effect(idempotent, cancel_safe, read)
+transform fetch_secret(r: Request) -> Request =
+  kms::fetch
+    @effect(idempotent, cancel_safe, read)
 ```
 
 ```rust
@@ -76,9 +80,11 @@ on their infallibility.
 
 ## Capacity and back-pressure tuning
 
-`spawn(self, capacity)` validates and sets the per-actor inbox size. The
-number of queued message slots is bounded, which is the point of bounded
-channels:
+`ComponentConfig` sets the shard count and per-actor inbox size independently
+for every process. `Component::start` validates all of them before spawning
+the first actor. The lower-level `spawn(self, capacity)` API performs the same
+capacity validation when manual assembly is required. The number of queued
+message slots is bounded:
 
 ```
 queued slots  =  sum over actors(capacity)
@@ -109,45 +115,249 @@ which one your product wants, per edge, and write it down in the source.
 
 ## Lifecycle: startup and graceful shutdown
 
-Wire sinks first, then upstream stages, so every outbox points at a live
-handle:
+Use the generated component API for production assembly:
 
 ```rust
-let mut sinks = Vec::new();
-let mut supervisor = sigil_rt::Supervisor::new();
-for _ in 0..shards {
-    let (h, task) = Settlement::new().spawn(capacity)?;
-    sinks.push(h);
-    supervisor.register(task)?;
-}
+let mut config = ComponentConfig::default();
+config.gateway = ProcessConfig {
+    shards: 8,
+    inbox_capacity: 1_024,
+};
+config.settlement = ProcessConfig {
+    shards: 4,
+    inbox_capacity: 2_048,
+};
 
-let mut gateways = Vec::new();
-for _ in 0..shards {
-    let mut g = Gateway::new();
-    g.connect_settlement(sinks.clone())?;
-    let (handle, task) = g.spawn(capacity)?;
-    gateways.push(handle);
-    supervisor.register(task)?;
-}
+let mut component = Component::start(config)?;
+component
+    .ingress_gateway()
+    .round_robin()
+    .send(request)
+    .await?;
+export_snapshots(component.snapshots());
 ```
 
-Shut down **in topological order**. Dropping a stage's handles closes its
-inboxes; its actors drain, release their own outboxes, and the shutdown
-cascades downstream:
+`Component::start` requires an active Tokio runtime and returns a typed
+configuration error when there is none. It preflights every shard count,
+capacity, and handle-vector reservation before startup, creates sinks first,
+wires verified routes, and registers shards under unique operational names
+such as `Gateway[3]`. Only zero-indegree processes expose
+`ingress_<process>()` methods.
 
 ```rust
-drop(gateways);
-drop(sinks);
-let reports = supervisor.shutdown(Duration::from_secs(10)).await;
+let reports = component.shutdown(Duration::from_secs(10)).await;
 for report in reports { export(report); }
 ```
 
-`Supervisor::next_event` exposes panic/cancellation while the rest of the
-component is still running. `ActorTask` is `must_use`, and dropping one
-aborts rather than silently detaching it. Dropping `Supervisor` also aborts
-every actor it still owns. Shutting down out of order is where hand-written
-actor systems hang. The order is derivable from `topology.mmd`, and the graph
-is proven acyclic, so one exists.
+Shutdown releases component-owned handles in `Component::SHUTDOWN_ORDER`,
+which is generated directly from the verified acyclic graph. Upstream actors
+drain and release their outboxes before downstream actors stop. Any external
+ingress clone retained by application code can delay closure, so the hard
+deadline still applies and produces explicit `ShutdownDeadline` reports.
+
+Manual `new` / `connect_*` / `spawn` remains available for specialized
+integration. Register multiple manual shards with
+`Supervisor::register_as("Gateway[0]", task)` so operational names are
+unique. `ActorTask` is `must_use`; dropping it aborts rather than silently
+detaching work. `Component::next_event` exposes panic/cancellation while the
+rest of the component is still running and is intended to be selected
+alongside the application's other control-plane events.
+
+## Concurrent ingress and readiness
+
+Each entry process exposes a cloneable `IngressRouter<Handle>`. All clones
+share one atomic round-robin cursor, so producer tasks distribute admission
+across the fleet instead of each restarting at shard zero:
+
+```rust
+let ingress = component.ingress_gateway().clone();
+for producer in producers {
+    let ingress = ingress.clone();
+    tokio::spawn(async move {
+        while let Some(request) = producer.next().await {
+            ingress.round_robin().send(request).await?;
+        }
+        Ok::<_, sigil_rt::SigilError>(())
+    });
+}
+```
+
+For affinity, `by_key` uses the same versioned stable hash as internal
+`send ... by key` routing:
+
+```rust
+ingress.by_key(&account_id).send(request).await?;
+```
+
+Changing a stateful process's shard count changes key placement. It is a
+deployment migration, not an in-place configuration edit. Cross-host
+migration uses the epoch-fenced protocol described under
+[Distributed placement and shard handoff](#distributed-placement-and-shard-handoff).
+
+Ingress admission is explicit:
+
+| Method | Full inbox behavior | Result |
+| ------ | ------------------- | ------ |
+| `send(message)` | waits | `Result<()>` |
+| `admit_shed(message)` | returns immediately | `SendOutcome::Shed` |
+| `admit_deadline(message, duration)` | waits only to the deadline | `SendOutcome::Shed` on expiry |
+
+For a multi-handler entry, construct its generated dispatch enum when using
+the bounded methods, for example
+`GatewayMsg::NewOrder(order)`. Admission shedding happens before actor
+acceptance; the caller must export the returned outcome as boundary
+telemetry.
+
+`component.health()` returns the expected actor count, currently running
+shard names, and live accounting snapshots. `is_ready()` means every
+generated actor is running:
+
+```rust
+let health = component.health();
+if !health.is_ready() {
+    mark_not_ready(health.unavailable_actors(), health.snapshots);
+}
+```
+
+This is component readiness, not dependency or business-level health.
+Applications must combine it with their foreign-service and durability
+checks.
+
+## Distributed placement and shard handoff
+
+Declare co-location explicitly:
+
+```
+placement edge { Gateway }
+placement core { RiskEngine, Settlement }
+```
+
+When any placement exists, every process must belong to exactly one group.
+The compiler emits `COMPONENT_PLACEMENT`; only verified edges crossing group
+boundaries appear in `remote_boundaries`. It also emits
+`transport_manifest(max_payload_bytes)`, including the boundary schemas and a
+protocol-compatible at-most-once and at-least-once delivery contract.
+
+`Component::start` runs the complete verified reference topology inside one
+Tokio runtime. `PlacementComponent::start(...).await` instead starts only one
+declared placement: same-placement edges remain typed channels and every
+cross-placement output requires its generated `DurableRemoteEndpoint<T>`.
+Sigil does not ship a network driver or choose service discovery; a deployment
+adapter implements `Transport` at each advertised boundary.
+
+Before traffic is admitted, peers must negotiate:
+
+- the distributed protocol version;
+- the routing-hash version;
+- the highest common version of each message schema whose compiler-derived
+  structural SHA-256 fingerprint also matches;
+- at-most-once or at-least-once delivery; and
+- a maximum payload size.
+
+Remote admission is always bounded:
+
+```rust
+let outcome = transport
+    .admit(envelope, RemoteAdmission::deadline(Duration::from_millis(20))?)
+    .await?;
+```
+
+There is no remote equivalent of an indefinitely blocking send.
+The compiler rejects `@block` on every cross-placement edge; use `@shed` or a
+finite `@deadline`.
+`TransportOutcome::Accepted` means accepted by the bounded transport, not
+handled or committed by the actor. `Shed` is expected policy output.
+Exactly-once is intentionally absent. At-most-once can lose; at-least-once can
+duplicate and therefore requires durable producer sequences plus
+receiver-side deduplication.
+
+Generated schemas expose `encode_remote`, `decode_remote`, and
+`authorize_remote`. The codec limit is always intersected with the negotiated
+payload ceiling:
+
+```rust
+let limits = CodecLimits::new(64 * 1024, 16 * 1024)?;
+let envelope = order.encode_remote(
+    &session,
+    destination,
+    message_id,
+    DeliverySemantics::AtMostOnce,
+    limits,
+)?;
+let authorized =
+    Order::authorize_remote(&session, &lease, &envelope, limits)?;
+apply(authorized.message()).await?;
+drop(authorized); // releases the ownership permit after state mutation
+```
+
+The wire layout is declaration-order, little-endian, and strict. Strings and
+bytes have `u32` lengths checked before allocation; booleans accept only
+`0`/`1`; strings must be UTF-8; floats must be finite; durations must have
+valid nanoseconds; truncation and trailing bytes are errors. A remote message
+must be a finite locally declared schema. Bound foreign types, including
+foreign types nested inside a local schema, require an explicit adapter and
+otherwise fail compilation.
+
+The fingerprint covers the schema name, ordered field names and primitive
+kinds, and nested schema fingerprints. Editing any of those while retaining
+schema version 1 therefore makes rolling peers reject negotiation instead of
+decoding the new bytes with an old layout. Future compatible evolution can
+advertise multiple explicit versions; the current generated codec advertises
+one exact version and fails closed on every structural change.
+
+`RemoteEndpoint<T>` combines one typed schema, a negotiated `Transport`, a
+consistent set of fenced destination shards, and a `MessageIdSource`. It
+provides round-robin, stable-key, and broadcast admission. Generated
+`RemoteEndpoints` gathers every outbound boundary and verifies the declared
+target placement/process and one deployment identity. At-least-once endpoints
+refuse `VolatileMessageIds`; a production adapter must return `Durable` only
+after it has durably advanced or reserved the producer sequence.
+
+`DurableRemoteEndpoint<T>` combines that typed endpoint with a
+`DurableOutbox`. It persists the exact envelope before the first admission,
+durably records every attempt before transport I/O, and retains accepted,
+failed, shed, partitioned, and exhausted work until a matching durable
+receiver acknowledgement arrives. Retry exhaustion is visible but never
+deletes the record.
+
+Generated placement startup requires one `StateCommitter<Process>` for each
+remote receiver shard. Startup restores application state and its
+deduplication frontier before spawning the actor. The generated
+`deliver_<process>_<handler>` method moves an owned `AuthorizedMessage<T>`
+through the bounded receiver inbox; its ownership permit remains live through
+the handler and atomic state/identity commit. At-least-once acknowledgement is
+therefore emitted only after durable commit. A committed replay skips the
+handler and returns an idempotent duplicate receipt.
+
+Stateful shard movement is fenced by a monotonically increasing
+`OwnershipEpoch`:
+
+```rust
+let plan = source.begin_drain(node_b, next_epoch)?;
+// Stop new old-epoch admissions and retain every OwnershipPermit until its
+// message has finished mutating state.
+let bundle = source.complete_handoff(plan, checkpoint)?;
+let (successor, checkpoint) = ShardLease::receive_handoff(bundle, &local_node)?;
+restore_and_verify(checkpoint)?;
+successor.activate()?;
+```
+
+`complete_handoff` fails while any ownership permit is live. The source is
+permanently retired before the successor can be activated, and stale epochs
+are rejected. State and the deduplication frontier travel together in
+`ShardCheckpoint`.
+
+The local fence cannot elect a global owner. Production deployments still
+need a strongly consistent coordinator to allocate epochs, durable checkpoint
+storage, authentication/encryption, service discovery, a codec adapter for
+any deliberately bound foreign type, and a rule that one non-cloneable
+handoff bundle reaches only one successor. These items appear in generated
+residual-risk output for programs with placement declarations.
+
+Level-1 type/acyclic topology checks and Level-3 process-local invariants
+remain available. `require path_latency` and Level-4 cross-process
+conservation fail closed when a remote boundary exists: transport timing,
+loss, and duplication are not silently imported into an in-process theorem.
 
 ## Panics and task supervision
 
@@ -241,6 +451,12 @@ cargo run -p sigilc -- component.sigil out --level 4 --emit-graph
 cd out && cargo build && cargo test
 ```
 
+Sigil's repository Actions are deliberately manual. Dispatch `ci` after a
+commit when a hosted OS/MSRV/Miri/fuzz matrix is useful; select its extended
+evidence input when mutation testing and the bounded soak are warranted.
+Dispatch `release-artifacts` explicitly for signed release evidence. Neither
+workflow runs merely because a commit or tag was pushed.
+
 **Generate in CI or vendor the output?** Both are defensible. Vendoring
 makes the compiled artifact reviewable in a pull request — which matters,
 because the generated code *is* the thing that runs. Generating in CI keeps
@@ -261,7 +477,8 @@ Sigil owns concurrency, failure structure, and the proofs. It does not own:
 - the correctness of your external transforms;
 - the OS, scheduler, and runtime it executes on;
 - capacity numbers chosen for your traffic;
-- durable inbox/outbox or reconciliation across process and host failure;
+- a network transport, durable inbox/outbox, global epoch coordinator, or
+  reconciliation across process and host failure;
 - whether the invariant you wrote is the invariant your business needs.
 
 That last one deserves emphasis. The compiler proves that

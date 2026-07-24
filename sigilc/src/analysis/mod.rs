@@ -25,6 +25,6 @@ pub use reference::{
     interpret_handler, record as reference_record, ReferenceResult, ReferenceValue, TraceEvent,
 };
 pub use residual::residual_risk_report;
-pub use topology::{derive_topology, Topology, TopologyEdge};
+pub use topology::{derive_topology, wire_encodable_schemas, Topology, TopologyEdge};
 pub use typecheck::{check_effect_contracts, check_types};
 pub use types::{infer_program, type_name, TransformTypes, TypeEnv};

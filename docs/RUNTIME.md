@@ -41,7 +41,7 @@ locality check, and a timeout in A could be "paired" by a recover in B.
 ```
 out_dir/
   Cargo.toml          standalone [workspace], depends on sigil_rt
-  src/lib.rs          schemas, transforms, processes, actors, smoke test
+  src/lib.rs          schemas, transforms, actors, component assembly, smoke test
   src/main.rs         concurrent demo driver (with --emit-main)
   RESIDUAL_RISK.md    what was proven, assumed, and skipped
   RESIDUAL_RISK.json  versioned, owned residual items
@@ -132,11 +132,44 @@ pub struct Gateway {
 }
 ```
 
-The demo driver spawns **sinks first** so upstream stages can be wired to
-live handles, then shuts down stage by stage in topological order. Closing a
-stage's channels drains its actors, which release their outboxes, cascading
-the shutdown downstream. A production supervisor adds a hard deadline and
-reports every undrained accepted message if draining cannot complete.
+Generated crates also expose `ProcessConfig`, `ComponentConfig`, and
+`Component`. `Component::start` validates the complete configuration before
+startup, reserves handle storage, spawns **sinks first**, connects every
+verified route, and registers each shard with its supervisor:
+
+```rust
+let mut config = ComponentConfig::default();
+config.gateway.shards = 8;
+config.gateway.inbox_capacity = 1_024;
+config.risk.shards = 16;
+
+let component = Component::start(config)?;
+component.ingress_gateway().round_robin().send(order).await?;
+let reports = component.shutdown(Duration::from_secs(10)).await;
+```
+
+Only zero-indegree processes expose `ingress_<process>()`; internal-stage
+handles cannot accidentally become an undeclared external entry point.
+Each ingress is a cloneable `IngressRouter` whose clones share an atomic
+round-robin cursor. `by_key` uses the same routing-hash version as actor
+outboxes. Handles also expose immediate-shed and duration-deadline admission
+alongside their existing blocking `send`.
+`Component::START_ORDER`, `SHUTDOWN_ORDER`, and `EDGES` make the generated
+assembly auditable against the exported graph.
+
+Explicit `placement` declarations additionally emit `COMPONENT_PLACEMENT`.
+Only edges between different groups appear as `RemoteBoundaryDescriptor`
+values. Generated `transport_manifest(max_payload_bytes)` advertises the
+component's protocol, routing-hash, boundary schemas, payload limit, and
+at-most-once/at-least-once protocol capabilities. Generated
+`PlacementComponent::start(...).await` starts only one placement, connects
+local edges directly, and requires typed durable endpoints for remote output.
+
+Shutdown closes component-owned handles stage by stage in topological order.
+Each actor drains and releases its outboxes, cascading closure downstream.
+The supervisor applies a hard deadline and reports every undrained accepted
+message if an application-retained ingress clone or stuck handler prevents
+draining.
 
 Shutdown ordering is where hand-written actor systems deadlock. Here it is
 derived from the graph the compiler already proved acyclic.
@@ -153,16 +186,96 @@ The runtime is deliberately small:
 
 | Item | Purpose |
 | ---- | ------- |
-| `SigilError` | typed timeout, transform, schema, configuration, stopped, panicked, and cancelled failures |
+| generated `Component` | validated assembly, concurrent routed ingress, readiness, topology-owned shutdown |
+| `SigilError` | typed timeout, transform, schema, configuration, distributed, stopped, panicked, and cancelled failures |
 | `ActorStats` / `ActorSnapshot` | complete terminal counters / live accepted, handled, dropped, shed |
-| `ActorTask` / `Supervisor` | no silent detach; live termination events and bounded shutdown |
+| `ActorTask` / `Supervisor` | no silent detach; shard-qualified registration, live termination events, bounded shutdown |
 | `Router<H>` | shard ring: `round_robin`, `by_key`, `shards` |
+| `IngressRouter<H>` | cloneable producer router with one shared atomic cursor and stable-key affinity |
+| `distributed::Transport` | bounded remote admission under a negotiated protocol/schema/delivery session |
+| `distributed::WireEnvelope` | message identity, fenced shard address, schema version, delivery semantics, and opaque bytes |
+| `distributed::WireCodec` | deterministic generated schema encoding with explicit total/field ceilings |
+| `distributed::{WireEncoder, WireDecoder}` | checked little-endian primitives, length validation before allocation, and canonical-value rejection |
+| `distributed::AuthorizedMessage` | typed decoded payload plus the live, non-cloneable shard ownership permit |
+| `distributed::RemoteEndpoint<T>` | typed round-robin, stable-key, and broadcast admission to fenced remote shards |
+| `distributed::DurableOutbox` | persist-before-send, durable attempts, bounded retry, and checked idempotent acknowledgement |
+| `distributed::DurableRemoteEndpoint<T>` | generated typed routing through a durable at-least-once outbox |
+| `distributed::StateCommitter<S>` | per-shard restore, dedup lookup, and atomic application-state/message-ID commit |
+| generated `PlacementComponent` | placement-local startup, typed receiver permit handoff, health, and bounded shutdown |
+| `distributed::MessageIdSource` | adapter contract for unique producer sequences; at-least-once requires declared durable state |
+| `distributed::ShardLease` | one-atomic epoch/phase/permit fence for drain, checkpoint, and handoff |
+| `distributed::DedupWindow` | bounded exact duplicate suppression with a checkpointable frontier |
 | `SendOutcome` | `Delivered` \| `Shed` |
 | `validate_channel_capacity` | rejects capacities that would make Tokio panic |
 | `join_actor` / `join_task` | converts Tokio panic/cancellation joins to typed Sigil errors |
 | `tracked_spawn_blocking` | retains accounting for blocking work after timeout cancellation |
 | `backpressure::{block, shed, deadline}` | the three declared policies |
 | `chaos` | fault injection and counters |
+
+## Distributed runtime contract
+
+`sigil_rt::distributed` is a transport integration boundary, not a bundled
+network stack. Peers exchange `TransportManifest` values and
+`NegotiatedTransport::negotiate` selects the highest common protocol and
+schema versions with identical structural fingerprints, intersects delivery
+semantics, requires an identical routing hash, and chooses the smaller payload
+ceiling. Every received envelope must be validated against that immutable
+session.
+
+Generated schemas implement `WireCodec` at schema version 1 and expose typed
+envelope helpers. Their `SchemaFingerprint` is a compiler-derived SHA-256 over
+the ordered recursive layout; a same-version layout mismatch cannot negotiate.
+`CodecLimits` requires nonzero total-payload and
+individual-field ceilings. Encoding uses checked capacity arithmetic and
+fallible reservation. Decoding checks the complete payload ceiling before
+reading, validates every length prefix before allocating, and rejects
+truncation, trailing bytes, invalid UTF-8 and booleans, non-finite floats, and
+invalid duration nanoseconds. `authorize_and_decode` validates the negotiated
+schema and current shard epoch, then returns an `AuthorizedMessage`; its
+ownership permit stays live until the caller finishes applying the message.
+
+Remote admission deliberately supports only immediate shed and a finite
+deadline. `TransportOutcome::Accepted` means the bounded transport accepted
+the envelope; it does not mean that the remote actor handled or durably
+committed it. Exactly-once is not offered. At-least-once adapters must persist
+producer sequence state and use `DedupWindow` or an equivalent durable,
+bounded duplicate ledger.
+
+`RemoteEndpoint<T>` validates that its destinations all belong to one
+deployment, placement group, and process and contain no duplicate shard. It
+uses the same `StableRouteKey` hash as local routing and obtains a new
+`MessageId` for each envelope, including each broadcast destination.
+`VolatileMessageIds` is suitable only for at-most-once sessions with a fresh
+producer identity after restart. At-least-once construction fails unless the
+supplied source declares durable sequence state.
+
+`DurableRemoteEndpoint<T>` additionally requires a negotiated at-least-once
+session and the same session as its `DurableOutbox`. The outbox persists exact
+bytes and attempt counts before I/O and removes a record only for a matching
+`DeliveryAck` backed by `DurableCommit` evidence. Generated receiver delivery
+uses an owned permit, bounded actor-inbox admission, and
+`StateCommitter<Process>`; startup restores state and deduplication together,
+then each successful handler result is committed with its message identity
+before acknowledgement.
+
+`ShardLease` fences the data plane by `ShardAddress { key, owner, epoch }`.
+Its phase and live permit count share one atomic word, so a weak-memory race
+cannot complete handoff while a serving permit is live. The migration
+sequence is:
+
+1. acquire and retain an ownership permit through every state mutation;
+2. `begin_drain`, which closes new admissions at the old epoch;
+3. wait for the permit count to reach zero and create a `ShardCheckpoint`
+   containing state plus the deduplication frontier;
+4. `complete_handoff`, permanently retiring the source lease;
+5. `receive_handoff` on the named successor, restore and verify the checkpoint
+   while its lease is `Pending`, then `activate`.
+
+The runtime fence is local. A strongly consistent external coordinator must
+allocate monotonically increasing epochs, durably store checkpoints, and
+ensure a handoff bundle is delivered to only one successor. The generated
+in-process `Component` remains useful as the reference execution and does not
+itself schedule processes across hosts.
 
 ## Fault injection
 

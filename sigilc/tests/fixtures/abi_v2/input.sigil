@@ -1,0 +1,12 @@
+extern crate service = "1"
+
+schema M { value: Int }
+
+transform read(m: M) -> M =
+  service::read
+    @effect(idempotent, cancel_safe, read)
+
+process P {
+  state total: Int = 0
+  on m: M { total := total + m.value }
+}

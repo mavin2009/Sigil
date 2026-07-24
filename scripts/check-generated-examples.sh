@@ -16,6 +16,7 @@ examples=(
   concurrent/ledger/ledger.sigil
   concurrent/orderflow/orderflow.sigil
   counter/counter.sigil
+  distributed/order_fleet.sigil
   finance/clearing.sigil
   ingest/ingest.sigil
   level2/slo_and_hold.sigil
@@ -36,15 +37,23 @@ for relative in "${examples[@]}"; do
   "$SIGILC" "$SIGIL_ROOT/examples/$relative" "$output" --emit-main --emit-graph --level 1 \
     >"$log" 2>&1
   cargo generate-lockfile --manifest-path "$output/Cargo.toml" --offline >>"$log" 2>&1
-  if ! CARGO_TARGET_DIR="$SIGIL_ROOT/target/generated-example-matrix" \
+  if ! RUSTFLAGS="-D warnings" \
+    CARGO_TARGET_DIR="$SIGIL_ROOT/target/generated-example-matrix" \
     cargo check --manifest-path "$output/Cargo.toml" --locked --offline \
       --no-default-features >>"$log" 2>&1; then
     cat "$log"
     exit 1
   fi
-  if ! CARGO_TARGET_DIR="$SIGIL_ROOT/target/generated-example-matrix" \
+  if ! RUSTFLAGS="-D warnings" \
+    CARGO_TARGET_DIR="$SIGIL_ROOT/target/generated-example-matrix" \
     cargo check --manifest-path "$output/Cargo.toml" --locked --offline \
       --all-features >>"$log" 2>&1; then
+    cat "$log"
+    exit 1
+  fi
+  if ! CARGO_TARGET_DIR="$SIGIL_ROOT/target/generated-example-matrix" \
+    cargo clippy --manifest-path "$output/Cargo.toml" --locked --offline \
+      --all-targets --all-features -- -D warnings >>"$log" 2>&1; then
     cat "$log"
     exit 1
   fi

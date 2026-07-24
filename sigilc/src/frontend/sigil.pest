@@ -5,7 +5,7 @@ COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 
 ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-file = { SOI ~ (extern_crate | schema_def | process_def | transform_def | spec_def)* ~ EOI }
+file = { SOI ~ (extern_crate | schema_def | placement_def | process_def | transform_def | spec_def)* ~ EOI }
 
 // Declare a Rust dependency the generated crate should pull in.
 extern_crate = { "extern" ~ "crate" ~ ident ~ "=" ~ (path_dep | string) }
@@ -14,6 +14,10 @@ path_dep = { "path" ~ string }
 schema_def = { "schema" ~ ident ~ ("=" ~ rust_path)? ~ "{" ~ fields? ~ "}" }
 fields = { field ~ ("," ~ field)* ~ ","? }
 field = { ident ~ ":" ~ type_ }
+
+// Every process must be assigned exactly once when any placement declaration
+// is present. Edges between groups are explicit remote-capable boundaries.
+placement_def = { "placement" ~ ident ~ "{" ~ ident ~ ("," ~ ident)* ~ ","? ~ "}" }
 
 type_ = { "Int" | "Float" | "String" | "Bool" | "UUID" | "Bytes" | "Duration" | ident }
 
