@@ -7,6 +7,70 @@ use crate::frontend::ast::{
 };
 use std::collections::BTreeSet;
 
+pub const GENERATED_ABI_VERSION: u32 = 1;
+pub const RESIDUAL_RISK_SCHEMA_VERSION: u32 = 1;
+
+fn json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+/// Stable, machine-readable foreign-effect contracts shipped beside every
+/// generated crate.
+pub fn emit_effect_contracts(program: &Program) -> String {
+    use crate::frontend::ast::{Cancellation, Idempotency, SideEffect};
+    let entries = program
+        .transforms
+        .iter()
+        .filter_map(|transform| {
+            let binding = transform.binding.as_ref()?;
+            let idempotency = match binding.effect.idempotency {
+                Idempotency::Idempotent => "idempotent",
+                Idempotency::NonIdempotent => "non_idempotent",
+            };
+            let cancellation = match binding.effect.cancellation {
+                Cancellation::CancelSafe => "cancel_safe",
+                Cancellation::CompletionTracked => "completion_tracked",
+            };
+            let side_effect = match binding.effect.side_effect {
+                SideEffect::None => "none",
+                SideEffect::Read => "read",
+                SideEffect::Write => "write",
+            };
+            Some(format!(
+                "    {{\"transform\":{},\"path\":{},\"idempotency\":{},\
+                 \"cancellation\":{},\"side_effect\":{}}}",
+                json_string(&transform.name),
+                json_string(&binding.path),
+                json_string(idempotency),
+                json_string(cancellation),
+                json_string(side_effect)
+            ))
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{{\n  \"schema_version\": 1,\n  \"generated_abi\": \
+         {GENERATED_ABI_VERSION},\n  \"bindings\": [\n{}\n  ]\n}}\n",
+        entries.join(",\n")
+    )
+}
+
 /// Emit a full Rust library source from the checked program and its Graph IR.
 pub fn emit(program: &Program, irs: &[GraphIR]) -> String {
     let ir = &merged_header_ir(irs);
@@ -136,9 +200,10 @@ fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
     // nothing here needs hand-editing, and regenerating never clobbers work.
     if let Some(b) = &t.binding {
         let path = &b.path;
-        let body = match b.kind {
+        let call = match b.kind {
             BindKind::Async => format!(
-                "    {path}(input)\n        .await\n        .map_err(|e| sigil_rt::SigilError::Transform(format!(\"{}: {{e}}\", \"{}\")))",
+                "{path}(input)\n        .await\n        .map_err(|e| \
+                 sigil_rt::SigilError::Transform(format!(\"{}: {{e}}\", \"{}\")))?",
                 "{}", t.name
             ),
             // The important one. Calling a blocking function directly from an
@@ -146,10 +211,10 @@ fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
             // the scheduler rather than the program, so no proof here would
             // catch it. Declaring `blocking` moves it to the blocking pool.
             BindKind::Blocking => format!(
-                "    tokio::task::spawn_blocking(move || {path}(input))\n                 \x20       .await\n                 \x20       .map_err(|e| sigil_rt::SigilError::Transform(format!(\"{}: join: {{e}}\", \"{}\")))?\n                 \x20       .map_err(|e| sigil_rt::SigilError::Transform(format!(\"{}: {{e}}\", \"{}\")))",
-                "{}", t.name, "{}", t.name
+                "sigil_rt::tracked_spawn_blocking(\"{}\", move || {path}(input))\n                 \x20       .await?\n                 \x20       .map_err(|e| sigil_rt::SigilError::Transform(format!(\"{}: {{e}}\", \"{}\")))?",
+                t.name, "{}", t.name
             ),
-            BindKind::Infallible => format!("    Ok({path}(input))"),
+            BindKind::Infallible => format!("{path}(input)"),
         };
         // An `infallible` binding is declared as unable to fail, so it is not
         // routed through fault injection — injecting faults into a recovery
@@ -163,7 +228,12 @@ fn emit_declared_transform(t: &crate::frontend::ast::TransformDecl) -> String {
             )
         };
         return format!(
-            "// bound to `{path}` ({})\nasync fn {}(input: {in_ty}) -> Result<{out_ty}> {{\n{chaos}{body}\n}}\n",
+            "// bound to `{path}` ({})\nasync fn {}(input: {in_ty}) -> Result<{out_ty}> {{\n\
+             {chaos}    sigil_rt::panic_point(\"before_foreign_call\");\n\
+             \x20   let output = {call};\n\
+             \x20   sigil_rt::panic_point(\"after_foreign_call\");\n\
+             \x20   Ok(output)\n\
+             }}\n",
             match b.kind {
                 BindKind::Async => "async",
                 BindKind::Blocking => "blocking, dispatched to the blocking pool",
@@ -341,6 +411,8 @@ fn emit_process(
 
     let targets = process_send_targets(process);
     s.push_str(&format!("pub struct {} {{\n", process.name));
+    s.push_str("    /// Live operational counters; never contains actor state.\n");
+    s.push_str("    pub __telemetry: sigil_rt::ActorTelemetry,\n");
     for st in &process.states {
         // Public so integration tests / callers can observe local state.
         s.push_str(&format!("    pub {}: {},\n", st.name, rust_type(&st.ty)));
@@ -362,7 +434,10 @@ fn emit_process(
     s.push_str("}\n\n");
 
     s.push_str(&format!("impl {} {{\n", process.name));
-    s.push_str("    pub fn new() -> Self {\n        Self {\n");
+    s.push_str(
+        "    pub fn new() -> Self {\n        Self {\n            __telemetry: \
+         sigil_rt::ActorTelemetry::new(),\n",
+    );
     for st in &process.states {
         s.push_str(&format!(
             "            {}: {},\n",
@@ -442,11 +517,11 @@ fn emit_actor(process: &Process) -> String {
              /// Sending is the ONLY way to interact with the actor's state.\n\
              #[derive(Clone)]\n\
              pub struct {p}Handle {{\n\
-             \x20   tx: tokio::sync::mpsc::Sender<{msg_ty}>,\n\
+             \x20   tx: sigil_rt::ActorSender<{msg_ty}>,\n\
              }}\n\n\
              impl {p}Handle {{\n\
              \x20   /// Raw channel, for the declared back-pressure policy.\n\
-             \x20   pub fn raw(&self) -> &tokio::sync::mpsc::Sender<{msg_ty}> {{\n\
+             \x20   pub fn raw(&self) -> &sigil_rt::ActorSender<{msg_ty}> {{\n\
              \x20       &self.tx\n\
              \x20   }}\n\n\
              \x20   pub async fn send(&self, msg: {msg_ty}) -> Result<()> {{\n\
@@ -460,22 +535,26 @@ fn emit_actor(process: &Process) -> String {
              \x20   /// Move this process's state into an isolated task.\n\
              \x20   /// After `spawn`, the state is unreachable except via messages;\n\
              \x20   /// it is returned intact when the last Handle is dropped.\n\
-             \x20   pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)> {{\n\
+             \x20   pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, sigil_rt::ActorTask<Self>)> {{\n\
              \x20       sigil_rt::validate_channel_capacity(capacity)?;\n\
-             \x20       let (tx, mut rx) = tokio::sync::mpsc::channel::<{msg_ty}>(capacity);\n\
+             \x20       let (raw_tx, mut rx) = tokio::sync::mpsc::channel::<{msg_ty}>(capacity);\n\
+             \x20       let telemetry = self.__telemetry.clone();\n\
+             \x20       let tx = sigil_rt::ActorSender::new(raw_tx, telemetry.clone());\n\
              \x20       let join = tokio::spawn(async move {{\n\
              \x20           let mut stats = sigil_rt::ActorStats::default();\n\
              \x20           while let Some(msg) = rx.recv().await {{\n\
              \x20               match self.{method}(msg).await {{\n\
-             \x20                   Ok(()) => stats.handled += 1,\n\
-             \x20                   Err(_) => stats.dropped += 1, // residual stage failed with no recover path\n\
+             \x20                   Ok(()) => {{ stats.record_handled(); self.__telemetry.note_handled(); }},\n\
+             \x20                   Err(_) => {{ stats.record_dropped(); self.__telemetry.note_dropped(); }},\n\
              \x20               }}\n\
              \x20           }}\n\
 {drop_outboxes}\
              \x20           stats.shed = {shed_expr};\n\
+             \x20           self.__telemetry.mark_stopped();\n\
              \x20           (self, stats)\n\
              \x20       }});\n\
-             \x20       Ok(({p}Handle {{ tx }}, join))\n\
+             \x20       let task = sigil_rt::ActorTask::new(\"{p}\", join, telemetry);\n\
+             \x20       Ok(({p}Handle {{ tx }}, task))\n\
              \x20   }}\n\
              }}\n"
         ));
@@ -495,7 +574,7 @@ fn emit_actor(process: &Process) -> String {
     s.push_str("}\n\n");
 
     s.push_str(&format!(
-        "#[derive(Clone)]\npub struct {p}Handle {{\n    tx: tokio::sync::mpsc::Sender<{enum_name}>,\n}}\n\nimpl {p}Handle {{\n    /// Raw channel, for the declared back-pressure policy.\n    pub fn raw(&self) -> &tokio::sync::mpsc::Sender<{enum_name}> {{\n        &self.tx\n    }}\n\n"
+        "#[derive(Clone)]\npub struct {p}Handle {{\n    tx: sigil_rt::ActorSender<{enum_name}>,\n}}\n\nimpl {p}Handle {{\n    /// Raw channel, for the declared back-pressure policy.\n    pub fn raw(&self) -> &sigil_rt::ActorSender<{enum_name}> {{\n        &self.tx\n    }}\n\n"
     ));
     for h in &process.handlers {
         s.push_str(&format!(
@@ -508,7 +587,7 @@ fn emit_actor(process: &Process) -> String {
     s.push_str("}\n\n");
 
     s.push_str(&format!(
-        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)> {{\n        sigil_rt::validate_channel_capacity(capacity)?;\n        let (tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let join = tokio::spawn(async move {{\n            let mut stats = sigil_rt::ActorStats::default();\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
+        "impl {p} {{\n    pub fn spawn(mut self, capacity: usize) -> Result<({p}Handle, sigil_rt::ActorTask<Self>)> {{\n        sigil_rt::validate_channel_capacity(capacity)?;\n        let (raw_tx, mut rx) = tokio::sync::mpsc::channel::<{enum_name}>(capacity);\n        let telemetry = self.__telemetry.clone();\n        let tx = sigil_rt::ActorSender::new(raw_tx, telemetry.clone());\n        let join = tokio::spawn(async move {{\n            let mut stats = sigil_rt::ActorStats::default();\n            while let Some(msg) = rx.recv().await {{\n                let r = match msg {{\n"
     ));
     for h in &process.handlers {
         s.push_str(&format!(
@@ -518,7 +597,7 @@ fn emit_actor(process: &Process) -> String {
         ));
     }
     s.push_str(&format!(
-        "                }};\n                match r {{\n                    Ok(()) => stats.handled += 1,\n                    Err(_) => stats.dropped += 1,\n                }}\n            }}\n{drop_outboxes}            stats.shed = {shed_expr};\n            (self, stats)\n        }});\n        Ok(({p}Handle {{ tx }}, join))\n    }}\n}}\n"
+        "                }};\n                match r {{\n                    Ok(()) => {{ stats.record_handled(); self.__telemetry.note_handled(); }},\n                    Err(_) => {{ stats.record_dropped(); self.__telemetry.note_dropped(); }},\n                }}\n            }}\n{drop_outboxes}            stats.shed = {shed_expr};\n            self.__telemetry.mark_stopped();\n            (self, stats)\n        }});\n        let task = sigil_rt::ActorTask::new(\"{p}\", join, telemetry);\n        Ok(({p}Handle {{ tx }}, task))\n    }}\n}}\n"
     ));
     s
 }
@@ -854,7 +933,12 @@ fn emit_stmt(
             }
         }
         Stmt::Assign { name, expr, .. } => {
-            format!("{indent}self.{name} = {};\n", emit_expr(expr, states, msg))
+            format!(
+                "{indent}sigil_rt::panic_point(\"before_state_write\");\n\
+                 {indent}self.{name} = {};\n\
+                 {indent}sigil_rt::panic_point(\"after_state_write\");\n",
+                emit_expr(expr, states, msg)
+            )
         }
         Stmt::Send {
             target,
@@ -907,14 +991,15 @@ fn emit_stmt(
                         "sigil_rt::backpressure::block(h.raw(), {wrapped}).await?;"
                     ),
                     crate::frontend::ast::Backpressure::Shed => format!(
-                        "if sigil_rt::backpressure::shed(h.raw(), {wrapped})? == sigil_rt::SendOutcome::Shed {{ __shed_n += 1; }}"
+                        "if sigil_rt::backpressure::shed(h.raw(), {wrapped})? == sigil_rt::SendOutcome::Shed {{ __shed_n = __shed_n.saturating_add(1); }}"
                     ),
                     crate::frontend::ast::Backpressure::Deadline(ms) => format!(
-                        "if sigil_rt::backpressure::deadline(h.raw(), {wrapped}, {ms}).await? == sigil_rt::SendOutcome::Shed {{ __shed_n += 1; }}"
+                        "if sigil_rt::backpressure::deadline(h.raw(), {wrapped}, {ms}).await? == sigil_rt::SendOutcome::Shed {{ __shed_n = __shed_n.saturating_add(1); }}"
                     ),
                 };
-                return format!(
-                    "{indent}let mut __shed_n: u64 = 0;\n\
+                let emitted = format!(
+                    "{indent}sigil_rt::panic_point(\"before_send\");\n\
+                     {indent}let mut __shed_n: u64 = 0;\n\
                      {indent}match self.{target_lc}_out.as_ref() {{\n\
                      {indent}    Some(out) => {{\n\
                      {indent}        let __b = {value};\n\
@@ -925,42 +1010,64 @@ fn emit_stmt(
                      {indent}    {not_connected}\n\
                      {indent}}}\n\
                      {indent}if __shed_n > 0 {{\n\
-                     {indent}    self.__shed += __shed_n;\n\
+                     {indent}    self.__shed = self.__shed.saturating_add(__shed_n);\n\
+                     {indent}    self.__telemetry.note_shed(__shed_n);\n\
                      {indent}    for _ in 0..__shed_n {{ sigil_rt::chaos::note_shed(\"{target}\"); }}\n\
-                     {indent}}}\n"
+                     {indent}}}\n\
+                     {indent}sigil_rt::panic_point(\"after_send\");\n"
                 );
+                return match guard {
+                    None => emitted,
+                    Some(cond) => {
+                        let condition = emit_expr(cond, states, msg);
+                        let inner = emitted
+                            .lines()
+                            .map(|line| format!("    {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("{indent}if {condition} {{\n{inner}\n{indent}}}\n")
+                    }
+                };
             }
 
             let emitted = match backpressure {
                 crate::frontend::ast::Backpressure::Block => format!(
-                    "{indent}match self.{target_lc}_out.{borrow}() {{\n\
+                    "{indent}sigil_rt::panic_point(\"before_send\");\n\
+                     {indent}match self.{target_lc}_out.{borrow}() {{\n\
                      {indent}    Some(out) => {{\n\
                      {indent}        sigil_rt::backpressure::block({pick}, {wrapped}).await?;\n\
                      {indent}    }}\n\
                      {indent}    {not_connected}\n\
-                     {indent}}}\n"
+                     {indent}}}\n\
+                     {indent}sigil_rt::panic_point(\"after_send\");\n"
                 ),
                 // Shed / deadline can drop by design: compute the outcome in a
                 // closed scope so the outbox borrow ends before we count it.
                 crate::frontend::ast::Backpressure::Shed => format!(
-                    "{indent}let __outcome = match self.{target_lc}_out.{borrow}() {{\n\
+                    "{indent}sigil_rt::panic_point(\"before_send\");\n\
+                     {indent}let __outcome = match self.{target_lc}_out.{borrow}() {{\n\
                      {indent}    Some(out) => sigil_rt::backpressure::shed({pick}, {wrapped})?,\n\
                      {indent}    {not_connected}\n\
                      {indent}}};\n\
                      {indent}if __outcome == sigil_rt::SendOutcome::Shed {{\n\
-                     {indent}    self.__shed += 1;\n\
+                     {indent}    self.__shed = self.__shed.saturating_add(1);\n\
+                     {indent}    self.__telemetry.note_shed(1);\n\
                      {indent}    sigil_rt::chaos::note_shed(\"{target}\");\n\
-                     {indent}}}\n"
+                     {indent}}}\n\
+                     {indent}sigil_rt::panic_point(\"after_send\");\n"
                 ),
                 crate::frontend::ast::Backpressure::Deadline(ms) => format!(
-                    "{indent}let __outcome = match self.{target_lc}_out.{borrow}() {{\n\
+                    "{indent}sigil_rt::panic_point(\"before_send\");\n\
+                     {indent}let __outcome = match self.{target_lc}_out.{borrow}() {{\n\
                      {indent}    Some(out) => sigil_rt::backpressure::deadline({pick}, {wrapped}, {ms}).await?,\n\
                      {indent}    {not_connected}\n\
                      {indent}}};\n\
                      {indent}if __outcome == sigil_rt::SendOutcome::Shed {{\n\
-                     {indent}    self.__shed += 1;\n\
+                     {indent}    self.__shed = self.__shed.saturating_add(1);\n\
+                     {indent}    self.__telemetry.note_shed(1);\n\
                      {indent}    sigil_rt::chaos::note_shed(\"{target}\");\n\
-                     {indent}}}\n"
+                     {indent}}}\n\
+                     {indent}sigil_rt::panic_point(\"after_send\");\n"
                 ),
             };
             match guard {
@@ -1129,7 +1236,7 @@ fn emit_pipeline(
             // Acknowledged timed drop: no fallback; timeout/failure propagates
             // (counted as dropped by the actor loop), after bounded retries.
             current = format!(
-                "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ __attempt += 1; sigil_rt::chaos::note_retry(\"{transform}\"); }} Ok(Err(e)) => return Err(e), Err(_) => return Err(sigil_rt::SigilError::Timeout), }} }} }}"
+                "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ sigil_rt::panic_point(\"before_retry\"); __attempt = __attempt.saturating_add(1); sigil_rt::chaos::note_retry(\"{transform}\"); sigil_rt::panic_point(\"after_retry\"); }} Ok(Err(e)) => return Err(e), Err(_) => return Err(sigil_rt::SigilError::Timeout), }} }} }}"
             );
         } else if let (Some(ms), true) = (timeout_ms, retries > 0) {
             let fallback = recover.clone().unwrap_or_else(|| transform.clone());
@@ -1144,8 +1251,10 @@ fn emit_pipeline(
 {indent}        match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{\n\
 {indent}            Ok(Ok(v)) => break v,\n\
 {indent}            _ if __attempt < {retries} => {{\n\
-{indent}                __attempt += 1;\n\
+{indent}                sigil_rt::panic_point(\"before_retry\");\n\
+{indent}                __attempt = __attempt.saturating_add(1);\n\
 {indent}                sigil_rt::chaos::note_retry(\"{transform}\");\n\
+{indent}                sigil_rt::panic_point(\"after_retry\");\n\
 {indent}            }}\n\
 {indent}            _ => {{\n\
 {indent}                sigil_rt::chaos::note_recovery(\"{transform}\");\n\
@@ -1157,7 +1266,7 @@ fn emit_pipeline(
                 )
             } else {
                 format!(
-                    "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ __attempt += 1; sigil_rt::chaos::note_retry(\"{transform}\"); }} _ => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
+                    "{{ let __in = {current}; let mut __attempt: u64 = 0; loop {{ match timeout(Duration::from_millis({ms}), {transform}(__in.clone())).await {{ Ok(Ok(v)) => break v, _ if __attempt < {retries} => {{ sigil_rt::panic_point(\"before_retry\"); __attempt = __attempt.saturating_add(1); sigil_rt::chaos::note_retry(\"{transform}\"); sigil_rt::panic_point(\"after_retry\"); }} _ => {{ sigil_rt::chaos::note_recovery(\"{transform}\"); break {fallback}(__in).await?; }} }} }} }}"
                 )
             };
         } else if let Some(ms) = timeout_ms {
@@ -1235,12 +1344,12 @@ fn emit_external_stub(name: &str, in_ty: &str, out_ty: &str) -> String {
     // latency and faults exercise the verified @timeout/@recover paths.
     if in_ty == out_ty {
         format!(
-            "async fn {name}(input: {in_ty}) -> Result<{out_ty}> {{\n    sigil_rt::chaos::external_stage(\"{name}\").await?;\n    Ok(input)\n}}\n"
+            "async fn {name}(input: {in_ty}) -> Result<{out_ty}> {{\n    sigil_rt::panic_point(\"before_foreign_call\");\n    sigil_rt::chaos::external_stage(\"{name}\").await?;\n    sigil_rt::panic_point(\"after_foreign_call\");\n    Ok(input)\n}}\n"
         )
     } else {
         // Stage changes schema: build a default output (residual: real logic belongs here).
         format!(
-            "async fn {name}(_input: {in_ty}) -> Result<{out_ty}> {{\n    sigil_rt::chaos::external_stage(\"{name}\").await?;\n    Ok({out_ty}::default())\n}}\n"
+            "async fn {name}(_input: {in_ty}) -> Result<{out_ty}> {{\n    sigil_rt::panic_point(\"before_foreign_call\");\n    sigil_rt::chaos::external_stage(\"{name}\").await?;\n    sigil_rt::panic_point(\"after_foreign_call\");\n    Ok({out_ty}::default())\n}}\n"
         )
     }
 }
@@ -1499,17 +1608,20 @@ fn collect_hold_checks(program: &Program) -> HoldChecks {
 fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topology) -> String {
     use std::fmt::Write as _;
     let checks = collect_hold_checks(program);
-    let entry_name = topo
-        .order
-        .first()
-        .cloned()
-        .unwrap_or_else(|| program.processes[0].name.clone());
-    let entry = program
-        .processes
-        .iter()
-        .find(|p| p.name == entry_name)
-        .expect("entry process exists");
-    let entry_handler = entry.handlers.first().expect("entry handler");
+    let Some(entry_name) = topo.order.first().cloned().or_else(|| {
+        program
+            .processes
+            .first()
+            .map(|process| process.name.clone())
+    }) else {
+        return "fn main() {\n    println!(\"no process\");\n}\n".into();
+    };
+    let Some(entry) = program.processes.iter().find(|p| p.name == entry_name) else {
+        return "fn main() {\n    println!(\"invalid topology entry\");\n}\n".into();
+    };
+    let Some(entry_handler) = entry.handlers.first() else {
+        return "fn main() {\n    println!(\"no entry handler\");\n}\n".into();
+    };
 
     // Message field synthesis (same policy as the fleet demo).
     let mut field_init = String::new();
@@ -1559,7 +1671,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         out,
         "// outboxes, verified message types along every edge, proved the graph"
     );
-    let _ = write!(out, "// acyclic, and staged the shutdown so no message is ever lost in a closed\n// channel. Sigil emits no explicit locks or shared mutable state.\n\n");
+    let _ = write!(out, "// acyclic, and staged shutdown so accepted in-process messages drain before\n// downstream channels close. Queues are volatile across process/host loss.\n// Sigil emits no explicit locks or shared mutable state.\n\n");
     out.push_str("use sigil_gen::*;\nuse std::time::Instant;\n\n");
     out.push_str(
         "#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() -> sigil_rt::Result<()> {\n",
@@ -1645,7 +1757,9 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
     // Shut down and report stage by stage in topological order.
     for pname in &topo.order {
         let lc = pname.to_lowercase();
-        let process = program.processes.iter().find(|p| &p.name == pname).unwrap();
+        let Some(process) = program.processes.iter().find(|p| &p.name == pname) else {
+            continue;
+        };
         let mut shard_fmt = String::new();
         let mut shard_args = String::new();
         let mut agg_decl = String::new();
@@ -1707,7 +1821,7 @@ fn emit_topology_main(program: &Program, topo: &crate::analysis::topology::Topol
         let _ = writeln!(out, "    drop({lc}_handles);");
         let _ = write!(out, "{agg_decl}");
         let _ = write!(out, "    let mut {lc}_handled: u64 = 0;\n    let mut {lc}_dropped: u64 = 0;\n    let mut {lc}_shed: u64 = 0;\n");
-        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = sigil_rt::join_actor(j).await?;\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}{shard_asserts}        {lc}_handled += stats.handled;\n        {lc}_dropped += stats.dropped;\n        {lc}_shed += stats.shed;\n    }}\n");
+        let _ = write!(out, "    for (idx, j) in {lc}_joins.into_iter().enumerate() {{\n        let (st, stats) = j.join().await?;\n        println!(\"[{pname}] shard {{idx}}:{shard_fmt} handled={{}} dropped={{}}\"{shard_args}, stats.handled, stats.dropped);\n{agg_add}{shard_asserts}        {lc}_handled = {lc}_handled.saturating_add(stats.handled);\n        {lc}_dropped = {lc}_dropped.saturating_add(stats.dropped);\n        {lc}_shed = {lc}_shed.saturating_add(stats.shed);\n    }}\n");
         let _ = write!(out, "{agg_print}");
         let _ = writeln!(out, "    println!(\"[{pname}] handled + dropped = {{}} + {{}} = {{}}, shed downstream = {{}}\", {lc}_handled, {lc}_dropped, {lc}_handled + {lc}_dropped, {lc}_shed);");
     }
@@ -1840,7 +1954,7 @@ pub fn emit_cargo_toml(package_name: &str, sigil_rt_path: &str, with_main: bool)
         ""
     };
     format!(
-        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\ntracing = {{ version = \"0.1\", optional = true }}\n\n[features]\ndefault = []\n# Emits a tracing span per handler invocation. Off by default so the\n# generated crate adds no dependency you did not ask for.\ntracing = [\"dep:tracing\"]\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
+        "[workspace]\n\n# Integer overflow must never wrap silently: a wrapped counter would\n# invalidate invariants the compiler proved. Enabled in ALL profiles.\n[profile.release]\noverflow-checks = true\n\n[profile.dev]\noverflow-checks = true\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.85\"\n\n[package.metadata.sigil]\ngenerated-abi = {GENERATED_ABI_VERSION}\nresidual-risk-schema = {RESIDUAL_RISK_SCHEMA_VERSION}\n\n[dependencies]\ntokio = {{ version = \"1\", features = [\"time\", \"macros\", \"rt-multi-thread\", \"sync\"] }}\nsigil_rt = {{ path = \"{sigil_rt_path}\" }}\nthiserror = \"1\"\ntracing = {{ version = \"0.1\", optional = true }}\n\n[features]\ndefault = []\n# Emits a tracing span per handler invocation. Off by default so the\n# generated crate adds no dependency you did not ask for.\ntracing = [\"dep:tracing\"]\n\n[lib]\nname = \"sigil_gen\"\npath = \"src/lib.rs\"\n{bin_section}"
     )
 }
 
@@ -2022,15 +2136,15 @@ async fn main() -> sigil_rt::Result<()> {{
 {agg_decl}    let mut agg_dropped: u64 = 0;
     let mut agg_handled: u64 = 0;
     for (idx, j) in joins.into_iter().enumerate() {{
-        let (st, stats) = sigil_rt::join_actor(j).await?;
+        let (st, stats) = j.join().await?;
         println!("shard {{idx}}:{shard_print_fmt} handled={{}} dropped={{}}"{shard_print_args}, stats.handled, stats.dropped);
-{fleet_asserts}{agg_add}        agg_handled += stats.handled;
-        agg_dropped += stats.dropped;
+{fleet_asserts}{agg_add}        agg_handled = agg_handled.saturating_add(stats.handled);
+        agg_dropped = agg_dropped.saturating_add(stats.dropped);
     }}
-{agg_print}    println!("handled + dropped   = {{}} + {{}} = {{}}", agg_handled, agg_dropped, agg_handled + agg_dropped);
+{agg_print}    println!("handled + dropped   = {{}} + {{}} = {{}}", agg_handled, agg_dropped, agg_handled.saturating_add(agg_dropped));
     println!("expected messages   = {{total}}");
     assert_eq!(
-        agg_handled + agg_dropped,
+        agg_handled.saturating_add(agg_dropped),
         total as u64,
         "message conservation violated"
     );

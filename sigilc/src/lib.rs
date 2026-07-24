@@ -9,15 +9,18 @@ pub mod diagnostics;
 pub mod frontend;
 
 pub use analysis::{
-    check_failure_paths, check_handler_wellformedness, check_numeric_types,
-    check_recover_signatures, check_transform_purity, check_transform_signatures, derive_topology,
-    fallible_fallbacks, input_preconditions, level1_check, level2_check, level3_prove,
-    level4_prove, level_banner, lower, residual_risk_report, run_checks, AssuranceLevel,
-    CheckOutcome, GraphIR, Level2Report, Level3Report, Level4Report, Topology,
+    check_budget_arithmetic, check_effect_contracts, check_failure_paths,
+    check_handler_wellformedness, check_numeric_types, check_recover_signatures,
+    check_transform_purity, check_transform_signatures, check_types, derive_topology,
+    fallible_fallbacks, input_preconditions, interpret_handler, level1_check, level2_check,
+    level3_prove, level4_prove, level_banner, lower, reference_record, residual_risk_report,
+    run_checks, AssuranceLevel, CheckOutcome, GraphIR, Level2Report, Level3Report, Level4Report,
+    ReferenceResult, ReferenceValue, Topology, TraceEvent,
 };
 pub use backend::{
-    emit, emit_cargo_toml, emit_cargo_toml_with_deps, emit_demo_main, relative_sigil_rt_path,
-    to_dot, to_mermaid,
+    emit, emit_cargo_toml, emit_cargo_toml_with_deps, emit_demo_main, emit_effect_contracts,
+    relative_sigil_rt_path, to_dot, to_mermaid, write_generated_crate, GeneratedCrate,
+    GENERATED_ABI_VERSION, RESIDUAL_RISK_SCHEMA_VERSION,
 };
 pub use diagnostics::{line_col, render as render_diagnostic};
-pub use frontend::{parse, Program, Span};
+pub use frontend::{format_program, parse, Program, Span};

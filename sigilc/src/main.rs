@@ -1,13 +1,15 @@
 //! Sigilc CLI — compile a .sigil file to an ownership-safe Rust crate.
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 use sigilc::{
-    emit, emit_demo_main, level_banner, lower, parse, relative_sigil_rt_path, residual_risk_report,
-    run_checks, AssuranceLevel,
+    emit, emit_demo_main, emit_effect_contracts, level_banner, lower, parse,
+    relative_sigil_rt_path, residual_risk_report, run_checks, write_generated_crate,
+    AssuranceLevel, GeneratedCrate, GENERATED_ABI_VERSION, RESIDUAL_RISK_SCHEMA_VERSION,
 };
 
 const USAGE: &str =
@@ -121,17 +123,8 @@ fn main() -> Result<()> {
         }
     }
 
-    fs::create_dir_all(out.join("src"))?;
-
     let rust = emit(&program, &graph);
-    fs::write(out.join("src/lib.rs"), &rust)?;
-    println!("[codegen] Wrote {}", out.join("src/lib.rs").display());
-
-    if emit_main_flag {
-        let main_rs = emit_demo_main(&program);
-        fs::write(out.join("src/main.rs"), main_rs)?;
-        println!("[codegen] Wrote {}", out.join("src/main.rs").display());
-    }
+    let main_rs = emit_main_flag.then(|| emit_demo_main(&program));
 
     let pkg_name = input
         .file_stem()
@@ -139,36 +132,30 @@ fn main() -> Result<()> {
         .unwrap_or("sigil_out")
         .replace('-', "_");
     let rt_path = relative_sigil_rt_path(&out);
-    fs::write(
-        out.join("Cargo.toml"),
-        sigilc::emit_cargo_toml_with_deps(
-            &pkg_name,
-            &rt_path,
-            emit_main_flag,
-            &program.extern_crates,
-        ),
-    )?;
-    println!(
-        "[codegen] Wrote {} (sigil_rt path: {})",
-        out.join("Cargo.toml").display(),
-        rt_path
+    let cargo_toml = sigilc::emit_cargo_toml_with_deps(
+        &pkg_name,
+        &rt_path,
+        emit_main_flag,
+        &program.extern_crates,
     );
 
-    if emit_graph_flag {
+    let (topology_mermaid, topology_dot) = if emit_graph_flag {
         // Exported from the SAME topology the provers consumed, so the
         // picture cannot drift from the analysis.
         match sigilc::derive_topology(&program) {
             Ok(topo) => {
                 let mermaid = sigilc::to_mermaid(&program, &topo);
-                fs::write(out.join("topology.mmd"), &mermaid)?;
-                println!("[graph]   Wrote {}", out.join("topology.mmd").display());
                 let dot = sigilc::to_dot(&program, &topo);
-                fs::write(out.join("topology.dot"), &dot)?;
-                println!("[graph]   Wrote {}", out.join("topology.dot").display());
+                (Some(mermaid), Some(dot))
             }
-            Err(e) => eprintln!("[graph]   skipped (topology not derivable): {e}"),
+            Err(error) => {
+                eprintln!("[graph]   skipped (topology not derivable): {error}");
+                (None, None)
+            }
         }
-    }
+    } else {
+        (None, None)
+    };
 
     let base_risk = residual_risk_report(
         &program,
@@ -177,14 +164,141 @@ fn main() -> Result<()> {
         level >= AssuranceLevel::Safe,
     );
     let risk = format!("{}{}", level_banner(&outcome), base_risk);
-    fs::write(out.join("RESIDUAL_RISK.md"), &risk)?;
-    println!("[risk]    Wrote {}", out.join("RESIDUAL_RISK.md").display());
+    let source_sha = sha256_hex(source.as_bytes());
+    let residual_json = emit_residual_json(&program, &outcome, &source_sha);
+    let build_manifest = emit_build_manifest(&source_sha, &rt_path);
+    let generated = GeneratedCrate {
+        lib_rs: rust,
+        main_rs,
+        cargo_toml,
+        topology_mermaid,
+        topology_dot,
+        residual_risk_md: risk,
+        residual_risk_json: residual_json,
+        effect_contracts_json: emit_effect_contracts(&program),
+        build_manifest_json: build_manifest,
+    };
+    write_generated_crate(&out, &generated)?;
+    println!(
+        "[codegen] Published complete crate transaction at {}",
+        out.display()
+    );
 
     println!("Generated crate is ready in {}", out.display());
     if emit_main_flag {
         println!("Demo binary target: cargo run -p {pkg_name} --bin demo");
     }
     Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", character as u32);
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn emit_build_manifest(source_sha: &str, runtime_path: &str) -> String {
+    let lock_sha = sha256_hex(include_bytes!("../../Cargo.lock"));
+    format!(
+        "{{\n  \"schema_version\": 1,\n  \"compiler\": {},\n  \"language\": {},\n  \
+         \"runtime\": {},\n  \"generated_abi\": {GENERATED_ABI_VERSION},\n  \
+         \"residual_risk_schema\": {RESIDUAL_RISK_SCHEMA_VERSION},\n  \
+         \"msrv\": \"1.85.0\",\n  \"verification_toolchain\": \"1.97.0\",\n  \
+         \"source_sha256\": {},\n  \"workspace_lock_sha256\": {},\n  \
+         \"runtime_path\": {}\n}}\n",
+        json_string(env!("CARGO_PKG_VERSION")),
+        json_string(env!("CARGO_PKG_VERSION")),
+        json_string(env!("CARGO_PKG_VERSION")),
+        json_string(source_sha),
+        json_string(&lock_sha),
+        json_string(runtime_path)
+    )
+}
+
+fn emit_residual_json(
+    program: &sigilc::Program,
+    outcome: &sigilc::CheckOutcome,
+    source_sha: &str,
+) -> String {
+    let mut items = Vec::new();
+    for skipped in &outcome.skipped {
+        items.push(format!(
+            "    {{\"kind\":\"skipped_guarantee\",\"description\":{},\
+             \"owner\":\"compiler_operator\"}}",
+            json_string(skipped)
+        ));
+    }
+    for transform in program
+        .transforms
+        .iter()
+        .filter(|transform| transform.is_external())
+    {
+        use sigilc::frontend::ast::{Cancellation, Idempotency, SideEffect};
+        if let Some(binding) = &transform.binding {
+            let idempotency = match binding.effect.idempotency {
+                Idempotency::Idempotent => "idempotent",
+                Idempotency::NonIdempotent => "non_idempotent",
+            };
+            let cancellation = match binding.effect.cancellation {
+                Cancellation::CancelSafe => "cancel_safe",
+                Cancellation::CompletionTracked => "completion_tracked",
+            };
+            let side_effect = match binding.effect.side_effect {
+                SideEffect::None => "none",
+                SideEffect::Read => "read",
+                SideEffect::Write => "write",
+            };
+            items.push(format!(
+                "    {{\"kind\":\"external_transform\",\"description\":{},\
+                 \"path\":{},\"contract\":{{\"idempotency\":{},\"cancellation\":{},\
+                 \"side_effect\":{}}},\"owner\":\"application_owner\"}}",
+                json_string(&transform.name),
+                json_string(&binding.path),
+                json_string(idempotency),
+                json_string(cancellation),
+                json_string(side_effect)
+            ));
+        } else {
+            items.push(format!(
+                "    {{\"kind\":\"external_transform\",\"description\":{},\
+                 \"contract\":\"undeclared_external_contract\",\
+                 \"owner\":\"application_owner\"}}",
+                json_string(&transform.name)
+            ));
+        }
+    }
+    items.extend([
+        "    {\"kind\":\"volatile_durability\",\"description\":\"queued messages and actor state are in-memory and are not retained across process or host failure\",\"owner\":\"deployment_owner\"}".to_string(),
+        "    {\"kind\":\"panic_reconciliation\",\"description\":\"a panicked handler may have completed an external effect or send; automatic replay is forbidden and accounting is incomplete\",\"owner\":\"operations_owner\"}".to_string(),
+        "    {\"kind\":\"platform\",\"description\":\"Tokio, allocator, OS scheduling, and wall-clock behavior are outside the proof model\",\"owner\":\"platform_owner\"}".to_string(),
+    ]);
+    format!(
+        "{{\n  \"schema_version\": {RESIDUAL_RISK_SCHEMA_VERSION},\n  \
+         \"generated_abi\": {GENERATED_ABI_VERSION},\n  \"assurance_level\": {},\n  \
+         \"source_sha256\": {},\n  \"items\": [\n{}\n  ]\n}}\n",
+        outcome.level as u8,
+        json_string(source_sha),
+        items.join(",\n")
+    )
 }
 
 #[cfg(test)]
@@ -310,6 +424,52 @@ mod integration {
         assert!(
             msg.contains(needle) || msg.contains("path_timeout") || msg.contains("initial"),
             "expected '{needle}' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_proof_fixture_has_its_declared_compile_outcome() {
+        use sigilc::{run_checks, AssuranceLevel};
+
+        let proof_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/proofs");
+        let mut fixtures: Vec<_> = std::fs::read_dir(proof_dir)
+            .expect("proof fixture directory")
+            .map(|entry| entry.expect("proof fixture entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sigil")
+            })
+            .collect();
+        fixtures.sort();
+
+        let mut must_pass = 0;
+        for fixture in &fixtures {
+            let name = fixture
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("UTF-8 proof fixture name");
+            let source = std::fs::read_to_string(fixture).expect("read proof fixture");
+            let accepted = parse(&source)
+                .ok()
+                .and_then(|program| {
+                    lower(&program)
+                        .ok()
+                        .map(|graph| run_checks(&program, &graph, AssuranceLevel::System).is_ok())
+                })
+                .unwrap_or(false);
+
+            if name == "acknowledged_timeout.sigil" {
+                must_pass += 1;
+                assert!(accepted, "{name} is the documented positive control");
+            } else {
+                assert!(!accepted, "{name} is marked MUST FAIL but was accepted");
+            }
+        }
+
+        assert_eq!(must_pass, 1, "expected exactly one positive control");
+        assert!(
+            fixtures.len() >= 28,
+            "proof fixture inventory unexpectedly shrank"
         );
     }
 
@@ -497,15 +657,18 @@ mod integration {
         // directly from an async handler stalls a runtime worker — the exact
         // hazard the `blocking` declaration exists to remove.
         assert!(
-            rust.contains("tokio::task::spawn_blocking(move || sensor_hal::read_imu(input))"),
-            "blocking bindings must be dispatched off the async runtime"
+            rust.contains(
+                "sigil_rt::tracked_spawn_blocking(\"read_imu\", move || \
+                 sensor_hal::read_imu(input))"
+            ),
+            "blocking bindings must be dispatched off the async runtime and completion-tracked"
         );
         // Async bindings are awaited directly, not wrapped.
         assert!(rust.contains("sensor_hal::downlink_packet(input)"));
         assert!(!rust.contains("spawn_blocking(move || sensor_hal::downlink_packet"));
         // Infallible bindings take no error path and are NOT fault-injected;
         // injecting faults into a recovery path would defeat its purpose.
-        assert!(rust.contains("Ok(sensor_hal::fuse_attitude(input))"));
+        assert!(rust.contains("let output = sensor_hal::fuse_attitude(input);"));
         let dead_reckon = rust
             .split("async fn dead_reckon")
             .nth(1)
@@ -721,6 +884,21 @@ process P {{
         // No escape hatch: unsafe is forbidden crate-wide, not merely unused.
         assert!(rust.contains("#![forbid(unsafe_code)]"));
         assert!(no_shared_mutability(&rust));
+        for point in [
+            "before_state_write",
+            "after_state_write",
+            "before_send",
+            "after_send",
+            "before_retry",
+            "after_retry",
+            "before_foreign_call",
+            "after_foreign_call",
+        ] {
+            assert!(
+                rust.contains(&format!("panic_point(\"{point}\")")),
+                "missing proof-boundary panic hook {point}"
+            );
+        }
 
         // Silent wrapping would let a counter roll past i64::MAX and break a
         // proven invariant, so overflow checks are on in EVERY profile.
@@ -1073,7 +1251,10 @@ spec S {
         let irs = lower(&program).unwrap();
         let rust = emit(&program, &irs);
         assert!(rust.contains("sigil_rt::backpressure::shed("));
-        assert!(rust.contains("self.__shed += 1"), "shed must be counted");
+        assert!(
+            rust.contains("self.__shed = self.__shed.saturating_add(1)"),
+            "shed must be counted without wrapping"
+        );
         assert!(rust.contains("note_shed"));
         assert!(no_shared_mutability(&rust));
 
@@ -1570,6 +1751,41 @@ process Right {
         assert!(rust.contains("round_robin().raw()"), "round-robin missing");
         assert!(rust.contains("for h in out.shards()"), "broadcast missing");
         assert!(no_shared_mutability(&rust));
+
+        let guarded_broadcast = r#"
+schema M { n: Int }
+process Up {
+  state sent: Int = 0
+  on m: M {
+    sent := sent + if m.n > 0 { 1 } else { 0 }
+    send m to Down broadcast when m.n > 0
+  }
+}
+process Down {
+  state got: Int = 0
+  on m: M { got := got + 1 }
+}
+"#;
+        let program = parse(guarded_broadcast).expect("guarded broadcast parses");
+        let graph = lower(&program).expect("guarded broadcast lowers");
+        let rust = emit(&program, &graph);
+        let guards = rust
+            .match_indices("m.n >")
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            guards.len(),
+            2,
+            "state conditional and send guard must both be emitted"
+        );
+        let guard_at = guards[1];
+        let broadcast_at = rust
+            .find("for h in out.shards()")
+            .expect("broadcast loop emitted");
+        assert!(
+            guard_at < broadcast_at,
+            "broadcast delivery must remain inside its declared guard"
+        );
     }
 
     /// Multi-process topology: compiler wires outboxes, types the edges,

@@ -1,0 +1,3 @@
+schema M { value: Int }
+transform keep(m: M) -> M { m }
+process P { state total: Int = 0 on m: M { let x = m ~> keep total := total + x.value } }

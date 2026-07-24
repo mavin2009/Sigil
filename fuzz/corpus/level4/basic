@@ -1,0 +1,4 @@
+schema M { value: Int }
+process A { state sent: Int = 0 on m: M { sent := sent + 1 send m to B @shed } }
+process B { state got: Int = 0 on m: M { got := got + 1 } }
+spec S { hold B.got <= A.sent }

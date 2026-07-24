@@ -14,8 +14,9 @@ use crate::analysis::check::{
     fallible_fallbacks, level1_check,
 };
 use crate::analysis::ir::GraphIR;
-use crate::analysis::level2::{level2_check, Level2Report};
+use crate::analysis::level2::{check_budget_arithmetic, level2_check, Level2Report};
 use crate::analysis::topology::derive_topology;
+use crate::analysis::typecheck::check_effect_contracts;
 use crate::frontend::ast::Program;
 use anyhow::Result;
 
@@ -95,11 +96,13 @@ pub fn run_checks(
         }
         check_handler_wellformedness(program)?;
         check_numeric_types(program)?;
+        check_effect_contracts(program)?;
         check_recover_signatures(program)?;
         check_transform_signatures(program)?;
         check_failure_paths(program)?;
         check_transform_purity(program)?;
         derive_topology(program)?;
+        check_budget_arithmetic(program)?;
     } else {
         skipped.push("shared-mutability / local-state discipline (Level-1 not run)".into());
         skipped.push("@timeout ↔ @recover pairing (Level-1 not run)".into());

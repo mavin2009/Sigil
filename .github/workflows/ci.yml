@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,25 +18,139 @@ env:
 jobs:
   quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          components: clippy,rustfmt
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
+        with:
+          toolchain: 1.97.0
+          components: clippy,rustfmt,llvm-tools-preview
       - name: Formatting
         run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Production code has no unchecked unwrap, expect, or panic
+        run: cargo clippy --workspace --lib --bins --all-features --locked -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps
-      - name: Unit, integration, generated-crate, and chaos tests
-        run: cargo test --workspace --all-targets
+        run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Unit, property, differential, generated-crate, and chaos tests
+        run: cargo test --workspace --all-targets --locked
       - name: Compiler panic smoke campaign
         run: ./fuzz/run.sh 1 10
       - name: Accepted implies generated Rust compiles
         run: ./fuzz/metamorphic.sh 1 10
       - name: Prover soundness smoke campaign
         run: ./fuzz/prover_soundness.sh 1 10
+      - name: Reproducible generated artifacts
+        run: ./scripts/reproducible.sh
+      - name: Coverage
+        run: |
+          cargo install cargo-llvm-cov --version 0.8.7 --locked
+          cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: lcov.info
+          if-no-files-found: error
+
+  platform:
+    name: ${{ matrix.os }} / Rust ${{ matrix.toolchain }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: [1.85.0, stable]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - run: cargo test --workspace --all-targets --locked
+      - name: Compile every positive generated example with both feature sets
+        shell: bash
+        run: ./scripts/check-generated-examples.sh
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
+        with:
+          toolchain: 1.97.0
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo audit --deny warnings
+      - run: cargo deny --all-features check
+      - run: ./scripts/check-critical-duplicates.sh
+
+  concurrency-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
+        with:
+          toolchain: nightly-2025-11-22
+          components: miri
+      - name: Loom lifecycle and supervisor models
+        run: cargo +nightly-2025-11-22 test -p sigil_rt --test loom_lifecycle --locked
+      - name: Runtime under Miri
+        run: cargo +nightly-2025-11-22 miri test -p sigil_rt --lib --locked
+
+  cargo-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
+        with:
+          toolchain: nightly-2025-11-22
+      - run: cargo +nightly-2025-11-22 install cargo-fuzz --version 0.13.2 --locked
+      - name: Coverage-guided smoke campaigns
+        run: |
+          for target in parser checker topology level3 level4 codegen; do
+            cargo +nightly-2025-11-22 fuzz run "$target" -- -max_total_time=10 -timeout=5
+          done
+
+  scheduled-evidence:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0 branch
+        with:
+          toolchain: 1.97.0
+      - name: Mutation test the proof core
+        run: |
+          cargo install cargo-mutants --version 27.1.0 --locked
+          ./scripts/mutation-proof-core.sh
+      - name: Bounded degradation soak
+        run: |
+          mkdir -p target/soak
+          cargo test -p sigil_rt --test soak --release -- --ignored --nocapture \
+            | tee target/soak/report.jsonl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scheduled-hardening-evidence
+          path: |
+            mutants.out/
+            target/soak/report.jsonl
+          if-no-files-found: error

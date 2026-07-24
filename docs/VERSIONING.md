@@ -9,6 +9,7 @@ change is communicated.
 - [Proof-breaking changes](#proof-breaking-changes)
 - [The stability tiers](#the-stability-tiers)
 - [Supply chain](#supply-chain)
+- [Generated artifacts](#generated-artifacts)
 - [Current status](#current-status)
 
 ---
@@ -96,14 +97,24 @@ compromised or buggy compiler invalidates every proof downstream.
   Unstable tier, output *will* change; because it is readable Rust, the diff
   is reviewable. That is the intended safety net.
 
-**What is not yet done**
+**Repository release controls**
 
-- Reproducible builds of the compiler are not verified.
-- Release artifacts are not signed.
-- No SBOM is published.
+- CI runs RustSec and cargo-deny policy, rejects duplicate versions of
+  critical runtime/compiler crates, and restricts dependency sources.
+- Generated artifacts are reproduced byte-for-byte from two clean output
+  directories.
+- Tag builds publish CycloneDX SBOMs, a deterministic archive, SHA-256,
+  keyless Sigstore bundle, and GitHub build-provenance attestation.
+- Every third-party GitHub Action is pinned by full commit.
 
-These are real gaps for a regulated environment and are listed rather than
-glossed.
+These controls still depend on branch protection and release-environment
+policy being enabled in the hosting repository.
+
+## Generated artifacts
+
+Generated ABI and residual-risk schema versions are independent integers.
+Their compatibility and migration policy, machine-readable manifests, and v1
+golden fixtures are documented in [ABI.md](ABI.md).
 
 ## Current status
 
@@ -115,9 +126,9 @@ the shape of the commitment is visible to anyone evaluating adoption.
 
 Before a 1.0 that would carry these guarantees:
 
-- [ ] the ORDERING / counting core reviewed as an isolated, separately
+- [ ] the ORDERING / counting core independently reviewed as an isolated, separately
       testable unit with explicit stated preconditions
-- [ ] a soundness argument for each Level 3/4 obligation written out well
+- [x] a soundness argument for each Level 3/4 obligation written out well
       enough to be attacked
 - [ ] `CHANGELOG.md` with proof-affecting entries, from 1.0 onward
 - [ ] the language surface frozen, with a migration story for changes

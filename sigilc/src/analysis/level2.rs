@@ -24,6 +24,23 @@ pub struct Level2Report {
     pub residual_assumptions: Vec<String>,
 }
 
+/// Validate every timeout, retry, hand-off, and topology path calculation
+/// with checked arithmetic even when Level 2 obligations are not requested.
+pub fn check_budget_arithmetic(program: &Program) -> Result<()> {
+    let mut processing = std::collections::BTreeMap::new();
+    let mut latency = std::collections::BTreeMap::new();
+    for process in &program.processes {
+        processing.insert(process.name.as_str(), process_worst_case_ms(process)?);
+        latency.insert(
+            process.name.as_str(),
+            process_worst_case_latency_ms(process)?.0,
+        );
+    }
+    longest_path(program, &processing)?;
+    longest_path(program, &latency)?;
+    Ok(())
+}
+
 pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> {
     let mut report = Level2Report::default();
 
@@ -47,25 +64,23 @@ pub fn level2_check(program: &Program, irs: &[GraphIR]) -> Result<Level2Report> 
     let per_process: std::collections::BTreeMap<&str, u64> = program
         .processes
         .iter()
-        .map(|p| (p.name.as_str(), process_worst_case_ms(p)))
-        .collect();
-    let sum = longest_path(program, &per_process);
+        .map(|p| Ok((p.name.as_str(), process_worst_case_ms(p)?)))
+        .collect::<Result<_>>()?;
+    let sum = longest_path(program, &per_process)?;
     report.path_timeout_sum_ms = sum;
 
     // End-to-end latency: processing + declared hand-off waits, longest path.
     let mut latency_blockers: Vec<String> = Vec::new();
-    let per_process_latency: std::collections::BTreeMap<&str, u64> = program
-        .processes
-        .iter()
-        .map(|p| {
-            let (ms, blocker) = process_worst_case_latency_ms(p).unwrap_or((0, None));
-            if let Some(b) = blocker {
-                latency_blockers.push(b);
-            }
-            (p.name.as_str(), ms)
-        })
-        .collect();
-    let latency = longest_path(program, &per_process_latency);
+    let mut per_process_latency: std::collections::BTreeMap<&str, u64> =
+        std::collections::BTreeMap::new();
+    for process in &program.processes {
+        let (ms, blocker) = process_worst_case_latency_ms(process)?;
+        if let Some(blocker) = blocker {
+            latency_blockers.push(blocker);
+        }
+        per_process_latency.insert(process.name.as_str(), ms);
+    }
+    let latency = longest_path(program, &per_process_latency)?;
     report.path_latency_ms = latency;
     report.latency_blockers = latency_blockers.clone();
     let blockers_snapshot = latency_blockers;
@@ -194,7 +209,11 @@ fn discharge_hold(
     // All assignments to state must be pure
     let mut pure_ok = true;
     let mut uses_msg_fields = false;
-    let owner = owner.expect("state owner exists when state_decl matched");
+    let owner = owner.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Level-2 internal consistency error: state '{state_name}' lost its owning process"
+        )
+    })?;
     for handler in &owner.handlers {
         for stmt in &handler.body {
             if let Stmt::Assign {
@@ -484,26 +503,36 @@ fn check_expr_steps(expr: &Expr, process: &str) -> Result<()> {
 /// programs that comfortably meet their SLO.) Within a handler the timed
 /// stages are sequential, so they add, each charged `(1 + retries) × timeout`.
 pub fn process_worst_case_ms_pub(process: &crate::frontend::ast::Process) -> u64 {
-    process_worst_case_ms(process)
+    // Graph rendering is descriptive and cannot return a diagnostic without a
+    // breaking API change. Saturate its label; the Level-1/2 gate uses the
+    // checked function below and rejects the same program.
+    process_worst_case_ms(process).unwrap_or(u64::MAX)
 }
 
-fn process_worst_case_ms(process: &crate::frontend::ast::Process) -> u64 {
-    process
-        .handlers
-        .iter()
-        .map(|h| {
-            h.body
-                .iter()
-                .map(|stmt| match stmt {
-                    Stmt::Let { expr, .. }
-                    | Stmt::Assign { expr, .. }
-                    | Stmt::Send { expr, .. }
-                    | Stmt::Expr { expr, .. } => expr_timeout_ms(expr),
-                })
-                .sum::<u64>()
-        })
-        .max()
-        .unwrap_or(0)
+fn process_worst_case_ms(process: &crate::frontend::ast::Process) -> Result<u64> {
+    let mut worst = 0u64;
+    for handler in &process.handlers {
+        let mut total = 0u64;
+        for statement in &handler.body {
+            let expression = match statement {
+                Stmt::Let { expr, .. }
+                | Stmt::Assign { expr, .. }
+                | Stmt::Send { expr, .. }
+                | Stmt::Expr { expr, .. } => expr,
+            };
+            total = total
+                .checked_add(expr_timeout_ms(expression)?)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level-2 budget overflow in process '{}' handler '{}'",
+                        process.name,
+                        handler.msg_name
+                    )
+                })?;
+        }
+        worst = worst.max(total);
+    }
+    Ok(worst)
 }
 
 /// Worst case for one message in a process, INCLUDING time spent handing
@@ -513,7 +542,7 @@ fn process_worst_case_ms(process: &crate::frontend::ast::Process) -> u64 {
 /// time bound. End-to-end latency then cannot be proven, only measured.
 fn process_worst_case_latency_ms(
     process: &crate::frontend::ast::Process,
-) -> Option<(u64, Option<String>)> {
+) -> Result<(u64, Option<String>)> {
     let mut worst = 0u64;
     let mut blocker: Option<String> = None;
     for h in &process.handlers {
@@ -526,9 +555,23 @@ fn process_worst_case_latency_ms(
                     expr,
                     ..
                 } => {
-                    total += expr_timeout_ms(expr);
+                    total = total.checked_add(expr_timeout_ms(expr)?).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Level-2 latency overflow in process '{}' handler '{}'",
+                            process.name,
+                            h.msg_name
+                        )
+                    })?;
                     match backpressure.budget_ms() {
-                        Some(ms) => total += ms,
+                        Some(ms) => {
+                            total = total.checked_add(ms).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Level-2 latency overflow in process '{}' handler '{}'",
+                                    process.name,
+                                    h.msg_name
+                                )
+                            })?;
+                        }
                         None => {
                             blocker = Some(format!(
                                 "`{}` handler of `{}` sends to `{target}` with @block",
@@ -538,18 +581,27 @@ fn process_worst_case_latency_ms(
                     }
                 }
                 Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-                    total += expr_timeout_ms(expr);
+                    total = total.checked_add(expr_timeout_ms(expr)?).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Level-2 latency overflow in process '{}' handler '{}'",
+                            process.name,
+                            h.msg_name
+                        )
+                    })?;
                 }
             }
         }
         worst = worst.max(total);
     }
-    Some((worst, blocker))
+    Ok((worst, blocker))
 }
 
 /// Longest path through the process topology, where each process
 /// contributes its own worst case. Parallel branches take the max.
-fn longest_path(program: &Program, per_process: &std::collections::BTreeMap<&str, u64>) -> u64 {
+fn longest_path(
+    program: &Program,
+    per_process: &std::collections::BTreeMap<&str, u64>,
+) -> Result<u64> {
     match crate::analysis::topology::derive_topology(program) {
         Ok(topo) if topo.is_pipeline() => {
             let mut longest: std::collections::BTreeMap<&str, u64> =
@@ -563,18 +615,24 @@ fn longest_path(program: &Program, per_process: &std::collections::BTreeMap<&str
                     .filter_map(|e| longest.get(e.from.as_str()).copied())
                     .max()
                     .unwrap_or(0);
-                longest.insert(pname.as_str(), best_pred + own);
+                let path = best_pred.checked_add(own).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level-2 longest-path budget overflows while entering process '{pname}'"
+                    )
+                })?;
+                longest.insert(pname.as_str(), path);
             }
-            longest.values().copied().max().unwrap_or(0)
+            Ok(longest.values().copied().max().unwrap_or(0))
         }
-        _ => per_process.values().copied().max().unwrap_or(0),
+        Ok(_) => Ok(per_process.values().copied().max().unwrap_or(0)),
+        Err(error) => Err(error),
     }
 }
 
-fn expr_timeout_ms(expr: &Expr) -> u64 {
+fn expr_timeout_ms(expr: &Expr) -> Result<u64> {
     match expr {
         Expr::Pipeline { base, steps, .. } => {
-            let mut total = expr_timeout_ms(base);
+            let mut total = expr_timeout_ms(base)?;
             for step in steps {
                 let ms = step.tags.iter().find_map(|t| match t {
                     Tag::Timeout {
@@ -602,12 +660,25 @@ fn expr_timeout_ms(expr: &Expr) -> u64 {
                         _ => None,
                     })
                     .unwrap_or(0);
-                total += ms.unwrap_or(0) * (1 + retries);
+                let attempts = retries
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Level-2 retry attempt count overflows u64"))?;
+                let stage = ms.unwrap_or(0).checked_mul(attempts).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level-2 timeout budget overflows: {}ms × {attempts} attempts",
+                        ms.unwrap_or(0)
+                    )
+                })?;
+                total = total.checked_add(stage).ok_or_else(|| {
+                    anyhow::anyhow!("Level-2 expression timeout budget overflows u64")
+                })?;
             }
-            total
+            Ok(total)
         }
-        Expr::Binary { lhs, rhs, .. } => expr_timeout_ms(lhs) + expr_timeout_ms(rhs),
-        _ => 0,
+        Expr::Binary { lhs, rhs, .. } => expr_timeout_ms(lhs)?
+            .checked_add(expr_timeout_ms(rhs)?)
+            .ok_or_else(|| anyhow::anyhow!("Level-2 expression timeout budget overflows u64")),
+        _ => Ok(0),
     }
 }
 

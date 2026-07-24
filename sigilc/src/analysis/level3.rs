@@ -427,7 +427,15 @@ fn prove_one(
         })?;
 
     // BASE
-    let decl = owner.states.iter().find(|s| s.name == state).unwrap();
+    let decl = owner
+        .states
+        .iter()
+        .find(|candidate| candidate.name == state)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Level-3 internal consistency error: state '{state}' lost its declaration"
+            )
+        })?;
     if !matches!(decl.ty, Type::Int) {
         bail!(
             "Level-3 violation in spec '{spec_name}': state '{state}' has type Float. \
@@ -777,8 +785,20 @@ fn prove_relational(
              processes — same-process only at Level 3 (cross-process relations are Level 4)"
         );
     }
-    let a_decl = owner.states.iter().find(|s| s.name == a).unwrap();
-    let b_decl = owner.states.iter().find(|s| s.name == b).unwrap();
+    let a_decl = owner
+        .states
+        .iter()
+        .find(|state| state.name == a)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Level-3 internal consistency error: state '{a}' disappeared")
+        })?;
+    let b_decl = owner
+        .states
+        .iter()
+        .find(|state| state.name == b)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Level-3 internal consistency error: state '{b}' disappeared")
+        })?;
     if !matches!(a_decl.ty, Type::Int) || !matches!(b_decl.ty, Type::Int) {
         bail!(
             "Level-3 violation in spec '{spec_name}': relational Float holds are outside \
@@ -786,7 +806,13 @@ fn prove_relational(
         );
     }
     let lit_init = |st: &str| -> Result<i64> {
-        let d = owner.states.iter().find(|s| s.name == st).unwrap();
+        let d = owner
+            .states
+            .iter()
+            .find(|state| state.name == st)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Level-3 internal consistency error: state '{st}' disappeared")
+            })?;
         match &d.init {
             Expr::Literal { value, .. } => int_literal(value).ok_or_else(|| {
                 anyhow::anyhow!(

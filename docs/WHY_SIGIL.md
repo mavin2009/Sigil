@@ -17,8 +17,8 @@ list of things a reviewer would otherwise have to verify by reading.
 
 ## The whole component
 
-**51 lines** of Sigil (excluding comments) describe a four-stage,
-authenticated, authorized, audited secret-release path:
+A compact Sigil source file describes a four-stage, authenticated,
+authorized, audited secret-release path:
 
 ```
 process Audit {
@@ -32,9 +32,9 @@ process Audit {
 }
 ```
 
-That compiles to **479 lines** of Rust (`342` in the library, `137` in the
-runnable driver). The ratio is not the point. The point is *which* 439 lines,
-and what happens if any one of them is wrong.
+That expands into a Rust library and runnable driver. The expansion ratio is
+not the point. The point is which decisions are generated consistently, and
+what happens if any one of them is wrong.
 
 ---
 
@@ -96,44 +96,58 @@ holds you to.
 
 ```rust
 pub struct Authn {
+    pub __telemetry: sigil_rt::ActorTelemetry,
     pub verified: i64,
     /// Outbox to the Authz actor. Wire with connect_authz() before spawn.
     pub authz_out: Option<sigil_rt::Router<AuthzHandle>>,
 }
 
 pub struct AuthnHandle {
-    tx: tokio::sync::mpsc::Sender<Request>,
+    tx: sigil_rt::ActorSender<Request>,
 }
 
 impl Authn {
     pub fn spawn(mut self, capacity: usize)
         -> sigil_rt::Result<(
             AuthnHandle,
-            tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>,
+            sigil_rt::ActorTask<Self>,
         )>
     {
         sigil_rt::validate_channel_capacity(capacity)?;
+        let telemetry = self.__telemetry.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(capacity);
+        let tx = sigil_rt::ActorSender::new(tx, telemetry.clone());
         let join = tokio::spawn(async move {
             let mut stats = sigil_rt::ActorStats::default();
             while let Some(msg) = rx.recv().await {
                 match self.on_request(msg).await {
-                    Ok(()) => stats.handled += 1,
-                    Err(_) => stats.dropped += 1,
+                    Ok(()) => {
+                        stats.record_handled();
+                        self.__telemetry.note_handled();
+                    }
+                    Err(_) => {
+                        stats.record_dropped();
+                        self.__telemetry.note_dropped();
+                    }
                 }
             }
             self.authz_out = None; // release downstream channel
+            self.__telemetry.mark_stopped();
             (self, stats)
         });
-        Ok((AuthnHandle { tx }, join))
+        Ok((
+            AuthnHandle { tx },
+            sigil_rt::ActorTask::new("Authn", join, telemetry),
+        ))
     }
 }
 ```
 
 Note what is **absent**: no `Arc`, no `Mutex`, no `AtomicU64`, no `unsafe`.
 `spawn` takes `self` **by move**, so after the call the state is
-unreachable except by message. Data races are not prevented by discipline
-here; they are unrepresentable. An integration test asserts none of those
+unreachable except by message. Data races on Sigil-owned process state are
+excluded by construction. External Rust and dependencies remain outside
+that source-level guarantee. An integration test asserts none of those
 tokens ever appear in generated code.
 
 Now consider the accumulator in `examples/finance/clearing.sigil`:
@@ -229,7 +243,7 @@ Both mistakes are the kind that pass code review. Neither passes the build.
 ## Where to go next
 
 - [Language Reference](LANGUAGE.md) — the complete surface
-- [Assurance Levels](ASSURANCE.md) — what each level proves, and the 25
+- [Assurance Levels](ASSURANCE.md) — what each level proves, and the 27
   programs that must fail to compile
 - [Runtime & Generated Code](RUNTIME.md) — the actor model in detail
 
@@ -237,8 +251,9 @@ Both mistakes are the kind that pass code review. Neither passes the build.
 
 Sigil does **not** claim the component cannot fail. It claims:
 
-1. Specific failure classes are unrepresentable (data races, shared mutable
-   accumulators, null, untagged failure paths, cyclic actor graphs).
+1. Specific failure classes are excluded from Sigil-owned process code
+   (data races on process state, shared mutable accumulators, null, untagged
+   failure paths, cyclic actor graphs).
 2. Specific properties are proven (the invariants above, the latency budget).
 3. **Everything else is named.** Every build emits `RESIDUAL_RISK.md`
    listing what was assumed rather than proven: the external transforms
@@ -269,10 +284,12 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 ```
 
 1,757 faults hit the system. 2,560 retries and 632 recoveries absorbed them.
-Zero messages lost, every invariant intact, and no explicit locks emitted by
-Sigil. Tokio, the allocator, and platform libraries remain free to
+No policy shedding occurred in this in-process run; every invariant remained
+intact, and no explicit locks were emitted by Sigil. Tokio, the allocator,
+and platform libraries remain free to
 synchronize internally; Sigil does not claim their implementation is
-lock-free.
+lock-free. Tokio queues are volatile, so process or host failure remains a
+durability boundary.
 
 The finance component behaves the same way:
 

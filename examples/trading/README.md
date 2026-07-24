@@ -107,4 +107,5 @@ shedding only *decreases* downstream counts:
 
 `notional_at_risk` is exactly half the message count — only `NewOrder`
 carries notional, and the demo drives both handlers evenly. Both message
-types flow, both invariants hold, zero loss.
+types flow, both invariants hold, and this in-process run has no policy
+shedding. The bounded Tokio queues are not durable across process/host loss.

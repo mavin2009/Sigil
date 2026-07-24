@@ -177,7 +177,11 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
                     .processes
                     .iter()
                     .find(|p| p.name == *target)
-                    .expect("target existence checked above");
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "topology changed while resolving declared target '{target}'"
+                        )
+                    })?;
                 if dest.handlers.is_empty() {
                     bail!("topology violation: send target '{target}' has no handlers");
                 }
@@ -268,7 +272,12 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
         indegree.insert(p.name.as_str(), 0);
     }
     for e in &edges {
-        *indegree.get_mut(e.to.as_str()).unwrap() += 1;
+        let degree = indegree.get_mut(e.to.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("topology edge targets undeclared process '{}'", e.to)
+        })?;
+        *degree = degree
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("topology indegree overflows for '{}'", e.to))?;
     }
     let mut queue: Vec<&str> = program
         .processes
@@ -290,8 +299,12 @@ pub fn derive_topology(program: &Program) -> Result<Topology> {
     while let Some(n) = queue.pop() {
         order.push(n.to_string());
         for e in edges.iter().filter(|e| e.from == n) {
-            let d = indegree.get_mut(e.to.as_str()).unwrap();
-            *d -= 1;
+            let d = indegree.get_mut(e.to.as_str()).ok_or_else(|| {
+                anyhow::anyhow!("topology edge targets undeclared process '{}'", e.to)
+            })?;
+            *d = d.checked_sub(1).ok_or_else(|| {
+                anyhow::anyhow!("topology indegree underflow while visiting '{}'", e.to)
+            })?;
             if *d == 0 {
                 queue.push(e.to.as_str());
             }

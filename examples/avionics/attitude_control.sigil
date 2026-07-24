@@ -65,20 +65,20 @@ schema Attitude = sensor_hal::Attitude {
 }
 
 // ---- Bound to real driver code. Blocking calls are declared as such. ----
-transform read_imu(f: ImuFrame) -> ImuFrame = blocking sensor_hal::read_imu
-transform read_star_tracker(a: Attitude) -> Attitude = blocking sensor_hal::read_star_tracker
-transform downlink(a: Attitude) -> Attitude = sensor_hal::downlink_packet
+transform read_imu(f: ImuFrame) -> ImuFrame = blocking sensor_hal::read_imu @effect(idempotent, completion_tracked, read)
+transform read_star_tracker(a: Attitude) -> Attitude = blocking sensor_hal::read_star_tracker @effect(idempotent, completion_tracked, read)
+transform downlink(a: Attitude) -> Attitude = sensor_hal::downlink_packet @effect(idempotent, cancel_safe, write)
 
 // ---- Pure fallbacks: compiled, infallible, un-slowable. ----
 // A fallible fallback would reintroduce exactly the loss it exists to
 // prevent, and Level 3 rejects one.
 transform coast(f: ImuFrame) -> ImuFrame { f }
-transform dead_reckon(a: Attitude) -> Attitude = infallible sensor_hal::fuse_attitude
+transform dead_reckon(a: Attitude) -> Attitude = infallible sensor_hal::fuse_attitude @effect(idempotent, cancel_safe, none)
 transform hold_attitude(a: Attitude) -> Attitude { a }
 transform drop_packet(a: Attitude) -> Attitude { a }
 
 // ---- Schema transition: raw frame to estimated attitude. ----
-transform estimate(f: ImuFrame) -> Attitude = blocking sensor_hal::estimate_attitude
+transform estimate(f: ImuFrame) -> Attitude = blocking sensor_hal::estimate_attitude @effect(idempotent, completion_tracked, read)
 
 // Pure fallback that constructs a zeroed, explicitly-invalid attitude. A
 // schema literal makes this expressible without a stub, so the estimator

@@ -32,9 +32,9 @@ extern crate sensor_hal = path "../../examples/avionics/sensor_hal"
 
 schema ImuFrame = sensor_hal::ImuFrame { id: String, roll_rate: Float, ... }
 
-transform read_imu(f: ImuFrame) -> ImuFrame  = blocking sensor_hal::read_imu
-transform downlink(a: Attitude) -> Attitude  = sensor_hal::downlink_packet
-transform dead_reckon(a: Attitude) -> Attitude = infallible sensor_hal::fuse_attitude
+transform read_imu(f: ImuFrame) -> ImuFrame = blocking sensor_hal::read_imu @effect(idempotent, completion_tracked, read)
+transform downlink(a: Attitude) -> Attitude = sensor_hal::downlink_packet @effect(idempotent, cancel_safe, write)
+transform dead_reckon(a: Attitude) -> Attitude = infallible sensor_hal::fuse_attitude @effect(idempotent, cancel_safe, none)
 ```
 
 **`blocking` is the one that earns its keep.** Calling a blocking driver

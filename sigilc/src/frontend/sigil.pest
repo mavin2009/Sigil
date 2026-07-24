@@ -28,9 +28,15 @@ transform_def = {
     ~ (binding | ("{" ~ stmt* ~ "}"))
 }
 // Bind a transform to a real Rust function instead of leaving a stub.
-binding = { "=" ~ bind_kind? ~ rust_path }
+binding = { "=" ~ bind_kind? ~ rust_path ~ effect_contract }
 bind_kind = { "blocking" | "infallible" }
 rust_path = @{ ident ~ ("::" ~ ident)+ | ident }
+effect_contract = {
+    "@effect" ~ "(" ~ idempotency ~ "," ~ cancellation ~ "," ~ side_effect ~ ")"
+}
+idempotency = { "idempotent" | "non_idempotent" }
+cancellation = { "cancel_safe" | "completion_tracked" }
+side_effect = { "none" | "read" | "write" }
 
 spec_def = { "spec" ~ ident ~ "{" ~ spec_item* ~ "}" }
 spec_item = { extinct_clause | require_clause | hold_clause }

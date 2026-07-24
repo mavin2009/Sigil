@@ -121,9 +121,9 @@ extern crate sensor_hal = path "../hal"     // or: = "1.2" for crates.io
 
 schema ImuFrame = sensor_hal::ImuFrame { id: String, roll_rate: Float }
 
-transform read_imu(f: ImuFrame) -> ImuFrame    = blocking sensor_hal::read_imu
-transform downlink(a: Attitude) -> Attitude    = sensor_hal::downlink_packet
-transform fuse(a: Attitude) -> Attitude        = infallible sensor_hal::fuse
+transform read_imu(f: ImuFrame) -> ImuFrame = blocking sensor_hal::read_imu @effect(idempotent, completion_tracked, read)
+transform downlink(a: Attitude) -> Attitude = sensor_hal::downlink_packet @effect(idempotent, cancel_safe, write)
+transform fuse(a: Attitude) -> Attitude = infallible sensor_hal::fuse @effect(idempotent, cancel_safe, none)
 ```
 
 | Kind | Expected Rust signature | Emitted as |
@@ -131,6 +131,14 @@ transform fuse(a: Attitude) -> Attitude        = infallible sensor_hal::fuse
 | (default) | `async fn(T) -> Result<U, E>` | awaited directly |
 | `blocking` | `fn(T) -> Result<U, E>` that blocks | `spawn_blocking`, so it cannot stall a runtime worker |
 | `infallible` | `fn(T) -> U` | called directly; no error path |
+
+Every binding must declare
+`@effect(idempotent|non_idempotent, cancel_safe|completion_tracked, none|read|write)`.
+Async work must be cancellation-safe. Blocking work cannot be cancelled once
+its OS thread starts, so it must be completion-tracked. A retried operation
+must be idempotent. Infallible bindings are restricted to
+`idempotent, cancel_safe, none`. The exact declarations are emitted in
+`SIGIL_EFFECTS.json`; their truth is an application-owned residual contract.
 
 `blocking` is the important one: a blocking call made from an async handler
 degrades the *scheduler* rather than the program, so it survives review and
@@ -343,13 +351,16 @@ What a `send` does when the destination's queue is full:
 
 | Policy | Wait | Loss | Latency bound |
 | ------ | ---- | ---- | ------------- |
-| `@block` (default) | until capacity | none | **unbounded** |
+| `@block` (default) | until capacity | no policy shedding while the process remains alive | **unbounded** |
 | `@shed` | never | drops when full (counted) | O(1) |
 | `@deadline(N.ms)` | up to N ms | drops past N (counted) | N |
 
 All three preserve downstream-counting invariants, because shedding only
 *decreases* the downstream count. Only the bounded policies can back an
 end-to-end latency claim — see [`require path_latency`](#specs).
+
+All inboxes are in memory. Acceptance by `@block` is not a durability
+acknowledgement: process or host failure can lose queued messages.
 
 An acyclic process graph rules out **cycles of generated channel waits**.
 That is narrower than global deadlock freedom or liveness: an untimed

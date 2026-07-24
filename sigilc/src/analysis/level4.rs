@@ -33,6 +33,8 @@ use crate::frontend::ast::{BinOp, Expr, Program, Route, SpecItem, Stmt, Type};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
+type GuardSendGroups<'a> = Vec<(Option<&'a Expr>, u64)>;
+
 #[derive(Debug, Default)]
 pub struct Level4Report {
     pub proven: Vec<String>,
@@ -126,7 +128,7 @@ pub fn level4_prove(program: &Program) -> Result<Level4Report> {
 
 /// Sends to `target` performed by ONE handler execution.
 /// `None` means "no static bound" (a broadcast fans out to a runtime shard count).
-fn sends_to(handler: &crate::frontend::ast::OnHandler, target: &str) -> Option<u64> {
+fn sends_to(handler: &crate::frontend::ast::OnHandler, target: &str) -> Result<Option<u64>> {
     let mut n = 0u64;
     for stmt in &handler.body {
         let Stmt::Send {
@@ -139,11 +141,13 @@ fn sends_to(handler: &crate::frontend::ast::OnHandler, target: &str) -> Option<u
             continue;
         }
         if matches!(route, Route::Broadcast) {
-            return None;
+            return Ok(None);
         }
-        n += 1;
+        n = n.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("Level-4 multiplicity overflows while counting sends to '{target}'")
+        })?;
     }
-    Some(n)
+    Ok(Some(n))
 }
 
 /// Sends to `target` grouped by their `when` guard.
@@ -154,8 +158,8 @@ fn sends_to(handler: &crate::frontend::ast::OnHandler, target: &str) -> Option<u
 fn sends_by_guard<'a>(
     handler: &'a crate::frontend::ast::OnHandler,
     target: &str,
-) -> Option<Vec<(Option<&'a Expr>, u64)>> {
-    let mut groups: Vec<(Option<&Expr>, u64)> = Vec::new();
+) -> Result<Option<GuardSendGroups<'a>>> {
+    let mut groups: GuardSendGroups<'a> = Vec::new();
     for stmt in &handler.body {
         let Stmt::Send {
             target: t,
@@ -170,7 +174,7 @@ fn sends_by_guard<'a>(
             continue;
         }
         if matches!(route, Route::Broadcast) {
-            return None;
+            return Ok(None);
         }
         let key = guard.as_ref();
         // Group syntactically-identical guards together.
@@ -180,11 +184,17 @@ fn sends_by_guard<'a>(
             _ => false,
         });
         match idx {
-            Some(i) => groups[i].1 += 1,
+            Some(i) => {
+                groups[i].1 = groups[i].1.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level-4 guarded multiplicity overflows while counting sends to '{target}'"
+                    )
+                })?;
+            }
             None => groups.push((key, 1)),
         }
     }
-    Some(groups)
+    Ok(Some(groups))
 }
 
 /// Multiplicity of messages arriving at `dest` per message handled by each
@@ -197,7 +207,7 @@ fn multiplicity_to(
     program: &Program,
     topo: &crate::analysis::topology::Topology,
     dest: &str,
-) -> BTreeMap<String, Option<u64>> {
+) -> Result<BTreeMap<String, Option<u64>>> {
     let mut m: BTreeMap<String, Option<u64>> = BTreeMap::new();
     m.insert(dest.to_string(), Some(1));
 
@@ -226,12 +236,22 @@ fn multiplicity_to(
                 if matches!(downstream, Some(0)) {
                     continue; // this successor never reaches dest
                 }
-                match sends_to(handler, succ) {
+                match sends_to(handler, succ)? {
                     None => acc = None, // broadcast onto a path that reaches dest
                     Some(0) => {}
                     Some(c) => {
                         acc = match (acc, downstream) {
-                            (Some(a), Some(d)) => Some(a + c * d),
+                            (Some(a), Some(d)) => Some(
+                                c.checked_mul(d)
+                                    .and_then(|product| a.checked_add(product))
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Level-4 graph multiplicity overflows on edge \
+                                             '{} -> {succ}'",
+                                            p.name
+                                        )
+                                    })?,
+                            ),
                             _ => None,
                         };
                     }
@@ -247,7 +267,7 @@ fn multiplicity_to(
         }
         m.insert(pname.clone(), best);
     }
-    m
+    Ok(m)
 }
 
 fn prove_system_hold(
@@ -408,7 +428,7 @@ fn prove_system_hold(
             );
         }
     }
-    let mult_map = multiplicity_to(program, topo, &b.name);
+    let mult_map = multiplicity_to(program, topo, &b.name)?;
     if !inbound(&b.name) {
         bail!(
             "Level-4 violation in spec '{spec}': FLOW fails — `{}` has no inbound edges; \
@@ -494,7 +514,7 @@ fn prove_system_hold(
             if matches!(downstream, Some(0)) {
                 continue;
             }
-            let Some(groups) = sends_by_guard(ha, succ) else {
+            let Some(groups) = sends_by_guard(ha, succ)? else {
                 unbounded = true;
                 break;
             };
@@ -508,16 +528,39 @@ fn prove_system_hold(
                     (Some(x), Some(y)) => format!("{x:?}") == format!("{y:?}"),
                     _ => false,
                 });
+                let contribution = c.checked_mul(d).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level-4 guarded multiplicity overflows on path '{} -> {succ}'",
+                        a.name
+                    )
+                })?;
                 match idx {
-                    Some(i) => per_guard[i].1 += c * d,
-                    None => per_guard.push((g, c * d)),
+                    Some(i) => {
+                        per_guard[i].1 =
+                            per_guard[i].1.checked_add(contribution).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Level-4 guarded multiplicity sum overflows in handler '{}'",
+                                    ha.msg_name
+                                )
+                            })?;
+                    }
+                    None => per_guard.push((g, contribution)),
                 }
             }
         }
         let m_h: Option<u64> = if unbounded {
             None
         } else {
-            Some(per_guard.iter().map(|(_, c)| *c).sum())
+            let mut total = 0u64;
+            for (_, count) in &per_guard {
+                total = total.checked_add(*count).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level-4 handler multiplicity sum overflows in handler '{}'",
+                        ha.msg_name
+                    )
+                })?;
+            }
+            Some(total)
         };
         let Some(m_h) = m_h else {
             bail!(

@@ -6,7 +6,7 @@ schema Event {
   payload: String
 }
 
-schema Result {
+schema StoredResult {
   id: String,
   status: String
 }
@@ -17,7 +17,7 @@ transform normalize(e: Event) -> Event {
 
 transform enrich(e: Event) -> Event {}
 transform fallback(e: Event) -> Event {}
-transform store(e: Event) -> Result {}
+transform store(e: Event) -> StoredResult {}
 
 process ResilientProcessor {
   state last_ok: String = "none"

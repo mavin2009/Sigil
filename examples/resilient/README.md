@@ -15,7 +15,7 @@ cargo run -p sigilc -- examples/resilient/resilient.sigil generated/resilient
 | `normalize` | Pure body → compiled |
 | `enrich` | Residual, `@timeout(80.ms)` |
 | `fallback` | Recover path for enrich |
-| `store` | Residual, `Event → Result` |
+| `store` | Residual, `Event → StoredResult` |
 
 ## Local state
 

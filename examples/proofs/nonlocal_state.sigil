@@ -1,10 +1,4 @@
-// PROOF (negative): writing a state slot that was never declared must fail Level-1.
-// Note: the surface syntax only allows assign to idents; IR checks StateWrite locality.
-// This file is accepted by the parser; the Level-1 IR check rejects non-local writes
-// when the IR records a write outside local_states (covered in unit tests).
-//
-// Kept for documentation of the guarantee; the executable proof is the unit test
-// rejects_nonlocal_state_write and the unhandled_timeout / type_mismatch programs.
+// MUST FAIL --level 1: writing a state slot that was never declared.
 
 schema Msg {
   id: String
@@ -14,6 +8,6 @@ process P {
   state ok: String = "yes"
 
   on msg: Msg {
-    ok := msg.id
+    missing := msg.id
   }
 }

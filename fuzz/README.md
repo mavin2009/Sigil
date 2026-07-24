@@ -1,6 +1,7 @@
 # Fuzzing sigilc
 
-Two properties, both of which found real defects.
+The deterministic process harnesses and coverage-guided libFuzzer targets
+exercise different failure classes.
 
 ## 1. The compiler never panics
 
@@ -74,14 +75,31 @@ injection, 0 violations.
 
 ## Note on scope
 
-These are randomized, not coverage-guided, and deterministic given a seed, so
-any failure reproduces exactly.
+The three scripts above are deterministic given a seed, so any failure
+reproduces exactly.
 
-What they do **not** establish: absence of unsoundness. Property 3 samples
+## Coverage-guided targets
+
+Install `cargo-fuzz`, then run any tracked target/corpus:
+
+```
+cargo fuzz run parser
+cargo fuzz run checker
+cargo fuzz run topology
+cargo fuzz run level3
+cargo fuzz run level4
+cargo fuzz run codegen
+```
+
+Seed corpora live under `fuzz/corpus/<target>/`. CI runs bounded smoke
+campaigns for all six; longer campaigns should minimize and commit any
+reproducer before closing the finding.
+
+What these campaigns do **not** establish: absence of unsoundness. Property 3 samples
 executions of programs the prover accepted; it can only ever refute a proof,
 never confirm one. The prover's reasoning — interval arithmetic, the
 per-handler delta argument, the counting argument over the topology — has not
-been mechanically verified, and its soundness rests on the arguments written
-in `docs/ASSURANCE.md` and on review. Every defect found so far was found by
-reading the code or by these harnesses, which is evidence that both are worth
-continuing, not that the search is finished.
+been mechanically verified. Its premises and preservation arguments are in
+`docs/SOUNDNESS.md` and remain subject to independent review. Property,
+reference-differential, mutation, Loom, Miri, and soak gates complement these
+campaigns; none substitutes for that review.

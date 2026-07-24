@@ -2,6 +2,9 @@
 target/
 /generated/
 **/*.rs.bk
+/fuzz/artifacts/
+# libFuzzer expands curated seeds into SHA-1-named working-corpus entries.
+/fuzz/corpus/*/????????????????????????????????????????
 
 # Compiled artifacts outside Cargo's target directory
 *.a
@@ -18,6 +21,9 @@ target/
 
 # Coverage, profiling, and crash output
 /coverage/
+/mutants.out/
+/sigilc/bom.json
+/sigil_rt/bom.json
 *.profdata
 *.profraw
 lcov.info

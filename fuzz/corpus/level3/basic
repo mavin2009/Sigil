@@ -1,0 +1,3 @@
+schema M { value: Int }
+process P { state total: Int = 0 on m: M { total := total + m.value } }
+spec S { require m.value >= 0 hold total >= 0 }

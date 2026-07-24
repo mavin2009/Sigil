@@ -23,7 +23,7 @@ process CircuitBreaker {
   on req: Request {
     let validated = req ~> validate @error
     let result = validated ~> call_service @timeout(50.ms) @recover(with: open_circuit)
-    let final = result ~> record @error
-    last_status := final.status
+    let recorded = result ~> record @error
+    last_status := recorded.status
   }
 }

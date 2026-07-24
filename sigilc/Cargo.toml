@@ -2,6 +2,7 @@
 name = "sigilc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Compiler for the Sigil language — fault-tolerant systems by construction"
 license.workspace = true
@@ -20,3 +21,7 @@ pest_derive = "=2.7.0"
 anyhow = "1.0"
 pathdiff = "0.2"
 semver = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+proptest = "1.5"

@@ -679,6 +679,12 @@ fn walk_recover_sigs(
 /// the output crate instead of in the source. Write `100.0` when you mean a
 /// float.
 pub fn check_numeric_types(program: &Program) -> Result<()> {
+    // The total language type checker owns name resolution, calls, transform
+    // returns, schema literals, sends, guards, and route keys. Keep this
+    // historical entry point as part of the public API: callers that used it
+    // now receive the complete Level-1 type guarantee.
+    crate::analysis::typecheck::check_types(program)?;
+
     use crate::analysis::types::type_name;
     use std::collections::BTreeMap;
 
@@ -1385,6 +1391,14 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
             &transform.return_ty,
             &format!("return type of transform '{}'", transform.name),
         )?;
+        for statement in &transform.body {
+            if let Stmt::Let { name, .. } = statement {
+                validate_ident(
+                    name,
+                    &format!("local binding in transform '{}'", transform.name),
+                )?;
+            }
+        }
     }
 
     // Unqualified Level-3 holds resolve state names globally. Requiring
@@ -1416,7 +1430,8 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
                 _ => None,
             })
             .collect();
-        let reserved_states: BTreeSet<String> = std::iter::once("__shed".to_string())
+        let reserved_states: BTreeSet<String> = ["__shed".to_string(), "__telemetry".to_string()]
+            .into_iter()
             .chain(targets.iter().map(|target| format!("{target}_out")))
             .collect();
         reject_duplicates(
@@ -1449,6 +1464,17 @@ pub fn check_handler_wellformedness(program: &Program) -> Result<()> {
             )?;
             *by_name.entry(h.msg_name.as_str()).or_insert(0) += 1;
             *by_type.entry(type_name(&h.msg_ty)).or_insert(0) += 1;
+            for statement in &h.body {
+                if let Stmt::Let { name, .. } = statement {
+                    validate_ident(
+                        name,
+                        &format!(
+                            "local binding in handler '{}' of process '{}'",
+                            h.msg_name, process.name
+                        ),
+                    )?;
+                }
+            }
         }
         for (name, n) in &by_name {
             if *n > 1 {
@@ -1671,7 +1697,7 @@ process P {
   on m: M {}
 }
 "#;
-        assert!(numeric_rejection(bad_init).contains("initializer has type Float"));
+        assert!(numeric_rejection(bad_init).contains("initializer expects Int, found Float"));
 
         let bad_assign = r#"
 schema M { value: Int }
@@ -1693,7 +1719,7 @@ spec S {
   hold count >= 0
 }
 "#;
-        assert!(numeric_rejection(bad_spec).contains("different types"));
+        assert!(numeric_rejection(bad_spec).contains("mixes numeric types"));
 
         let missing_field = r#"
 schema M { value: Int }
@@ -1712,6 +1738,6 @@ spec S {
             "schema M {{ value: Int }}\nprocess P {{ state x: Float = {}.0 on m: M {{}} }}",
             "9".repeat(400)
         );
-        assert!(numeric_rejection(&non_finite).contains("must be finite"));
+        assert!(numeric_rejection(&non_finite).contains("non-finite Float literal"));
     }
 }

@@ -1,9 +1,9 @@
 # Sigil
 
 **A small language for high-assurance concurrent components.** You write the
-pipeline; the compiler proves the properties, generates shared-nothing Rust
-with no locks in Sigil-emitted code, and tells you exactly what it could not
-prove.
+pipeline; the compiler checks the requested properties within its documented
+model, generates shared-nothing Rust with no locks in Sigil-emitted code, and
+tells you exactly what it could not prove.
 
 ```
 process Audit {
@@ -49,8 +49,7 @@ and someone's memory of the last incident.
 **"So it's a framework."** A framework can hand you actors and channels. It
 cannot reject your program because a counter moved three lines down. These
 checks need the whole statement order, the whole message graph, and every
-failure path visible at once — that's a compiler's job, and this one is
-~5,500 lines of Rust (plus its own test suite), not a moonshot.
+failure path visible at once — that's a compiler's job.
 
 **"Another DSL, another syntax to learn."** The surface is deliberately tiny:
 schemas, transforms, processes, four effect tags, one `send` statement. No
@@ -70,8 +69,9 @@ Building the two flagship examples found five real bugs *in the compiler
 itself* — the kind that only surface when you write real programs against it.
 Every one now has a test. And the claim is more specific than "safer": under
 20% fault injection, with 1,757 injected faults, the security pipeline held
-`served ≤ recorded ≤ granted ≤ verified` exactly — zero messages lost, and
-no `Mutex`, `RwLock`, `Arc`, or atomics emitted by Sigil.
+`served ≤ recorded ≤ granted ≤ verified` exactly, with no policy shedding in
+that in-process run, and no `Mutex`, `RwLock`, `Arc`, or atomics emitted by
+Sigil. Queues are volatile; this is not a crash-durability claim.
 
 **"This will just make everything slower and more annoying."** Sometimes yes,
 and it should. The first draft of the clearing example declared a 400 ms SLO
@@ -113,12 +113,15 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 
 | Doc | What's in it |
 | --- | ------------ |
-| **[Why Sigil](docs/WHY_SIGIL.md)** | one component walked from 51 lines of Sigil to 479 lines of generated Rust, and the seven decisions per handler the compiler checks so a reviewer doesn't have to |
+| **[Why Sigil](docs/WHY_SIGIL.md)** | one component walked from compact Sigil source to generated Rust, and the seven decisions per handler the compiler checks so a reviewer doesn't have to |
 | **[Language Reference](docs/LANGUAGE.md)** | complete surface syntax and semantics |
 | **[Assurance Levels](docs/ASSURANCE.md)** | what each level proves, the proof obligations, and all 27 must-fail programs |
 | **[Runtime & Generated Code](docs/RUNTIME.md)** | the actor model, topology wiring, `sigil_rt`, fault injection, tuning |
 | **[Production](docs/PRODUCTION.md)** | wiring external transforms, capacity tuning, shutdown, observability, measured performance, CI |
 | **[Production-Readiness Gate](docs/PRODUCTION_READINESS.md)** | prioritized blockers, acceptance criteria, and the release gate |
+| **[Soundness Argument](docs/SOUNDNESS.md)** | formal premises, preservation arguments, panic cut-points, and adversarial evidence for every Level 3/4 rule |
+| **[Operational Runbooks](docs/RUNBOOKS.md)** | panic, overload, shutdown, outage, rollback, reconciliation, and upgrade response |
+| **[Generated ABI](docs/ABI.md)** | machine-readable artifact versions, golden fixtures, and migration policy |
 | **[Residual Risk Process](docs/RESIDUAL_RISK_PROCESS.md)** | turning `RESIDUAL_RISK.md` into a review gate, with control mappings and a PR template |
 | **[Versioning & Proof Stability](docs/VERSIONING.md)** | what a proof is allowed to stop meaning, and the supply-chain story |
 
@@ -138,11 +141,12 @@ chaos: 10240 external calls, 1757 injected faults, 2560 retries,
 
 ## What it rules out
 
-By construction, at the default level: data races, shared mutable state,
-null, cross-process state writes, cyclic actor graphs, untagged failure
-paths, `@timeout` without recovery, `@retry` without a terminal failure path,
-fallible recovery paths, `Float` shard keys, and sends to a type the target
-cannot receive.
+By construction, at the default level: data races and shared mutable state
+for Sigil-owned process state, null, cross-process state writes, cyclic actor
+graphs, untagged failure paths, `@timeout` without recovery, `@retry` without
+a terminal failure path, fallible recovery paths, `Float` shard keys, and
+sends to a type the target cannot receive. External Rust and dependencies
+remain outside that source-level claim.
 
 Generated crates additionally forbid `unsafe`, enable overflow checks in
 every profile, and reject non-finite floats at handler entry. Level 3/4
@@ -174,10 +178,13 @@ docs/             language reference, assurance levels, runtime, rationale
 cargo test
 ```
 
-108 tests: runtime, CLI, parser, per-level checks, both provers, topology and
-routing, codegen shape, end-to-end generated crates, and default-on chaos
-regressions. Every rule has a program in `examples/proofs/` asserted to fail
-*for the right reason*.
+The default suite covers runtime lifecycle, CLI/parser limits, full type
+checking, both provers, topology/routing, reference-semantics differential
+execution, property generators, transactional codegen, ABI fixtures,
+generated crates, Loom models, every proof fixture, and default-on chaos
+regressions. CI also runs coverage-guided fuzzing and Miri; scheduled gates
+add mutation testing and bounded soak evidence. Every proof premise has an
+adversarial regression that must fail *for the right reason*.
 
 ## Production readiness
 
@@ -185,10 +192,10 @@ Honest status, because this is the question that matters:
 
 | Area | State |
 | ---- | ----- |
-| Compiler correctness | 100 compiler tests, 5 runtime tests, 3 default-on end-to-end chaos regressions, 27 must-fail programs, fuzz/property scripts, and generated demos that assert their own proofs. Multiple real defects were found this way, including proof unsoundnesses. |
+| Compiler correctness | Unit, integration, property, differential, ABI, model, fuzz, and default-on chaos suites; every must-fail fixture is inventory-tested. Multiple real defects were found this way, including proof unsoundnesses. |
 | Residual risk process | Documented with a review gate, control mappings and a PR template |
 | Integration | Documented; generated crates are ordinary Rust with no build script |
-| Observability | Optional `tracing` spans, `ActorStats`, `--emit-graph` topology export |
+| Observability | Optional `tracing` spans, live `ActorSnapshot`s, terminal `ActorReport`s, external-work counters, and `--emit-graph` topology export |
 | Performance | Characterized on one component, single vCPU — shape, not a benchmark |
 | Language freeze | **Not frozen.** Pre-1.0, see [VERSIONING.md](docs/VERSIONING.md) |
 | Production case study | **None.** Nobody has run this in production. |

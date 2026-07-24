@@ -24,51 +24,47 @@ Status marks:
   executable type, with non-finite input rejected, but every Float hold fails
   closed at Level 3/4. No IEEE-754 theorem is emitted.
 
-- [ ] **Write reviewable soundness arguments for every Level 3/4 rule.**
-  Acceptance: a document states formal preconditions and preservation
-  arguments for scalar induction, relational deltas, guard correlation,
-  topology flow, ordering, multiplicity, shedding, and failure cut-points;
-  each premise maps to one checker and adversarial negative test; the
-  ORDERING/counting core is isolated from CLI/codegen.
+- [x] **Write reviewable soundness arguments for every Level 3/4 rule.**
+  [`SOUNDNESS.md`](SOUNDNESS.md) states the formal preconditions and
+  preservation arguments for scalar induction, relational deltas, guard
+  correlation, topology flow, ordering, multiplicity, shedding, effects, and
+  panic cut-points. Its evidence table maps every premise to its isolated
+  analysis module and adversarial regression.
 
-- [ ] **Complete the static type and name system.** `[~]`
-  Duplicate declarations, Rust keywords, unknown schema types, generated
-  type collisions, ambiguous state names, actor-field collisions, invalid
-  dependency requirements, and TOML injection are now rejected/tested.
-  Numeric initializers, assignments, conditionals, spec operands, and spec
-  field access are now checked too. Remaining acceptance: type-check every
-  transform return, call argument, non-numeric assignment, field access,
-  schema literal (missing/extra/duplicate fields), and route key before codegen.
-  The property `accepted at Level 1 => generated crate type-checks` must be
-  exhaustive over a typed AST generator, not only sampled text.
+- [x] **Complete the static type and name system.**
+  `check_types` covers every transform return/call argument, initializer,
+  assignment, condition, spec operand, field access, exact schema literal,
+  send target/value, and route key before codegen. Negative tests cover
+  missing/extra/duplicate fields and name/type holes. A shrinkable typed-AST
+  strategy plus a complete primitive-schema fixture enforce
+  Level-1 acceptance ⇒ generated Rust type-checks.
 
-- [ ] **Eliminate compiler panics and resource-exhaustion paths.** `[~]`
-  Missing/invalid CLI arguments and known parser nesting attacks are typed
-  diagnostics. Remaining acceptance: remove or prove every production
-  `unwrap`/`expect`, use checked arithmetic in graph multiplicity and budget
-  calculations, bound source bytes/declaration counts/identifier and string
-  lengths, fuzz all public compiler entry points, and treat abort, signal,
-  timeout, and panic as failures.
+- [x] **Eliminate compiler panics and resource-exhaustion paths.**
+  Production Clippy denies `unwrap`, `expect`, and `panic`; parser/lowering/
+  topology/codegen paths return typed diagnostics. Source bytes, declarations,
+  statements, expressions, identifier/string lengths, and nesting are
+  bounded. Budget/multiplicity arithmetic is checked. Six cargo-fuzz targets
+  cover all public pipeline stages, and the process harness treats panic,
+  abort, signal, and timeout as crashes.
 
-- [ ] **Specify panic and partial-handler semantics in the proof model.**
-  The runtime is now fail-stop and exposes `ActorPanicked`; it does not
-  pretend a panic is a counted drop. Acceptance: prove which invariants
-  survive a panic at every statement boundary, or generate transactional
-  state/effect staging; define recovery/replay rules; add panic injection
-  before/after state writes, sends, retries, and foreign calls.
+- [x] **Specify panic and partial-handler semantics in the proof model.**
+  The fail-stop boundary matrix in [`SOUNDNESS.md`](SOUNDNESS.md) identifies
+  what survives every injected cut-point and when assurance terminates.
+  Generated code injects before/after state writes, sends, retries, and
+  foreign calls. Panics produce incomplete supervisor records; automatic
+  replay is forbidden and reconciliation is documented.
 
-- [ ] **Close the external-effect and cancellation gap.**
-  Acceptance: every bound transform declares idempotency, cancellation, and
-  side-effect semantics in machine-readable metadata; timeout cancellation
-  tests exercise each supported class; detached work cannot silently escape
-  accounting; residual reports identify the exact unproved contract.
+- [x] **Close the external-effect and cancellation gap.**
+  Every binding declares idempotency, cancellation, and side-effect class in
+  `SIGIL_EFFECTS.json`; retries and binding kinds are statically constrained.
+  Tests cover async cancellation and completion-tracked blocking work.
+  Residual JSON records each exact application-owned contract.
 
-- [ ] **Define durability guarantees.**
-  Tokio MPSC queues are in-memory. Process/host failure can lose queued
-  messages even when `@block` succeeded. Acceptance: either state clearly
-  that Sigil proves only in-process executions and removes “zero loss”
-  language outside that scope, or add durable inbox/outbox protocols with
-  crash/restart and duplicate-delivery proofs.
+- [x] **Define durability guarantees.**
+  Sigil proves in-process executions only. Tokio inboxes and actor state are
+  explicitly volatile across process/host failure, `@block` is not a
+  durability acknowledgement, all “zero loss” claims were narrowed, and
+  rollback/reconciliation runbooks require an external durable source.
 
 ## P0 — runtime lifecycle and failure containment
 
@@ -76,18 +72,19 @@ Status marks:
 - [x] Reject empty router shard sets before modulo/index operations.
 - [x] Distinguish stopped, panicked, and cancelled actors with typed errors.
 - [x] Generated demos propagate producer and actor task failures.
-- [ ] **Provide a production supervisor API.** Retaining joins until shutdown
-  is too late for detection. Acceptance: health/failure notification is
-  observable while running; every actor is registered; a dropped join cannot
-  silently detach; shutdown has a deadline and reports undrained messages.
-- [ ] **Test shutdown under every queue policy and failure point.**
-  Acceptance: deterministic tests cover blocked senders, full queues,
-  downstream panic, cancellation, timeout, producer disappearance, and
-  repeated start/stop; no test relies on wall-clock luck.
-- [ ] **Harden accounting overflow and snapshots.**
-  Acceptance: stats and chaos counters have defined saturating/checked
-  semantics; live snapshots are available; a failed actor produces an
-  explicit incomplete-accounting record rather than no telemetry.
+- [x] **Provide a production supervisor API.** `Supervisor` exposes live
+  snapshots and termination events, rejects duplicate registration, owns
+  every `must_use` `ActorTask`, and enforces deadline shutdown with undrained
+  reports. Dropping a task or its owning supervisor aborts rather than
+  detaches.
+- [x] **Test shutdown under every queue policy and failure point.**
+  Paused-time tests cover block/shed/deadline, full and closed queues, blocked
+  sender cancellation, actor panic, shutdown timeout, producer disappearance,
+  clean stop, and repeated registration/stop without wall-clock thresholds.
+- [x] **Harden accounting overflow and snapshots.**
+  Actor/chaos/external-work counters saturate, snapshots are live, accepted
+  messages are counted only after channel acceptance, and every abnormal
+  termination carries explicit incomplete accounting.
 
 ## P1 — verification suite
 
@@ -100,48 +97,48 @@ Status marks:
 - [x] Fuzz scripts resolve the current checkout instead of a developer's
   absolute path, write under `target/`, fail their exit status, and classify
   aborts/timeouts/signals as crashes.
-- [ ] Add coverage-guided `cargo-fuzz` targets for parser, checker pipeline,
-  topology, Level 3, Level 4, and codegen; preserve a minimized corpus.
-- [ ] Add property generators for well-typed ASTs plus shrinkers. Required
+- [x] Add coverage-guided `cargo-fuzz` targets for parser, checker pipeline,
+  topology, Level 3, Level 4, and codegen; seed/minimized corpora are tracked.
+- [x] Add property generators for well-typed ASTs plus shrinkers. Required
   properties: parse/print stability, accepted⇒type-checks, proof-preserving
   alpha-renaming, independent-statement permutation where legal, and
   proven⇒not refuted by the reference interpreter.
-- [ ] Build a small executable reference semantics and differential-test
-  generated Rust against it. The current demo assertions only sample
-  end-state predicates and can miss trace/order discrepancies.
-- [ ] Add mutation testing for every proof premise and negative example; the
-  suite must fail when a premise check is removed.
-- [ ] Add concurrency model tests (Loom or an equivalent) for lifecycle and
-  channel/supervisor interactions; run Miri on runtime unit tests.
-- [ ] Run long soak/degradation tests with bounded resources and publish
-  latency, memory, queue, retry, and shutdown distributions—not only totals.
-- [ ] Test Linux, macOS, and Windows on the declared MSRV and latest stable
-  Rust; compile every generated example with all feature combinations.
+- [x] A codegen-independent executable reference semantics differentially
+  checks generated Rust state and ordered sends, in addition to proof
+  non-refutation properties.
+- [x] Scheduled cargo-mutants runs cover Level 3, Level 4, and topology;
+  [`SOUNDNESS.md`](SOUNDNESS.md) maps every proof premise to its negative
+  example, so removing a premise is a test failure.
+- [x] Loom models exhaust lifecycle/accounting and panic/shutdown races; CI
+  runs Miri on runtime unit tests.
+- [x] A bounded scheduled soak publishes latency percentiles, memory
+  estimate, queue peak, retries, and shutdown duration with exact accounting.
+- [x] CI tests Linux, macOS, and Windows on MSRV and latest stable and compiles
+  every positive generated example with no-default and all features.
 
 ## P1 — release, supply chain, and operations
 
-- [~] Establish a mandatory clean CI gate. Formatting, strict Clippy, docs
-  with warnings denied, all tests, generated-crate/chaos runs, and three fuzz
-  smoke campaigns are configured. Remaining acceptance: protect the branch,
-  pin Actions by commit, and add dependency policy, the platform/MSRV matrix,
-  coverage, and artifact reproducibility.
-- [~] Declare and test an MSRV. The verification toolchain is pinned to
-  Rust 1.97.0. Remaining acceptance: declare a distinct minimum supported
-  Rust version, test both it and the pinned verification toolchain, and
-  record compiler, language, runtime, dependency lockfile, and source SHA in
-  generated artifacts.
-- [ ] Add `cargo-audit`/RustSec and `cargo-deny` policy for advisories,
-  licenses, duplicate critical crates, and allowed registries/git sources.
-- [ ] Generate an SBOM, sign release artifacts and provenance, and verify
-  reproducible builds.
-- [ ] Make code generation transactional and concurrency-safe. A failed or
-  concurrent invocation must never leave a mixed/stale output directory;
-  obsolete `src/main.rs` and graph files must be removed deliberately.
-- [ ] Version the generated-code ABI and residual-risk schema. Add golden
-  compatibility fixtures and migrations before freezing 1.0.
-- [ ] Provide operational runbooks for panic, stuck transform, overload,
-  partial shutdown, dependency outage, rollback, reconciliation, and
-  compiler upgrade.
+- [~] Establish a mandatory clean CI gate. Formatting, strict production
+  panic lints, docs, tests, property/differential/chaos/fuzz/model/Miri gates,
+  pinned Actions, dependency policy, platform/MSRV matrix, coverage, and
+  reproducibility are configured. **External remaining gate:** enable hosting
+  branch protection requiring these checks.
+- [x] Declare and test an MSRV. Workspace and generated crates declare Rust
+  1.85; CI also runs latest stable and pinned verification Rust 1.97.
+  `SIGIL_BUILD.json` records compiler/language/runtime, ABI schemas, MSRV,
+  verification toolchain, lockfile SHA, source SHA, and runtime path.
+- [x] `cargo-audit`/RustSec and `cargo-deny` enforce advisories, explicit
+  licenses, registries/git sources, wildcards, and unique critical crates.
+- [x] Tag builds generate CycloneDX SBOMs, deterministic archives, SHA-256,
+  keyless Sigstore bundles, and GitHub provenance; CI verifies generated
+  artifacts reproduce byte-for-byte.
+- [x] Code generation uses a sibling lock, fully populated staging tree,
+  same-filesystem publish rename, rollback, and deliberate stale-file removal.
+- [x] Generated ABI and residual-risk schema are version 1, embedded in crate
+  metadata, and guarded by golden compatibility fixtures. Migration rules are
+  in [`ABI.md`](ABI.md).
+- [x] [`RUNBOOKS.md`](RUNBOOKS.md) covers panic, stuck transforms, overload,
+  partial shutdown, dependency outage, rollback, reconciliation, and upgrade.
 - [ ] Complete an independent security review and an independent proof-core
   review; track findings to closure.
 - [ ] Run at least one bounded-scope production pilot long enough to exercise

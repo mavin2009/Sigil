@@ -18,6 +18,8 @@ What `sigilc` emits, how it executes, and how to exercise it.
 parse
   → lower                      (one Graph IR per process)
   → level1_check               (extinct-by-design, per process)
+  → check_types                (all names, expressions, literals, routes)
+  → check_effect_contracts     (idempotency/cancellation/side effects)
   → check_handler_wellformedness
   → check_transform_signatures
   → check_failure_paths
@@ -42,6 +44,9 @@ out_dir/
   src/lib.rs          schemas, transforms, processes, actors, smoke test
   src/main.rs         concurrent demo driver (with --emit-main)
   RESIDUAL_RISK.md    what was proven, assumed, and skipped
+  RESIDUAL_RISK.json  versioned, owned residual items
+  SIGIL_EFFECTS.json  bound-transform effect contracts
+  SIGIL_BUILD.json    compiler/runtime/lock/source provenance
 ```
 
 Sigil-emitted code contains **no `Mutex`, no `RwLock`, no `Arc`, no atomics,
@@ -55,42 +60,52 @@ Every process compiles to a shared-nothing actor:
 
 ```rust
 pub struct LedgerHandle {
-    tx: tokio::sync::mpsc::Sender<Payment>,
+    tx: sigil_rt::ActorSender<Payment>,
 }
 
 impl Ledger {
     pub fn spawn(mut self, capacity: usize)
-        -> Result<(LedgerHandle, tokio::task::JoinHandle<(Self, sigil_rt::ActorStats)>)>
+        -> Result<(LedgerHandle, sigil_rt::ActorTask<Self>)>
     {
         sigil_rt::validate_channel_capacity(capacity)?;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Payment>(capacity);
+        let telemetry = self.__telemetry.clone();
+        let task_telemetry = telemetry.clone();
+        let (raw_tx, mut rx) = tokio::sync::mpsc::channel::<Payment>(capacity);
+        let tx = sigil_rt::ActorSender::new(raw_tx, telemetry.clone());
         let join = tokio::spawn(async move {
             let mut stats = sigil_rt::ActorStats::default();
             while let Some(msg) = rx.recv().await {
                 match self.on_payment(msg).await {
-                    Ok(()) => stats.handled += 1,
-                    Err(_) => stats.dropped += 1,
+                    Ok(()) => {
+                        stats.record_handled();
+                        self.__telemetry.note_handled();
+                    }
+                    Err(_) => {
+                        stats.record_dropped();
+                        self.__telemetry.note_dropped();
+                    }
                 }
             }
             stats.shed = self.__shed;
+            self.__telemetry.mark_stopped();
             (self, stats)
         });
-        Ok((LedgerHandle { tx }, join))
+        Ok((LedgerHandle { tx }, sigil_rt::ActorTask::new("Ledger", join, task_telemetry)))
     }
 }
 ```
 
 `spawn` takes `self` **by move**. After the call the state is unreachable
-except by message; it comes back at `join()`. Data races are not prevented
-by discipline — they are unrepresentable.
+except by message; it comes back at `join()`. Data races on Sigil-owned
+process state are excluded by construction. External Rust and dependencies
+remain outside that source-level guarantee.
 
-On a normal actor exit, `ActorStats` gives exact accounting:
-`handled + dropped` is every message the actor completed or rejected, and
-`shed` counts outbound messages dropped by policy. A panic is fail-stop:
-Tokio catches it at the task boundary and returns a `JoinError`; Sigil's
-`join_actor` converts that to `SigilError::ActorPanicked`. State and final
-statistics are unavailable after a panic, so callers must monitor and treat
-that error as component failure rather than claiming conservation.
+On normal exit, `ActorStats` gives complete accounting. Live
+`ActorSnapshot` includes accepted messages. All counters saturate rather than
+wrap. A panic is fail-stop: `Supervisor` reports it while the component runs
+as incomplete accounting with the last snapshot and undrained count. State is
+unavailable, so callers must treat the run as failed rather than claiming
+conservation.
 
 **Multi-handler processes** get a typed dispatch enum:
 
@@ -120,8 +135,8 @@ pub struct Gateway {
 The demo driver spawns **sinks first** so upstream stages can be wired to
 live handles, then shuts down stage by stage in topological order. Closing a
 stage's channels drains its actors, which release their outboxes, cascading
-the shutdown downstream. No message is stranded in a closed channel, and
-nothing hangs waiting on a stage that will never drain.
+the shutdown downstream. A production supervisor adds a hard deadline and
+reports every undrained accepted message if draining cannot complete.
 
 Shutdown ordering is where hand-written actor systems deadlock. Here it is
 derived from the graph the compiler already proved acyclic.
@@ -137,11 +152,13 @@ The runtime is deliberately small:
 | Item | Purpose |
 | ---- | ------- |
 | `SigilError` | typed timeout, transform, schema, configuration, stopped, panicked, and cancelled failures |
-| `ActorStats` | `{ handled, dropped, shed }` |
+| `ActorStats` / `ActorSnapshot` | complete terminal counters / live accepted, handled, dropped, shed |
+| `ActorTask` / `Supervisor` | no silent detach; live termination events and bounded shutdown |
 | `Router<H>` | shard ring: `round_robin`, `by_key`, `shards` |
 | `SendOutcome` | `Delivered` \| `Shed` |
 | `validate_channel_capacity` | rejects capacities that would make Tokio panic |
 | `join_actor` / `join_task` | converts Tokio panic/cancellation joins to typed Sigil errors |
+| `tracked_spawn_blocking` | retains accounting for blocking work after timeout cancellation |
 | `backpressure::{block, shed, deadline}` | the three declared policies |
 | `chaos` | fault injection and counters |
 
@@ -156,6 +173,7 @@ Disabled by default (zero latency, zero faults).
 | `SIGIL_CHAOS_FAIL_PCT` | percent of external calls that fail (0–100) |
 | `SIGIL_CHAOS_LATENCY_MS` | max injected latency per external call |
 | `SIGIL_CHAOS_SLOW_PCT` | percent of calls that get injected latency (default 25) |
+| `SIGIL_CHAOS_PANIC_AT` | comma-separated proof cut-points for deterministic panic injection |
 
 ```
 SIGIL_CHAOS_FAIL_PCT=20 SIGIL_CHAOS_LATENCY_MS=120 cargo run --bin demo

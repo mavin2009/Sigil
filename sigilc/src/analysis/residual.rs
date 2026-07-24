@@ -38,7 +38,18 @@ pub fn residual_risk_report(
         );
         declared.push(sig.clone());
         if t.body.is_empty() {
-            external.push(format!("- {sig} (no body — external residual)"));
+            let contract = t.binding.as_ref().map_or_else(
+                || "no binding contract declared".to_string(),
+                |binding| {
+                    format!(
+                        "{:?}, {:?}, {:?}",
+                        binding.effect.idempotency,
+                        binding.effect.cancellation,
+                        binding.effect.side_effect
+                    )
+                },
+            );
+            external.push(format!("- {sig} (external residual; contract: {contract})"));
         } else {
             compiled.push(format!(
                 "- {sig} (body present — compiled into generated crate)"
@@ -196,7 +207,7 @@ pub fn residual_risk_report(
                         backpressure.describe(),
                         match backpressure {
                             crate::frontend::ast::Backpressure::Block =>
-                                " — no loss; wait is UNBOUNDED (queueing time is not covered by `path_timeout_sum`)",
+                                " — no policy shedding after in-process acceptance; wait is UNBOUNDED (queues are volatile and queueing time is not covered by `path_timeout_sum`)",
                             crate::frontend::ast::Backpressure::Shed =>
                                 " — bounded O(1); sheds on a full queue (counted in ActorStats.shed)",
                             crate::frontend::ast::Backpressure::Deadline(_) =>
@@ -273,9 +284,11 @@ pub fn residual_risk_report(
 {level2_section}
 
 ## Residual Risk
-- External transforms (empty bodies) are assumed to match their declared schemas and to terminate. Their internal failure modes are residual.
+- External transforms are assumed to match their declared schemas and effect contracts. Their functional behavior remains residual.
 - Undeclared transforms are residual until given signatures.
 - Tokio runtime, OS scheduler, and wall-clock latency are outside the model.
+- Actor panic, process exit, host loss, and power loss end the proved in-process execution. Queued messages and task-local state are volatile; Sigil provides no durable inbox/outbox.
+- A panic produces incomplete accounting and requires fail-stop reconciliation; automatic replay is forbidden because a foreign effect or send may already have occurred.
 - Functional correctness of business logic inside external transforms is residual (Level-1 only).
 - Level-2 holds that depend on external transforms remain residual assumptions.
 "#,

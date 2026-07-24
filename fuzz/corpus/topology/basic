@@ -1,0 +1,3 @@
+schema M { value: Int }
+process A { on m: M { send m to B @shed } }
+process B { on m: M {} }
